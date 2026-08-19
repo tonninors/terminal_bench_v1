@@ -14,7 +14,6 @@ import os
 import shutil
 import sqlite3
 import struct
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -93,7 +92,6 @@ def isolated_db(tmp_path_factory) -> Path:
 @pytest.fixture(scope="session")
 def conn(isolated_db) -> sqlite3.Connection:
     c = sqlite3.connect(str(isolated_db))
-    c.text_factory = bytes if False else str
     yield c
     c.close()
 
@@ -103,7 +101,8 @@ def conn(isolated_db) -> sqlite3.Connection:
 # --------------------------------------------------------------------------
 def test_output_present_and_looks_like_sqlite():
     assert RECOVERED.exists(), f"{RECOVERED} is missing"
-    head = RECOVERED.open("rb").read(16)
+    with RECOVERED.open("rb") as fh:
+        head = fh.read(16)
     assert head == b"SQLite format 3\x00", (
         f"{RECOVERED} does not start with the SQLite file header")
 
