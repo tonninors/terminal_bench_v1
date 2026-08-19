@@ -1,0 +1,222 @@
+{
+  "seed": 20260819,
+  "page_size": 4096,
+  "sqlite_version": "3.45.1",
+  "host_wal_checksum_big_endian_native": false,
+  "artifact_wal_checksum_big_endian": true,
+  "base_pages_in_main_db": 323,
+  "committed_frames": 201,
+  "crash_tail_frames": 54,
+  "superseded_same_salt_frames": 6,
+  "superseded_slot_range_0based": [
+    140,
+    146
+  ],
+  "stale_generation_frames": 14,
+  "commit_frame_indexes_0based": [
+    47,
+    143,
+    200
+  ],
+  "committed_db_size_pages": 382,
+  "corrupted_pages": {
+    "wiped_recoverable_from_T1": {
+      "pgno": 178,
+      "type": [
+        "leaf",
+        "postings"
+      ]
+    },
+    "wiped_recoverable_from_T3": {
+      "pgno": 4,
+      "type": [
+        "internal",
+        "journal_entries"
+      ]
+    },
+    "subtly_damaged_recoverable_from_T2": {
+      "pgno": 40,
+      "type": [
+        "leaf",
+        "journal_entries"
+      ]
+    },
+    "wiped_overflow_page": {
+      "pgno": 154,
+      "type": [
+        "overflow",
+        "journal_entries"
+      ],
+      "last_written_by_txn": 2
+    }
+  },
+  "artifact_salts": {
+    "salt1": 1547311591,
+    "salt2": 2705619922,
+    "ckpt_seq": 1,
+    "magic": 931071619
+  },
+  "stale_salts": {
+    "salt1": 494400004,
+    "salt2": 2477835694
+  },
+  "marks": {
+    "t1_entry_ids": [
+      321,
+      322,
+      323,
+      324,
+      325,
+      326,
+      327,
+      328,
+      329,
+      330,
+      331,
+      332,
+      333,
+      334,
+      335,
+      336,
+      337,
+      338,
+      339,
+      340,
+      341,
+      342,
+      343,
+      344,
+      345,
+      346
+    ],
+    "t2_entry_ids": [
+      30,
+      34,
+      43,
+      47,
+      54,
+      56,
+      57,
+      60,
+      84,
+      86,
+      101,
+      102,
+      103,
+      123,
+      139,
+      141,
+      148,
+      158,
+      164,
+      167,
+      190,
+      192,
+      196,
+      201,
+      219,
+      224,
+      260,
+      268,
+      285,
+      297,
+      300,
+      305,
+      311,
+      314
+    ],
+    "t3_entry_ids": [
+      347,
+      348,
+      349,
+      350,
+      351,
+      352,
+      353,
+      354,
+      355,
+      356,
+      357,
+      358,
+      359,
+      360
+    ],
+    "t3_settled_ids": [
+      4,
+      8,
+      10,
+      14,
+      22,
+      23,
+      27,
+      30,
+      33,
+      34,
+      45,
+      48,
+      51,
+      58,
+      60,
+      62,
+      69,
+      70
+    ],
+    "t4_entry_ids": [
+      361,
+      362,
+      363,
+      364,
+      365,
+      366,
+      367,
+      368,
+      369
+    ],
+    "t4_voided_ids": [
+      200,
+      201,
+      202,
+      203,
+      204,
+      205
+    ],
+    "t4_deleted_ids": [
+      17,
+      41,
+      58,
+      93
+    ],
+    "t4_frozen_accounts": [
+      3,
+      22,
+      47
+    ]
+  },
+  "sha256": {
+    "ledger.db": "312afc58cd4a872b4d6aa62d9393c58cdbaa33d8f5620bb459a5edf444562f92",
+    "ledger.db-wal": "83be7a3da42b7b047e73abfa1641a8f9aa7e0a5d280293ac47e612ed2304ee16",
+    "golden.db": "1ba64cae9311fdc712f5a6efd4c5067d0dc2d953eed12f3040da2c7956e2ffc3"
+  },
+  "trap_main_db_integrity_check": [
+    "error: database disk image is malformed"
+  ],
+  "trap_auto_recovery": {
+    "wal_checkpoint": [
+      0,
+      0,
+      0
+    ],
+    "integrity_check": [
+      "error: database disk image is malformed"
+    ]
+  },
+  "trap_replay_all": {
+    "integrity_check": "ok",
+    "differing_tables": [
+      "accounts",
+      "audit_log",
+      "journal_entries",
+      "postings"
+    ]
+  }
+}

@@ -1,0 +1,9 @@
+services:
+  client:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sqlite-wal-crash-recovery
+    container_name: sqlite-wal-crash-recovery
+    working_dir: /app
+    command: ["sleep", "infinity"]

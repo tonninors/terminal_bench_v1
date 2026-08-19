@@ -1,0 +1,50 @@
+# Terminal Bench task definition
+version: "1.0"
+name: sqlite-wal-crash-recovery
+descriptive_name: "SQLite crash recovery from a damaged write-ahead log"
+
+domain: systems
+subdomain: databases
+category: databases
+tags:
+  - sqlite
+  - database-internals
+  - crash-recovery
+  - write-ahead-log
+  - file-formats
+  - forensics
+
+difficulty: hard
+author_email: bram.honeybee2026@gmail.com
+
+# Every input file is generated from scratch by build/generate_case.py with a
+# fixed seed; nothing is downloaded, copied or derived from external material.
+requires_network: false
+
+max_agent_timeout_sec: 7200
+max_test_timeout_sec: 300
+
+instruction: |
+  /app/ledger.db and /app/ledger.db-wal are crash artifacts from a SQLite-backed
+  transaction service. The main database contains damaged pages, the write-ahead
+  log's header is corrupted, and the log body holds the page changes of several
+  transactions followed by a crash tail.
+
+  Recover the exact logical database state as of the last fully committed,
+  internally valid transaction in the write-ahead log, and write the result as a
+  standalone SQLite database at /app/recovered.db.
+
+  /app/recovered.db must:
+
+    * be a single self-contained SQLite database file that still opens and reads
+      correctly when copied on its own, with no -wal, -shm or journal sidecar;
+    * return exactly "ok" from PRAGMA integrity_check;
+    * report no violations from PRAGMA foreign_key_check;
+    * carry the original user-defined schema unchanged - every table, index,
+      trigger and view, with the same definitions and no extra objects;
+    * contain exactly the rows visible at that commit: every change made by it
+      must be present, and no change belonging to the transaction that follows it
+      may appear.
+
+  Only /app/recovered.db is evaluated. Work on copies of the supplied artifacts:
+  database tools may rewrite or remove them in place.

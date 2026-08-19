@@ -1,0 +1,421 @@
+{
+  "assertions": [
+    {
+      "discriminates_replay_all": false,
+      "expected": 14,
+      "label": "last-commit rows present",
+      "params": [
+        "121fec0c-eafb-25a1-24e5-a53ed240b5f8",
+        "02ba6820-2ede-5272-9f78-f965a48c777e",
+        "44cfd3e6-3f5e-75c6-7c69-bbd9e1c8d1a1",
+        "1115e553-6bae-1eaf-790e-1701db12fe22",
+        "650ca433-5ea6-fc0c-f366-ab4345571eca",
+        "d53553fd-9c1e-9ac4-5d7c-d4807bf30583",
+        "e04eb5b2-8b72-fe6d-75bb-716028122e13",
+        "73f6470a-6f75-6ca8-17fe-3d2c87d6dc2d",
+        "dc355e3a-56c7-2059-ab4c-2e739c3323ee",
+        "ce1efff2-d4a3-5e6d-d1cd-c146b5d5ebbe",
+        "21e83ab0-ee33-10c9-cc4a-9d3ffacc02cd",
+        "2897c1fa-57d8-017f-aace-f1b7c63f0cc1",
+        "e897e86d-48c0-5ef3-9940-0816dd641369",
+        "2db7b0a4-2d81-4156-3d5c-78f13c1f7d86"
+      ],
+      "sql": "SELECT COUNT(*) FROM journal_entries WHERE entry_uuid IN (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+    },
+    {
+      "discriminates_replay_all": false,
+      "expected": 28,
+      "label": "last-commit postings present",
+      "params": [
+        347,
+        360
+      ],
+      "sql": "SELECT COUNT(*) FROM postings WHERE entry_id BETWEEN ? AND ?"
+    },
+    {
+      "discriminates_replay_all": true,
+      "expected": 18,
+      "label": "last-commit state changes applied",
+      "params": [],
+      "sql": "SELECT COUNT(*) FROM journal_entries WHERE state='posted' AND entry_id IN (4,8,10,14,22,23,27,30,33,34,45,48,51,58,60,62,69,70)"
+    },
+    {
+      "discriminates_replay_all": false,
+      "expected": 2,
+      "label": "last-commit account freeze applied",
+      "params": [],
+      "sql": "SELECT COUNT(*) FROM accounts WHERE account_id IN (11,29) AND status='frozen'"
+    },
+    {
+      "discriminates_replay_all": true,
+      "expected": 0,
+      "label": "crash-tail rows absent",
+      "params": [
+        "2c9df8bb-204d-0efd-42e6-f780cff8cc10",
+        "9b3ef734-561e-b8ec-880d-3c337741a437",
+        "bf6c7282-9e7d-d76c-9f8f-fcc3eb91ac40",
+        "4fad87ee-cee9-06c7-73ce-7446c1c9ccc7",
+        "1f986df6-633d-462f-51fd-1722c06962ec",
+        "e9aade6b-bc6b-7ad0-3feb-0d4c8a6d1bb6",
+        "2ffc5e47-4b84-f922-0d92-c6eb4434ed39",
+        "790785ad-9eb1-b71b-6444-66ec382ae522",
+        "b6dddb54-b227-35a8-5f1b-4aa8f33a7226"
+      ],
+      "sql": "SELECT COUNT(*) FROM journal_entries WHERE entry_uuid IN (?,?,?,?,?,?,?,?,?)"
+    },
+    {
+      "discriminates_replay_all": true,
+      "expected": 0,
+      "label": "crash-tail postings absent",
+      "params": [
+        361
+      ],
+      "sql": "SELECT COUNT(*) FROM postings WHERE entry_id >= ?"
+    },
+    {
+      "discriminates_replay_all": true,
+      "expected": 0,
+      "label": "crash-tail voids not applied",
+      "params": [],
+      "sql": "SELECT COUNT(*) FROM journal_entries WHERE state='void' AND entry_id IN (200,201,202,203,204,205)"
+    },
+    {
+      "discriminates_replay_all": true,
+      "expected": 4,
+      "label": "crash-tail deletes not applied",
+      "params": [],
+      "sql": "SELECT COUNT(*) FROM journal_entries WHERE entry_id IN (17,41,58,93)"
+    },
+    {
+      "discriminates_replay_all": true,
+      "expected": 0,
+      "label": "crash-tail account freezes not applied",
+      "params": [],
+      "sql": "SELECT COUNT(*) FROM accounts WHERE account_id IN (3,22,47) AND status='frozen'"
+    },
+    {
+      "discriminates_replay_all": false,
+      "expected": 0,
+      "label": "trigger-maintained balances match the last commit",
+      "params": [],
+      "sql": "SELECT COUNT(*) FROM account_balances WHERE stored_minor <> derived_minor"
+    },
+    {
+      "discriminates_replay_all": true,
+      "expected": 740,
+      "label": "audit trail row count at the last commit",
+      "params": [],
+      "sql": "SELECT COUNT(*) FROM audit_log"
+    },
+    {
+      "discriminates_replay_all": false,
+      "expected": 0,
+      "label": "total posting weight at the last commit",
+      "params": [],
+      "sql": "SELECT COALESCE(SUM(amount_minor),0) FROM postings"
+    }
+  ],
+  "index_list": {
+    "accounts": [
+      [
+        "sqlite_autoindex_accounts_1",
+        1
+      ],
+      [
+        "ux_accounts_owner_ccy",
+        1
+      ]
+    ],
+    "audit_log": [
+      [
+        "ix_audit_target",
+        0
+      ]
+    ],
+    "journal_entries": [
+      [
+        "ix_entries_open_work",
+        0
+      ],
+      [
+        "ix_entries_posted_on",
+        0
+      ],
+      [
+        "sqlite_autoindex_journal_entries_1",
+        1
+      ]
+    ],
+    "postings": [
+      [
+        "ix_postings_account",
+        0
+      ],
+      [
+        "sqlite_autoindex_postings_1",
+        1
+      ]
+    ]
+  },
+  "schema": {
+    "index": {
+      "ix_audit_target": "CREATE INDEX ix_audit_target ON audit_log(table_name, row_key)",
+      "ix_entries_open_work": "CREATE INDEX ix_entries_open_work ON journal_entries(posted_on, entry_id) WHERE state = 'pending'",
+      "ix_entries_posted_on": "CREATE INDEX ix_entries_posted_on ON journal_entries(posted_on)",
+      "ix_postings_account": "CREATE INDEX ix_postings_account ON postings(account_id, entry_id)",
+      "ux_accounts_owner_ccy": "CREATE UNIQUE INDEX ux_accounts_owner_ccy ON accounts(owner_name, currency)"
+    },
+    "table": {
+      "accounts": "CREATE TABLE accounts ( account_id INTEGER PRIMARY KEY, account_no TEXT NOT NULL UNIQUE, owner_name TEXT NOT NULL, currency TEXT NOT NULL CHECK (length(currency) = 3), status TEXT NOT NULL CHECK (status IN ('open','frozen','closed')), opened_on TEXT NOT NULL, balance_minor INTEGER NOT NULL DEFAULT 0 )",
+      "audit_log": "CREATE TABLE audit_log ( audit_id INTEGER PRIMARY KEY, table_name TEXT NOT NULL, row_key TEXT NOT NULL, action TEXT NOT NULL, delta_minor INTEGER, note TEXT )",
+      "journal_entries": "CREATE TABLE journal_entries ( entry_id INTEGER PRIMARY KEY, entry_uuid TEXT NOT NULL UNIQUE, posted_on TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('pending','posted','void')), fx_rate REAL, narrative TEXT NOT NULL, memo TEXT, payload BLOB )",
+      "postings": "CREATE TABLE postings ( entry_id INTEGER NOT NULL REFERENCES journal_entries(entry_id) ON DELETE CASCADE, leg_no INTEGER NOT NULL, account_id INTEGER NOT NULL REFERENCES accounts(account_id), amount_minor INTEGER NOT NULL, leg_note TEXT, PRIMARY KEY (entry_id, leg_no) ) WITHOUT ROWID"
+    },
+    "trigger": {
+      "trg_accounts_status_au": "CREATE TRIGGER trg_accounts_status_au AFTER UPDATE OF status ON accounts WHEN OLD.status <> NEW.status BEGIN INSERT INTO audit_log(table_name, row_key, action, delta_minor, note) VALUES ('accounts', CAST(NEW.account_id AS TEXT), 'status', NULL, OLD.status || '->' || NEW.status); END",
+      "trg_entries_state_au": "CREATE TRIGGER trg_entries_state_au AFTER UPDATE OF state ON journal_entries WHEN OLD.state <> NEW.state BEGIN INSERT INTO audit_log(table_name, row_key, action, delta_minor, note) VALUES ('journal_entries', CAST(NEW.entry_id AS TEXT), 'state', NULL, OLD.state || '->' || NEW.state); END",
+      "trg_postings_ad": "CREATE TRIGGER trg_postings_ad AFTER DELETE ON postings BEGIN UPDATE accounts SET balance_minor = balance_minor - OLD.amount_minor WHERE account_id = OLD.account_id; INSERT INTO audit_log(table_name, row_key, action, delta_minor, note) VALUES ('postings', OLD.entry_id || ':' || OLD.leg_no, 'delete', -OLD.amount_minor, OLD.leg_note); END",
+      "trg_postings_ai": "CREATE TRIGGER trg_postings_ai AFTER INSERT ON postings BEGIN UPDATE accounts SET balance_minor = balance_minor + NEW.amount_minor WHERE account_id = NEW.account_id; INSERT INTO audit_log(table_name, row_key, action, delta_minor, note) VALUES ('postings', NEW.entry_id || ':' || NEW.leg_no, 'insert', NEW.amount_minor, NEW.leg_note); END"
+    },
+    "view": {
+      "account_balances": "CREATE VIEW account_balances AS SELECT a.account_id AS account_id, a.account_no AS account_no, a.currency AS currency, a.balance_minor AS stored_minor, COALESCE(SUM(p.amount_minor), 0) AS derived_minor FROM accounts a LEFT JOIN postings p ON p.account_id = a.account_id GROUP BY a.account_id, a.account_no, a.currency, a.balance_minor",
+      "pending_workload": "CREATE VIEW pending_workload AS SELECT e.entry_id, e.entry_uuid, e.posted_on, COUNT(p.leg_no) AS legs FROM journal_entries e LEFT JOIN postings p ON p.entry_id = e.entry_id WHERE e.state = 'pending' GROUP BY e.entry_id, e.entry_uuid, e.posted_on"
+    }
+  },
+  "table_info": {
+    "accounts": [
+      [
+        0,
+        "account_id",
+        "INTEGER",
+        0,
+        null,
+        1
+      ],
+      [
+        1,
+        "account_no",
+        "TEXT",
+        1,
+        null,
+        0
+      ],
+      [
+        2,
+        "owner_name",
+        "TEXT",
+        1,
+        null,
+        0
+      ],
+      [
+        3,
+        "currency",
+        "TEXT",
+        1,
+        null,
+        0
+      ],
+      [
+        4,
+        "status",
+        "TEXT",
+        1,
+        null,
+        0
+      ],
+      [
+        5,
+        "opened_on",
+        "TEXT",
+        1,
+        null,
+        0
+      ],
+      [
+        6,
+        "balance_minor",
+        "INTEGER",
+        1,
+        "0",
+        0
+      ]
+    ],
+    "audit_log": [
+      [
+        0,
+        "audit_id",
+        "INTEGER",
+        0,
+        null,
+        1
+      ],
+      [
+        1,
+        "table_name",
+        "TEXT",
+        1,
+        null,
+        0
+      ],
+      [
+        2,
+        "row_key",
+        "TEXT",
+        1,
+        null,
+        0
+      ],
+      [
+        3,
+        "action",
+        "TEXT",
+        1,
+        null,
+        0
+      ],
+      [
+        4,
+        "delta_minor",
+        "INTEGER",
+        0,
+        null,
+        0
+      ],
+      [
+        5,
+        "note",
+        "TEXT",
+        0,
+        null,
+        0
+      ]
+    ],
+    "journal_entries": [
+      [
+        0,
+        "entry_id",
+        "INTEGER",
+        0,
+        null,
+        1
+      ],
+      [
+        1,
+        "entry_uuid",
+        "TEXT",
+        1,
+        null,
+        0
+      ],
+      [
+        2,
+        "posted_on",
+        "TEXT",
+        1,
+        null,
+        0
+      ],
+      [
+        3,
+        "state",
+        "TEXT",
+        1,
+        null,
+        0
+      ],
+      [
+        4,
+        "fx_rate",
+        "REAL",
+        0,
+        null,
+        0
+      ],
+      [
+        5,
+        "narrative",
+        "TEXT",
+        1,
+        null,
+        0
+      ],
+      [
+        6,
+        "memo",
+        "TEXT",
+        0,
+        null,
+        0
+      ],
+      [
+        7,
+        "payload",
+        "BLOB",
+        0,
+        null,
+        0
+      ]
+    ],
+    "postings": [
+      [
+        0,
+        "entry_id",
+        "INTEGER",
+        1,
+        null,
+        1
+      ],
+      [
+        1,
+        "leg_no",
+        "INTEGER",
+        1,
+        null,
+        2
+      ],
+      [
+        2,
+        "account_id",
+        "INTEGER",
+        1,
+        null,
+        0
+      ],
+      [
+        3,
+        "amount_minor",
+        "INTEGER",
+        1,
+        null,
+        0
+      ],
+      [
+        4,
+        "leg_note",
+        "TEXT",
+        0,
+        null,
+        0
+      ]
+    ]
+  },
+  "tables": {
+    "accounts": {
+      "row_count": 64,
+      "sha256": "04c6a789f141c6b45adf782e6e892aa5b052162e5bcb6a1c50221194574b6fec"
+    },
+    "audit_log": {
+      "row_count": 740,
+      "sha256": "90ed6ebe36718a13b118a0d603c200790b227dae526d99b3fffdfee212bbb67e"
+    },
+    "journal_entries": {
+      "row_count": 360,
+      "sha256": "f29b344e6b175130a5dc584a19989e5964bc377afe739ef75f65bfa3366877e1"
+    },
+    "postings": {
+      "row_count": 720,
+      "sha256": "8a9623f4762181767dd97a771788241168e964921dfc42ee9cdb80114138d12d"
+    }
+  }
+}
