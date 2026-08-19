@@ -122,20 +122,11 @@ step "9. full PASS/FAIL harness"
 $PYTEST -q -p no:cacheprovider build/harness_test.py && ok "harness green" || bad "harness failed"
 
 step "10. rebuild and inspect the solver ZIP"
-rm -f dist/sqlite_wal_recovery_inputs.zip
-mkdir -p dist
-(cd artifacts && zip -X -9 ../dist/sqlite_wal_recovery_inputs.zip ledger.db ledger.db-wal) >/dev/null
-$PY - <<'PYEOF' || bad "ZIP contents are wrong"
-import zipfile, hashlib, pathlib
-z = zipfile.ZipFile("dist/sqlite_wal_recovery_inputs.zip")
-names = sorted(z.namelist())
-assert names == ["ledger.db", "ledger.db-wal"], names
-for n in names:
-    assert "/" not in n and not n.startswith("."), n
-    assert hashlib.sha256(z.read(n)).hexdigest() == \
-           hashlib.sha256(pathlib.Path("artifacts", n).read_bytes()).hexdigest()
-print("  ZIP holds exactly ledger.db and ledger.db-wal, byte-identical, no nesting")
-PYEOF
+$PY build/make_zip.py | sed 's/^/  /' || bad "ZIP build/inspection failed"
+sha_a=$(sha256sum dist/sqlite_wal_recovery_inputs.zip | cut -d" " -f1)
+$PY build/make_zip.py >/dev/null
+sha_b=$(sha256sum dist/sqlite_wal_recovery_inputs.zip | cut -d" " -f1)
+[ "$sha_a" = "$sha_b" ] && ok "ZIP is byte-reproducible" || bad "ZIP is not byte-reproducible"
 ok "ZIP verified"
 
 step "11. no external dependencies"

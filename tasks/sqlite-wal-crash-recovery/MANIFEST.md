@@ -31,6 +31,8 @@ has finished, per the Terminal Bench execution model.
 | `build/internal/generation_report.json` | machine-readable record of the generated case |
 | `build/negatives/*.py` | intentionally wrong answers, plus two alternate correct constructions |
 | `build/harness_test.py` | Phase-7 PASS/FAIL matrix over all candidates |
+| `build/make_zip.py` | deterministic builder for the solver ZIP |
+| `build/make_solution_sh.py` | regenerates the self-contained `solution.sh` from the oracle |
 | `build/run_all_validation.sh` | runs the entire local validation suite |
 | `build/_work/` | scratch directory, recreated on every generator run |
 | `solution/golden_recover.py` | oracle recovery |
@@ -45,6 +47,9 @@ Nothing in the internal set is referenced by `FINAL_PROMPT.txt`, and nothing in
 it reveals which WAL frames are committed to anyone who only receives the ZIP.
 
 ## ZIP contents (verified programmatically)
+
+Built by `build/make_zip.py` with fixed timestamps, so the archive itself is
+byte-reproducible (`sha256 f6feab0a876471ee555e46f689dc5e210380821f2e2c90237ed3620af19e1202`).
 
 ```
 $ unzip -l dist/sqlite_wal_recovery_inputs.zip
