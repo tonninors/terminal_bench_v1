@@ -20,7 +20,8 @@ the SQLite file-format documentation.
 
 1. **Automatic recovery is off the table, and the solver has to notice.**
    Opening the pair reports `database disk image is malformed` and
-   `PRAGMA wal_checkpoint(TRUNCATE)` returns `(0, 0, 0)`. SQLite has silently
+   `PRAGMA wal_checkpoint(PASSIVE)` reports zero frames in a 1.1 MB log.
+   SQLite has silently
    decided the log is empty and, on close, deletes the `-wal`. Anyone who does
    not understand *why* will conclude the log is worthless — and may destroy it.
 

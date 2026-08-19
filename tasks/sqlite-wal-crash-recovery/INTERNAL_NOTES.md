@@ -144,7 +144,7 @@ last-writer map, never hard-coded:
 * the damaged `ledger.db` alone does **not** pass `integrity_check`
   (it reports `database disk image is malformed`);
 * handing SQLite the damaged pair recovers nothing
-  (`wal_checkpoint` → `(0, 0, 0)`, still malformed);
+  (`wal_checkpoint(PASSIVE)` reports 0 frames in the log, still malformed);
 * replaying every valid frame yields a database that **does** pass
   `integrity_check` and `foreign_key_check` yet differs from the golden state in
   all four user tables;
@@ -158,6 +158,13 @@ ledger.db      sha256 312afc58cd4a872b4d6aa62d9393c58cdbaa33d8f5620bb459a5edf444
 ledger.db-wal  sha256 83be7a3da42b7b047e73abfa1641a8f9aa7e0a5d280293ac47e612ed2304ee16
 golden.db      sha256 1ba64cae9311fdc712f5a6efd4c5067d0dc2d953eed12f3040da2c7956e2ffc3
 ```
+
+Repairing the header (which the surviving checksum words make possible) and
+letting SQLite recover is a legitimate solver route:
+`PRAGMA wal_checkpoint(PASSIVE)` then reports `(0, 201, 201)` — SQLite itself
+stops at the last commit frame and drops the 54-frame tail, which independently
+confirms that the intended answer is the one SQLite's own recovery would reach.
+`build/negatives/alt_repair_header.py` exercises it and passes the verifier.
 
 `build/internal/generation_report.json` carries the full machine-readable record,
 including the crash-tail entry ids, voided ids, deleted ids and frozen accounts.

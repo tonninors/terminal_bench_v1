@@ -109,6 +109,8 @@ run_pos() {
 }
 run_pos alt_sql $PY build/negatives/alt_dump_restore.py --src "$TMP/recovered.db"
 run_pos alt_vacuum $PY build/negatives/alt_vacuum_into.py --src "$TMP/recovered.db"
+run_pos alt_repair_header $PY build/negatives/alt_repair_header.py \
+        --db artifacts/ledger.db --wal artifacts/ledger.db-wal
 
 step "8. solution.sh (self-contained oracle entry point)"
 $PY build/make_solution_sh.py >/dev/null

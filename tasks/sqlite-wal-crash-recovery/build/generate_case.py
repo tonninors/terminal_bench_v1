@@ -556,12 +556,14 @@ def verify_traps(report: dict) -> None:
     conn = sqlite3.connect(str(pair))
     cp = None
     try:
-        cp = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        cp = conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
         ic2 = conn.execute("PRAGMA integrity_check").fetchall()
     except sqlite3.DatabaseError as exc:
         ic2 = [(f"error: {exc}",)]
     finally:
         conn.close()
+    assert cp is not None and cp[1] == 0, (
+        f"SQLite must see an empty log, but reported {cp[1]} frames")
     assert ic2 != [("ok",)], "SQLite's own WAL recovery must not fix the database"
     report["trap_auto_recovery"] = {"wal_checkpoint": list(cp) if cp else None,
                                     "integrity_check": [r[0] for r in ic2][:3]}

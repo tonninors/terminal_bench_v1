@@ -29,7 +29,7 @@ has finished, per the Terminal Bench execution model.
 | `build/internal/golden.db` | ground truth; used for validation only, never by the oracle |
 | `build/internal/replay_all.db` | the replay-everything state, kept to prove the traps discriminate |
 | `build/internal/generation_report.json` | machine-readable record of the generated case |
-| `build/negatives/*.py` | intentionally wrong answers, plus two alternate correct constructions |
+| `build/negatives/*.py` | intentionally wrong answers, plus three alternate correct constructions |
 | `build/harness_test.py` | Phase-7 PASS/FAIL matrix over all candidates |
 | `build/make_zip.py` | deterministic builder for the solver ZIP |
 | `build/make_solution_sh.py` | regenerates the self-contained `solution.sh` from the oracle |

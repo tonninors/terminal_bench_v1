@@ -90,6 +90,18 @@ def test_alternate_construction_vacuum_into_passes(good, tmp_path):
     assert v.returncode == 0, v.stdout[-4000:]
 
 
+def test_alternate_construction_repair_header_passes(tmp_path):
+    """Repairing the destroyed WAL header and letting SQLite recover is a
+    different technique that reaches the same state; it must pass."""
+    out = tmp_path / "alt3.db"
+    r = run([sys.executable, NEG / "alt_repair_header.py", "--db", ART / "ledger.db",
+             "--wal", ART / "ledger.db-wal", "--out", out])
+    assert r.returncode == 0, r.stderr
+    assert "(0, 201, 201)" in r.stdout, r.stdout
+    v = verify(out)
+    assert v.returncode == 0, v.stdout[-4000:]
+
+
 # ---------------------------------------------------------------- negatives
 def test_missing_output_fails(tmp_path):
     v = verify(tmp_path / "nothing.db")

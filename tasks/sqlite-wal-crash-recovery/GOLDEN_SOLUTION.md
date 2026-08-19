@@ -12,11 +12,12 @@ implementation that reaches the same logical state passes the verifier.
 ## 0. Establish what SQLite itself will and will not do
 
 Copy the pair somewhere scratch and open it. SQLite reports
-`database disk image is malformed`, and `PRAGMA wal_checkpoint(TRUNCATE)`
-returns `(0, 0, 0)` — zero frames in the log. SQLite validated the WAL header,
-found it unusable, and treated the log as empty; then, on close, it deleted the
-`-wal` file. Conclusion: automatic recovery is not available, the log must be
-replayed by hand, and the artifacts must be treated as read-only evidence.
+`database disk image is malformed`, and `PRAGMA wal_checkpoint(PASSIVE)` returns
+`(0, 0, 0)` — **zero frames in the log**, even though the file is 1.1 MB.
+SQLite validated the WAL header, found it unusable and treated the log as empty;
+then, on close, it deleted the `-wal` file. Conclusion: automatic recovery is
+not available, the log has to be dealt with by hand, and the artifacts must be
+treated as read-only evidence.
 
 ## 1. Page size
 
@@ -72,6 +73,17 @@ If you prefer not to reconstruct the header, the byte order can also be settled
 empirically: frame 0's stored checksum seeds frame 1, so try both orders and
 keep whichever validates a long run of frames. That leaves frame 0 itself
 unauthenticated, which does not change the answer here.
+
+### Shortcut: repair the header and hand the job back to SQLite
+
+Once step 3 has produced the original 32-byte header, writing it back over the
+damaged one is enough — SQLite's own recovery then does the rest correctly.
+On the repaired pair `PRAGMA wal_checkpoint(PASSIVE)` reports
+`(0, 201, 201)`: it finds exactly the 201 committed frames, stops at the last
+commit frame, discards the 54-frame crash tail and rejects everything past it.
+`build/negatives/alt_repair_header.py` is that route end to end, and it passes
+the verifier. Steps 4-7 below describe the manual replay, which is what
+`solution/golden_recover.py` does and what is needed to understand the case.
 
 ## 4. The rolling checksum
 
@@ -143,7 +155,7 @@ answer. The recovered database contains 64 accounts, 360 journal entries,
 | approach | outcome |
 | --- | --- |
 | ship `/app/ledger.db` as-is | malformed; four damaged pages |
-| let SQLite recover the pair | the log is ignored entirely; still malformed |
+| let SQLite recover the pair as supplied | the log is ignored entirely; still malformed |
 | salvage rows from the main database only | clean file, but the base state — three committed transactions are missing |
 | replay the whole valid chain | clean file that passes `integrity_check` and `foreign_key_check`, but one transaction too far |
 | trust frame headers, skip the checksum | lands on a superseded commit marker; the file is malformed |

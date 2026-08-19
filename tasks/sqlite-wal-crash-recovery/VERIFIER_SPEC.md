@@ -118,6 +118,7 @@ definition and are not independently meaningful).
 | `solution/golden_recover.py` output | PASS |
 | `build/negatives/alt_dump_restore.py` (schema + rows rebuilt through SQL) | PASS |
 | `build/negatives/alt_vacuum_into.py` (`VACUUM INTO`) | PASS |
+| `build/negatives/alt_repair_header.py` (repair the WAL header, let SQLite recover) | PASS |
 | missing `/app/recovered.db` | FAIL |
 | empty file | FAIL |
 | `negative_copy_main.py` (main database verbatim) | FAIL |
