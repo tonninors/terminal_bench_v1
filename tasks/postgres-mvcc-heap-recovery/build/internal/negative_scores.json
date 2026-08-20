@@ -1,0 +1,125 @@
+{
+  "reference_rows": 265,
+  "strategies": {
+    "1. greatest xmin per key": {
+      "rows": 301,
+      "duplicate_key_records": 0,
+      "missing": 0,
+      "extra": 36,
+      "wrong_values": 96,
+      "duplicated_keys": 0,
+      "keys_wrong_in_total": 132,
+      "script": "negative_a_max_xmin.py"
+    },
+    "2. ignore xmax entirely": {
+      "rows": 389,
+      "duplicate_key_records": 112,
+      "missing": 0,
+      "extra": 12,
+      "wrong_values": 84,
+      "duplicated_keys": 84,
+      "keys_wrong_in_total": 96,
+      "script": "negative_b_ignore_xmax.py"
+    },
+    "3. committed xmax means deleted": {
+      "rows": 161,
+      "duplicate_key_records": 0,
+      "missing": 104,
+      "extra": 0,
+      "wrong_values": 0,
+      "duplicated_keys": 0,
+      "keys_wrong_in_total": 104,
+      "script": "negative_l_committed_xmax_deleted.py"
+    },
+    "4a. HOT redirects walked as tuples": {
+      "rows": 280,
+      "duplicate_key_records": 15,
+      "missing": 0,
+      "extra": 0,
+      "wrong_values": 0,
+      "duplicated_keys": 15,
+      "keys_wrong_in_total": 15,
+      "script": "negative_d_ignore_hot.py"
+    },
+    "4b. heap-only versions skipped": {
+      "rows": 188,
+      "duplicate_key_records": 0,
+      "missing": 77,
+      "extra": 0,
+      "wrong_values": 0,
+      "duplicated_keys": 0,
+      "keys_wrong_in_total": 77,
+      "script": "negative_d2_skip_heap_only.py"
+    },
+    "5. aborted treated as committed": {
+      "rows": 239,
+      "duplicate_key_records": 6,
+      "missing": 38,
+      "extra": 6,
+      "wrong_values": 35,
+      "duplicated_keys": 6,
+      "keys_wrong_in_total": 79,
+      "script": "negative_c_aborted_visible.py"
+    },
+    "6. in-progress treated as committed": {
+      "rows": 227,
+      "duplicate_key_records": 0,
+      "missing": 44,
+      "extra": 6,
+      "wrong_values": 6,
+      "duplicated_keys": 0,
+      "keys_wrong_in_total": 56,
+      "script": "negative_e_in_progress_committed.py"
+    },
+    "7a. snapshot_xip ignored": {
+      "rows": 227,
+      "duplicate_key_records": 0,
+      "missing": 44,
+      "extra": 6,
+      "wrong_values": 6,
+      "duplicated_keys": 0,
+      "keys_wrong_in_total": 56,
+      "script": "negative_j_ignore_xip.py"
+    },
+    "7b. every recent xid is in progress": {
+      "rows": 238,
+      "duplicate_key_records": 0,
+      "missing": 33,
+      "extra": 6,
+      "wrong_values": 24,
+      "duplicated_keys": 0,
+      "keys_wrong_in_total": 63,
+      "script": "negative_j2_recent_is_in_progress.py"
+    },
+    "8. hint bits used as the commit log": {
+      "rows": 121,
+      "duplicate_key_records": 0,
+      "missing": 144,
+      "extra": 0,
+      "wrong_values": 0,
+      "duplicated_keys": 0,
+      "keys_wrong_in_total": 144,
+      "script": "negative_i_hint_bits_only.py"
+    },
+    "9. every physical tuple": {
+      "rows": 555,
+      "duplicate_key_records": 254,
+      "missing": 0,
+      "extra": 36,
+      "wrong_values": 168,
+      "duplicated_keys": 168,
+      "keys_wrong_in_total": 204,
+      "script": "negative_f_all_tuples.py"
+    },
+    "10. newest committed, no header state": {
+      "rows": 289,
+      "duplicate_key_records": 0,
+      "missing": 0,
+      "extra": 24,
+      "wrong_values": 49,
+      "duplicated_keys": 0,
+      "keys_wrong_in_total": 73,
+      "script": "negative_m_newest_committed.py"
+    }
+  }
+}

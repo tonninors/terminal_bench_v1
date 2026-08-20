@@ -1,10 +1,10 @@
-postgres_mvcc_heap_inputs.zip contains the three input files for the task. Unzip
+postgres_mvcc_heap_inputs_v2.zip contains the three input files for the task. Unzip
 them into /app so they appear as /app/heap_pages.bin, /app/tx_status.csv and
 /app/table_schema.json.
 
 heap_pages.bin
     The raw main fork of a single PostgreSQL 16 table, copied byte for byte from
-    the server's data directory: 4 consecutive 8192-byte heap blocks in
+    the server's data directory: 6 consecutive 8192-byte heap blocks in
     block-number order, starting at block 0. Each block is an unmodified
     PostgreSQL page - page header, line pointer array, and the heap tuples
     themselves with their original headers, flags and payloads. Several

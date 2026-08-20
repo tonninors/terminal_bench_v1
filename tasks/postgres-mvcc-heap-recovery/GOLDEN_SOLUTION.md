@@ -85,8 +85,14 @@ lp_len   = (raw >> 17) & 0x7FFF  # tuple length in bytes
 
 Every live version — including heap-only tuples that have no index entry — is
 reachable by simply visiting every `LP_NORMAL` slot, so no chain following is
-needed once redirects are skipped. This fixture has 323 `LP_NORMAL`, 37
-`LP_REDIRECT` and 34 `LP_DEAD` slots.
+needed once redirects are skipped. This fixture has 555 `LP_NORMAL`, 15
+`LP_REDIRECT` and 13 `LP_DEAD` slots.
+
+Both directions of getting this wrong are punished. Walking an `LP_REDIRECT` as
+a tuple duplicates 15 keys. Going the other way and *skipping* heap-only tuples,
+on the theory that they are internal HOT bookkeeping, loses 77 visible rows: a
+`HEAP_ONLY_TUPLE` is a complete row version that merely has no index entry, and
+on these pages it is very often the version the snapshot can see.
 
 ## Step 6 — parse the tuple header
 
@@ -167,25 +173,41 @@ if status[xmax] != "committed":    return True   # deleter aborted or still runn
 return not in_progress(xmax, snap)               # deleted after the snapshot? visible
 ```
 
-Three details carry real weight here:
+Four details carry real weight here:
 
-* **`xmax != 0` is not a deletion.** Three tuples in this fixture were locked by
-  a committed `SELECT ... FOR UPDATE`; their `xmax` names a committed
-  transaction, but `HEAP_XMAX_LOCK_ONLY` (and the `HEAP_XMAX_INVALID` hint
-  PostgreSQL later stamps on them) marks them live.
-* **Hint bits are not the commit log.** 46 of 323 tuples have no
-  `HEAP_XMIN_COMMITTED`, and only 4 of the 40 tuples inserted by aborted
-  transactions carry `HEAP_XMIN_INVALID`. Use `tx_status.csv`; the hints only
-  ever confirm it.
+* **`xmax != 0` is not a deletion, and this is the single biggest trap.** 53
+  tuples in this fixture were locked by `SELECT ... FOR UPDATE`, `FOR NO KEY
+  UPDATE`, `FOR SHARE` or `FOR KEY SHARE`. Their `xmax` names a real
+  transaction, and for 33 of them that transaction both committed *and* is
+  plainly visible to the target snapshot - so every rule of the form "xmax
+  committed means the row is gone" throws them away. What keeps them alive is
+  `HEAP_XMAX_LOCK_ONLY`, and nothing else: none of these tuples carries the
+  `HEAP_XMAX_INVALID` hint, because their pages were never pruned after the
+  locker finished. The infomask has to be read.
+* **Hint bits are not the commit log.** 126 of 555 tuples have no
+  `HEAP_XMIN_COMMITTED`, and 12 of the 53 tuples inserted by aborted
+  transactions carry no `HEAP_XMIN_INVALID` either. Use `tx_status.csv`; the
+  hints only ever confirm it.
 * **An aborted deleter leaves the row visible**, and an aborted inserter's tuple
-  is dead no matter what its `xmax` says.
+  is dead no matter what its `xmax` says. For 47 keys the tuple with the
+  greatest `xmin` is exactly such a dead version.
+* **The lock modes look different on the page.** `FOR KEY SHARE` sets
+  `HEAP_XMAX_KEYSHR_LOCK`, `FOR UPDATE` and `FOR NO KEY UPDATE` set
+  `HEAP_XMAX_EXCL_LOCK`, `FOR SHARE` sets both. All of them also set
+  `HEAP_XMAX_LOCK_ONLY`, which is why testing that bit - plus the legacy
+  exclusive-lock arm of `HEAP_XMAX_IS_LOCKED_ONLY` - covers every case.
 
 ## Step 9 — one row per primary key
 
 Collect the visible tuples, key them by the primary key columns, and assert that
 no key appears twice. MVCC guarantees at most one visible version per key; two
-would mean a parsing or visibility bug, not an ambiguous snapshot. Here 323
-physical tuples over 236 distinct keys reduce to exactly 210 visible rows.
+would mean a parsing or visibility bug, not an ambiguous snapshot. Here 555
+physical tuples over 301 distinct keys reduce to exactly 265 visible rows.
+
+40 keys have three or more physical versions still on the page and the deepest
+chain is seven tuples long, so this reduction is not "take the last one": for 12
+keys the visible version sits strictly inside its chain, with both older and
+newer versions present on the same page.
 
 ## Step 10 — write the CSV
 
@@ -199,15 +221,15 @@ oracle sorts by primary key for determinism.
 ## What the oracle reports on this fixture
 
 ```
-blocks                                            4
-line pointers      LP_NORMAL 323, LP_REDIRECT 37, LP_DEAD 34, LP_UNUSED 0
-physical tuples                                 323
-distinct primary keys on disk                   236
-keys with several physical versions              87
-visible rows                                    210
-snapshot                          xmin 770, xmax 774, xip [770, 771, 772]
-keys whose visible version is NOT the newest xmin 81
-tuples kept despite a non-zero lock-only xmax      3
+blocks                                            6
+line pointers      LP_NORMAL 555, LP_REDIRECT 15, LP_DEAD 13, LP_UNUSED 0
+physical tuples                                 555
+distinct primary keys on disk                   301
+keys with several physical versions             168
+visible rows                                    265
+snapshot        xmin 781, xmax 795, xip [781,783,785,787,788,790,791,792,793]
+keys whose visible version is NOT the newest xmin 96
+tuples kept despite a non-zero lock-only xmax     53
 frozen tuples seen                                0
 hint-bit conflicts with tx_status                 0
 ```
@@ -217,9 +239,9 @@ hint-bit conflicts with tx_status                 0
 `build/internal/golden.csv` was produced by the PostgreSQL server itself, by
 running `SELECT * FROM account_ledger ORDER BY account_id` inside the very
 `REPEATABLE READ` transaction that owns the target snapshot. The oracle's output
-is **byte-identical** to it (`build/run_all_validation.sh` step 5,
+is **byte-identical** to it, on all 265 rows, (`build/run_all_validation.sh` step 5,
 `build/fixture_test.py::test_the_page_level_answer_equals_the_postgresql_reference`).
-The page-level recovery and the database engine agree on all 210 rows.
+The page-level recovery and the database engine agree on all 265 rows.
 
 `build/negatives/alt_independent_parser.py` is a second recovery written from
 scratch — different parser structure, different formulation of the visibility

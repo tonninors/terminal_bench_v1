@@ -40,7 +40,7 @@ chk(bool(inxip), "a committed transaction sits inside snapshot_xip: %s" % inxip)
 after = [int(r["xid"]) for r in tx if r["status"]=="committed" and int(r["xid"]) >= schema["snapshot_xmax"]]
 chk(bool(after), "committed transactions above snapshot_xmax: %s" % after)
 
-z = zipfile.ZipFile("dist/postgres_mvcc_heap_inputs.zip")
+z = zipfile.ZipFile("dist/postgres_mvcc_heap_inputs_v2.zip")
 names = sorted(z.namelist())
 chk(names == ["heap_pages.bin","table_schema.json","tx_status.csv"], "ZIP contents exactly: %s" % names)
 chk(not any(i.is_dir() for i in z.infolist()) and not any("/" in n for n in names), "no containing folder in the ZIP")
@@ -83,7 +83,7 @@ body = taskyaml.split("instruction: |\n",1)[1]
 dedented = "\n".join(l[2:] if l.startswith("  ") else l for l in body.split("\n")).strip()
 chk(dedented == prompt_raw.strip(), "task.yaml instruction matches FINAL_PROMPT.txt verbatim")
 
-required = ["FINAL_PROMPT.txt","FILE_DESCRIPTION.txt","DIFFICULTY_EXPLANATION.md","GOLDEN_SOLUTION.md",
+required = ["V1_VS_V2_DIFFICULTY.md", "FINAL_PROMPT.txt","FILE_DESCRIPTION.txt","DIFFICULTY_EXPLANATION.md","GOLDEN_SOLUTION.md",
             "VERIFIER_SPEC.md","MANIFEST.md","INTERNAL_NOTES.md","task.yaml","Dockerfile","solution.sh",
             "run-tests.sh","docker-compose.yaml",".gitignore"]
 missing = [f for f in required if not pathlib.Path(f).exists()]
@@ -91,6 +91,34 @@ chk(not missing, "all required files present" + (" (missing %s)" % missing if mi
 dirs = ["build","solution","tests","artifacts","dist","build/negatives","build/internal"]
 chk(all(pathlib.Path(d).is_dir() for d in dirs), "all required directories present")
 chk("All solver-facing data and database contents are synthetic and self-created for" in pathlib.Path("DIFFICULTY_EXPLANATION.md").read_text(encoding="utf-8"), "difficulty doc carries the required synthetic-data statement")
+
+# ---- v2: the solver-facing contract is unchanged ------------------------
+print()
+dockerfile = pathlib.Path("Dockerfile").read_text(encoding="utf-8")
+chk("/app/evidence" not in dockerfile,
+    "the image no longer creates duplicate inputs under /app/evidence")
+for f in ("heap_pages.bin", "tx_status.csv", "table_schema.json"):
+    chk("/app/" + f in dockerfile, "the image still provides /app/" + f)
+chk("/app/recovered.csv" in prompt_raw,
+    "/app/recovered.csv is still the sole requested output")
+chk(not pathlib.Path("dist/postgres_mvcc_heap_inputs.zip").exists(),
+    "the stale v1 bundle has been removed from dist/")
+rep = json.loads(pathlib.Path(
+    "build/internal/generation_report.json").read_text(encoding="utf-8"))
+chk(rep["lock_only_tuples_requiring_infomask"] >= 15,
+    "lock-only xmax needs the infomask on %d tuple(s)"
+    % rep["lock_only_tuples_requiring_infomask"])
+chk(len(rep["committed_but_listed_in_xip"]) >= 3,
+    "committed transactions listed in snapshot_xip: %s"
+    % rep["committed_but_listed_in_xip"])
+chk(len(rep["committed_inside_xid_range_but_not_in_xip"]) >= 3,
+    "committed transactions inside the xid range but absent from xip: %s"
+    % rep["committed_inside_xid_range_but_not_in_xip"])
+scores = json.loads(pathlib.Path(
+    "build/internal/negative_scores.json").read_text(encoding="utf-8"))
+worst = min(v["keys_wrong_in_total"] for v in scores["strategies"].values())
+chk(worst >= 10,
+    "every measured naive strategy is wrong on >= 10 keys (weakest: %d)" % worst)
 
 print()
 print("=" * 46)

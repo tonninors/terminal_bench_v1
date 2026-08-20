@@ -1,21 +1,28 @@
 {
+  "fixture_version": 2,
   "postgres_version_full": "PostgreSQL 16.15 (Debian 16.15-1.pgdg13+2) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
   "block_size": 8192,
-  "blocks": 4,
-  "heap_bytes": 32768,
-  "heap_sha256": "469c05309cd49962e8b8fc17ef32a359eb7e740a75c76df843d5c10d8298955e",
+  "blocks": 6,
+  "heap_bytes": 49152,
+  "heap_sha256": "24af7a463883b3a237f495e08bc30bbb2b6bb10585bccf0f7caeb5863104101a",
   "relation_path": "base/16384/16430",
-  "snapshot_text": "770:774:770,771,772",
-  "snapshot_xmin": 770,
-  "snapshot_xmax": 774,
+  "snapshot_text": "781:795:781,783,785,787,788,790,791,792,793",
+  "snapshot_xmin": 781,
+  "snapshot_xmax": 795,
   "snapshot_xip": [
-    770,
-    771,
-    772
+    781,
+    783,
+    785,
+    787,
+    788,
+    790,
+    791,
+    792,
+    793
   ],
   "transaction_xids": {
-    "T_base_insert": 735,
-    "T_hot_rounds": [
+    "A_base_insert": 735,
+    "A_churn_rounds": [
       736,
       737,
       738,
@@ -37,61 +44,264 @@
       754,
       755,
       756,
-      757,
-      758,
-      759
+      757
     ],
-    "T_hot_final": 760,
-    "T_update_committed": 761,
-    "T_delete_committed": 762,
-    "T_multiversion": [
-      763,
-      764,
-      765
+    "A_churn_final": 758,
+    "A_nonhot_update_pruned": 759,
+    "A_delete_pruned": 760,
+    "B_lock_for_update": 761,
+    "B_lock_for_no_key_update": 762,
+    "B_lock_for_share": 763,
+    "B_lock_for_key_share": 764,
+    "B_lock_aborted": 765,
+    "B_upd_before_lock": 766,
+    "B_lock_after_update": 767,
+    "B_update_committed": 768,
+    "B_multi_version": [
+      769,
+      770,
+      771
     ],
-    "T_insert_aborted": 766,
-    "T_update_aborted": 767,
-    "T_delete_aborted": 768,
-    "T_lock_only": 769,
-    "T_in_progress_1": 770,
-    "T_in_progress_2": 771,
-    "T_in_xip_then_committed": 772,
-    "T_committed_after_open_writers": 773,
-    "T_post_update": 774,
-    "T_post_insert": 775,
-    "T_post_delete": 776,
-    "T_post_hot_update": 777,
-    "T_post_update_aborted": 778,
-    "T_post_delete_aborted": 779
+    "B_delete_committed": 772,
+    "B_insert_aborted": 773,
+    "B_update_aborted": 774,
+    "B_delete_aborted": 775,
+    "B_mix_update_aborted": 776,
+    "B_mix_update_committed": 777,
+    "B_cal_update_committed": 778,
+    "B_cal_update_aborted": 779,
+    "B_cal_lock": 780,
+    "C_writer_w1_upd_commits_later": 781,
+    "C_gap_upd_1": 782,
+    "C_writer_w2_del_commits_later": 783,
+    "C_gap_del": 784,
+    "C_writer_w3_ins_commits_later": 785,
+    "C_gap_upd_2": 786,
+    "C_writer_w4_lock_commits_later": 787,
+    "C_writer_w5_upd_aborts_later": 788,
+    "C_gap_upd_3": 789,
+    "C_writer_w6_upd_never_finishes": 790,
+    "C_writer_w7_del_never_finishes": 791,
+    "C_writer_w8_ins_never_finishes": 792,
+    "C_writer_w9_lock_never_finishes": 793,
+    "C_gap_upd_4": 794,
+    "D_post_update": 795,
+    "D_post_insert": 796,
+    "D_post_delete": 797,
+    "D_post_chain": [
+      798,
+      799,
+      800
+    ],
+    "D_post_update_aborted": 801,
+    "D_post_delete_aborted": 802,
+    "D_post_lock": 803
+  },
+  "id_groups": {
+    "A_churn": [
+      1,
+      8
+    ],
+    "A_churn_long": [
+      9,
+      14
+    ],
+    "A_nonhot_pruned": [
+      15,
+      22
+    ],
+    "A_del_pruned": [
+      23,
+      28
+    ],
+    "B_upd_commit": [
+      29,
+      36
+    ],
+    "B_multi3": [
+      37,
+      44
+    ],
+    "B_del_commit": [
+      45,
+      50
+    ],
+    "B_upd_abort": [
+      51,
+      58
+    ],
+    "B_del_abort": [
+      59,
+      64
+    ],
+    "B_abort_then_commit": [
+      65,
+      70
+    ],
+    "B_commit_abort_lock": [
+      71,
+      76
+    ],
+    "B_presnap_chain": [
+      77,
+      82
+    ],
+    "C_xip_upd_c": [
+      83,
+      88
+    ],
+    "C_gap_upd_1": [
+      89,
+      94
+    ],
+    "C_xip_del_c": [
+      95,
+      100
+    ],
+    "C_gap_del": [
+      101,
+      106
+    ],
+    "C_gap_upd_2": [
+      107,
+      112
+    ],
+    "C_xip_lock_c": [
+      113,
+      117
+    ],
+    "C_xip_upd_a": [
+      118,
+      123
+    ],
+    "C_gap_upd_3": [
+      124,
+      129
+    ],
+    "C_ip_upd": [
+      130,
+      135
+    ],
+    "C_ip_del": [
+      136,
+      141
+    ],
+    "C_ip_lock": [
+      142,
+      146
+    ],
+    "C_gap_upd_4": [
+      147,
+      152
+    ],
+    "D_post_upd": [
+      153,
+      160
+    ],
+    "D_post_del": [
+      161,
+      166
+    ],
+    "D_hot_chain": [
+      167,
+      174
+    ],
+    "D_post_upd_abort": [
+      175,
+      180
+    ],
+    "D_post_del_abort": [
+      181,
+      186
+    ],
+    "D_post_lock": [
+      187,
+      191
+    ],
+    "filler": [
+      192,
+      251
+    ],
+    "A_lock_for_update": [
+      252,
+      257
+    ],
+    "A_lock_for_no_key_update": [
+      258,
+      262
+    ],
+    "A_lock_for_share": [
+      263,
+      267
+    ],
+    "A_lock_for_key_share": [
+      268,
+      272
+    ],
+    "A_lock_aborted": [
+      273,
+      277
+    ],
+    "A_upd_then_lock": [
+      278,
+      283
+    ]
   },
   "tx_status_counts": {
-    "aborted": 5,
-    "committed": 12,
-    "in progress": 2
+    "aborted": 9,
+    "committed": 33,
+    "in progress": 4
   },
-  "xids_in_tx_status": 19,
-  "committed_before_snapshot": 7,
-  "committed_after_snapshot": 4,
+  "xids_in_tx_status": 46,
+  "committed_visible_to_snapshot": 22,
+  "committed_after_snapshot": [
+    795,
+    796,
+    797,
+    798,
+    799,
+    800,
+    803
+  ],
   "committed_but_listed_in_xip": [
-    772
+    781,
+    783,
+    785,
+    787
+  ],
+  "aborted_listed_in_xip": [
+    788
+  ],
+  "committed_inside_xid_range_but_not_in_xip": [
+    782,
+    784,
+    786,
+    789,
+    794
   ],
   "still_in_progress": [
-    770,
-    771
+    790,
+    791,
+    792,
+    793
   ],
   "line_pointer_counts": {
     "LP_UNUSED": 0,
-    "LP_NORMAL": 323,
-    "LP_REDIRECT": 37,
-    "LP_DEAD": 34
+    "LP_NORMAL": 555,
+    "LP_REDIRECT": 15,
+    "LP_DEAD": 13
   },
-  "physical_tuples": 323,
-  "tuples_with_nulls": 83,
-  "hot_updated_tuples": 60,
-  "heap_only_tuples": 67,
-  "lock_only_tuples": 3,
+  "physical_tuples": 555,
+  "tuples_with_nulls": 135,
+  "hot_updated_tuples": 160,
+  "heap_only_tuples": 187,
+  "lock_only_tuples": 53,
+  "lock_only_tuples_requiring_infomask": 33,
+  "tuples_without_xmin_committed_hint": 126,
+  "tuples_with_aborted_xmin": 53,
+  "tuples_with_aborted_xmin_and_invalid_hint": 41,
   "toast_chunks": 0,
-  "golden_rows": 210,
+  "golden_rows": 265,
   "excluded_cases_present": {
     "multixact": 0,
     "frozen": 0,

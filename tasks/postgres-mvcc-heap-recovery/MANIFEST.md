@@ -6,19 +6,18 @@ Task root: `tasks/postgres-mvcc-heap-recovery/`
 
 | path | role |
 | --- | --- |
-| `artifacts/heap_pages.bin` | 4 raw 8192-byte PostgreSQL 16 heap blocks, block 0 first — task input |
+| `artifacts/heap_pages.bin` | 6 raw 8192-byte PostgreSQL 16 heap blocks, block 0 first — task input |
 | `artifacts/tx_status.csv` | `xid,status` for every transaction id on those pages — task input |
 | `artifacts/table_schema.json` | columns, types, nullability, primary key, PostgreSQL version, block size and the target snapshot — task input |
-| `dist/postgres_mvcc_heap_inputs.zip` | upload bundle; contains **only** those three files, at the archive root, no directory nesting |
+| `dist/postgres_mvcc_heap_inputs_v2.zip` | upload bundle; contains **only** those three files, at the archive root, no directory nesting |
 | `FINAL_PROMPT.txt` | the prompt shown to the solver |
 | `FILE_DESCRIPTION.txt` | the Outlier "File Description" text for the bundle |
 | `task.yaml` (`instruction:` field) | the same prompt, in the Terminal Bench task definition |
-| `Dockerfile`, `docker-compose.yaml` | build the task container; copy the three inputs to `/app/` and read-only copies to `/app/evidence/` |
+| `Dockerfile`, `docker-compose.yaml` | build the task container; copy the three inputs to `/app/` |
 
-Inside the container the solver sees `/app/heap_pages.bin`,
-`/app/tx_status.csv`, `/app/table_schema.json`, `/app/evidence/` (read-only,
-byte-identical copies, so a partial write cannot destroy the evidence) and
-nothing else from this repository. The tests, the oracle, the generator and the
+Inside the container the solver sees exactly `/app/heap_pages.bin`,
+`/app/tx_status.csv` and `/app/table_schema.json` - the three files the prompt
+names, with no duplicate copies and nothing else from this repository. The tests, the oracle, the generator and the
 PostgreSQL reference answer are copied in only after the agent has finished, per
 the Terminal Bench execution model.
 
@@ -34,7 +33,10 @@ the Terminal Bench execution model.
 | `build/fixture_test.py` | asserts the fixture's properties (exclusions, HOT artefacts, snapshot boundary, trap strength) |
 | `build/harness_test.py` | PASS/FAIL matrix over every candidate answer |
 | `build/run_all_validation.sh` | the whole local validation suite |
-| `build/negatives/*.py` | intentionally wrong answers, plus two alternate correct constructions |
+| `build/negatives/*.py` | twelve intentionally wrong answers, plus format/key-damage variants and two alternate correct constructions |
+| `build/measure_negatives.py` | scores every wrong strategy against the correct answer |
+| `build/internal/negative_scores.json` | the measured divergence of each wrong strategy |
+| `V1_VS_V2_DIFFICULTY.md` | what changed between the two fixture generations, and why |
 | `build/internal/golden.csv` | **the reference answer, produced by PostgreSQL itself**; used to build and validate the fixture, never by the oracle |
 | `build/internal/generation_report.json` | machine-readable record of the generated case, including every transaction id |
 | `build/internal/page_items.json` | `pageinspect` dump of the captured bytes, used to cross-check the parser |
@@ -57,12 +59,12 @@ byte-reproducible.
 
 ```
 $ python3 build/make_zip.py
-dist/postgres_mvcc_heap_inputs.zip
-  sha256 149c6e7b21dabb8a7bf89e8e5f4f4b411edcb9261b5da228799cf60d60c8a1c6
+dist/postgres_mvcc_heap_inputs_v2.zip
+  sha256 8414cc24a5d4ab3f6d7262452026c30743bd049384a8136eb101bc7b779df5f6
   3 member(s), no directory entries:
-         32768  heap_pages.bin       sha256 469c05309cd49962e8b8fc17ef32a359eb7e740a75c76df843d5c10d8298955e
-          1067  table_schema.json    sha256 ada6f1dbbf9d16dd3213196f357ae9b38c00b5338e3a9862f191cc2847c77c07
-           271  tx_status.csv        sha256 0ac8f5605debbe68ff432ab2be4e7d7a408225f14d15c783f4c0e046b798e65d
+         49152  heap_pages.bin       sha256 24af7a463883b3a237f495e08bc30bbb2b6bb10585bccf0f7caeb5863104101a
+          1121  table_schema.json    sha256 d22970565b32dfe9294b4a413dd451118d87e4269b1d306213c4e856443fd37d
+           645  tx_status.csv        sha256 4a25a6a31ed3aaf451b3e99f79284a66125b94b1062744949e2b17f438edabf3
 ```
 
 `make_zip.py` asserts on every build that the member list is exactly those three
@@ -75,7 +77,7 @@ bytes, and that `table_schema.json` carries no answer-shaped key.
 
 ## The three inputs, in full
 
-`table_schema.json` (1067 bytes) describes `public.account_ledger`:
+`table_schema.json` (1121 bytes) describes `public.account_ledger`:
 
 | # | column | type | nullable |
 | --- | --- | --- | --- |
@@ -88,15 +90,17 @@ bytes, and that `table_schema.json` carries no answer-shaped key.
 | 7 | `owner_note` | `text` | yes |
 
 plus `postgres_version` `16.15`, `block_size` 8192, `primary_key`
-`["account_id"]`, and the target snapshot `snapshot_xmin` 770, `snapshot_xmax`
-774, `snapshot_xip` `[770, 771, 772]`.
+`["account_id"]`, and the target snapshot `snapshot_xmin` 781, `snapshot_xmax`
+795, `snapshot_xip` `[781, 783, 785, 787, 788, 790, 791, 792, 793]`.
 
-`tx_status.csv` (271 bytes) holds 19 transactions: 12 `committed`, 5 `aborted`,
-2 `in_progress`.
+`tx_status.csv` (645 bytes) holds 46 transactions: 33 `committed`, 9 `aborted`,
+4 `in_progress`.
 
-`heap_pages.bin` (32768 bytes) is 4 blocks holding 394 line pointers — 323
-`LP_NORMAL`, 37 `LP_REDIRECT`, 34 `LP_DEAD` — over 236 distinct primary keys, of
-which 210 are visible under the target snapshot.
+`heap_pages.bin` (49152 bytes) is 6 blocks holding 583 line pointers — 555
+`LP_NORMAL`, 15 `LP_REDIRECT`, 13 `LP_DEAD` — over 301 distinct primary keys, of
+which 265 are visible under the target snapshot. 53 of the surviving tuples
+carry a lock-only `xmax`, 40 keys have three or more physical versions, and the
+deepest chain is seven tuples long.
 
 ## Dependencies
 

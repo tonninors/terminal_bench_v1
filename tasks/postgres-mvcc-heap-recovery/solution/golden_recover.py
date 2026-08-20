@@ -35,9 +35,12 @@ LP_UNUSED, LP_NORMAL, LP_REDIRECT, LP_DEAD = 0, 1, 2, 3
 HEAP_HASNULL = 0x0001
 HEAP_HASVARWIDTH = 0x0002
 HEAP_HASEXTERNAL = 0x0004
+HEAP_XMAX_KEYSHR_LOCK = 0x0010
 HEAP_COMBOCID = 0x0020
 HEAP_XMAX_EXCL_LOCK = 0x0040
 HEAP_XMAX_LOCK_ONLY = 0x0080
+# HEAP_LOCK_MASK = HEAP_XMAX_SHR_LOCK | HEAP_XMAX_EXCL_LOCK | HEAP_XMAX_KEYSHR_LOCK
+HEAP_LOCK_MASK = HEAP_XMAX_KEYSHR_LOCK | HEAP_XMAX_EXCL_LOCK
 HEAP_XMIN_COMMITTED = 0x0100
 HEAP_XMIN_INVALID = 0x0200
 HEAP_XMIN_FROZEN = HEAP_XMIN_COMMITTED | HEAP_XMIN_INVALID
@@ -277,6 +280,19 @@ class TxStatus:
         return st
 
 
+def xmax_is_locked_only(infomask: int) -> bool:
+    """HEAP_XMAX_IS_LOCKED_ONLY (htup_details.h).
+
+    An xmax that records a row lock rather than a deletion.  The explicit
+    HEAP_XMAX_LOCK_ONLY bit covers every lock mode on a modern page; the second
+    arm keeps faith with the macro, which also treats a bare exclusive lock bit
+    (no MultiXact, no key-share) as lock-only for tuples written by older
+    servers."""
+    if infomask & HEAP_XMAX_LOCK_ONLY:
+        return True
+    return (infomask & (HEAP_XMAX_IS_MULTI | HEAP_LOCK_MASK)) == HEAP_XMAX_EXCL_LOCK
+
+
 def xmin_committed(t: Tuple, status: TxStatus, notes: dict) -> bool:
     if (t.infomask & HEAP_XMIN_FROZEN) == HEAP_XMIN_FROZEN or t.xmin == FROZEN_XID:
         notes["frozen"] += 1
@@ -304,16 +320,21 @@ def tuple_visible(t: Tuple, snap: Snapshot, status: TxStatus, notes: dict) -> bo
         if snap.in_progress(t.xmin):
             return False                  # inserted after this snapshot was taken
 
-    if t.xmax != INVALID_XID and t.infomask & HEAP_XMAX_LOCK_ONLY:
+    if t.xmax != INVALID_XID and xmax_is_locked_only(t.infomask):
         notes["lock_only"] += 1           # a row lock, not a deletion
 
-    # Same order as HeapTupleSatisfiesMVCC: the XMAX_INVALID hint short-circuits
-    # first, and PostgreSQL sets it on lock-only tuples once the locker is done.
+    # Same order as HeapTupleSatisfiesMVCC.
     if t.infomask & HEAP_XMAX_INVALID:
         return True                       # hint bit: xmax is aborted or unset
     if t.xmax == INVALID_XID:
         return True
-    if t.infomask & HEAP_XMAX_LOCK_ONLY:
+    if xmax_is_locked_only(t.infomask):
+        # SELECT ... FOR UPDATE / FOR SHARE / FOR KEY SHARE puts the locker's
+        # xid in xmax.  The row is still live no matter what the commit log
+        # says about that transaction, and PostgreSQL only stamps
+        # HEAP_XMAX_INVALID over it if the page is later pruned - which never
+        # happened for these pages.  Reading xmax without this test deletes
+        # rows that were merely locked.
         return True
 
     st = status(t.xmax)

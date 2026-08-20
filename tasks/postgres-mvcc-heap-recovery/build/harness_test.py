@@ -49,6 +49,28 @@ def verify(candidate: Path):
         env=_env({"TB_RECOVERED_CSV": str(candidate)}))
 
 
+def keys_wrong(correct: Path, candidate: Path) -> int:
+    """Primary keys the candidate gets wrong: missing, extra, duplicated, or
+    carrying different values."""
+    import csv
+
+    def rows(p):
+        with p.open(encoding="utf-8", newline="") as fh:
+            r = [x for x in csv.reader(fh) if x]
+        return r[1:]
+
+    want = {r[0]: tuple(r) for r in rows(correct)}
+    got_rows = rows(candidate)
+    keys = [r[0] for r in got_rows]
+    seen, repeated = set(), set()
+    for k in keys:
+        (repeated if k in seen else seen).add(k)
+    missing = set(want) - set(keys)
+    extra = set(keys) - set(want)
+    wrong = {r[0] for r in got_rows if r[0] in want and tuple(r) != want[r[0]]}
+    return len(missing | extra | wrong | repeated)
+
+
 def failed_tests(result) -> set:
     out = set()
     for line in result.stdout.splitlines():
@@ -114,22 +136,31 @@ def test_postgres_reference_rendering_passes(tmp_path):
 
 # ------------------------------------------------------------------ negatives
 NEGATIVES = [
-    ("A-max-xmin", "negative_a_max_xmin.py", STD,
-     {"test_content_digest", "test_row_values_match_the_visible_state"}),
-    ("B-ignore-xmax", "negative_b_ignore_xmax.py", STD,
+    ("1-max-xmin", "negative_a_max_xmin.py", STD,
+     {"test_content_digest", "test_row_values_match_the_visible_state",
+      "test_no_unexpected_primary_key"}),
+    ("2-ignore-xmax", "negative_b_ignore_xmax.py", STD,
      {"test_no_duplicate_primary_keys", "test_content_digest"}),
-    ("C-aborted-visible", "negative_c_aborted_visible.py", STD,
-     {"test_content_digest"}),
-    ("D-ignore-hot", "negative_d_ignore_hot.py", STD,
+    ("3-committed-xmax-is-delete", "negative_l_committed_xmax_deleted.py", STD,
+     {"test_no_missing_primary_key", "test_content_digest"}),
+    ("4a-hot-redirect-as-tuple", "negative_d_ignore_hot.py", STD,
      {"test_no_duplicate_primary_keys"}),
-    ("E-in-progress-committed", "negative_e_in_progress_committed.py", STD,
+    ("4b-skip-heap-only-tuples", "negative_d2_skip_heap_only.py", STD,
+     {"test_no_missing_primary_key", "test_content_digest"}),
+    ("5-aborted-treated-committed", "negative_c_aborted_visible.py", STD,
+     {"test_content_digest", "test_no_duplicate_primary_keys"}),
+    ("6-in-progress-treated-committed", "negative_e_in_progress_committed.py", STD,
      {"test_content_digest"}),
-    ("F-all-tuples", "negative_f_all_tuples.py", STD,
+    ("7a-ignore-snapshot-xip", "negative_j_ignore_xip.py", STD,
+     {"test_content_digest"}),
+    ("7b-recent-is-in-progress", "negative_j2_recent_is_in_progress.py", STD,
+     {"test_content_digest"}),
+    ("8-hint-bits-only", "negative_i_hint_bits_only.py", STD,
+     {"test_content_digest", "test_no_missing_primary_key"}),
+    ("9-every-physical-tuple", "negative_f_all_tuples.py", STD,
      {"test_no_duplicate_primary_keys", "test_content_digest"}),
-    ("I-hint-bits-only", "negative_i_hint_bits_only.py", STD,
-     {"test_content_digest"}),
-    ("J-ignore-xip", "negative_j_ignore_xip.py", STD,
-     {"test_content_digest"}),
+    ("10-newest-committed-no-header", "negative_m_newest_committed.py", STD,
+     {"test_content_digest", "test_no_unexpected_primary_key"}),
 ]
 
 
@@ -143,6 +174,21 @@ def test_negative_fails(tmp_path, label, script, extra, expect_failed):
     assert expect_failed & got, (
         f"{label} failed, but not on the expected checks. "
         f"expected any of {sorted(expect_failed)}, got {sorted(got)}")
+
+
+MIN_KEYS_OFF = 10
+
+
+@pytest.mark.parametrize("label,script,extra,_expect",
+                         NEGATIVES, ids=[n[0] for n in NEGATIVES])
+def test_negative_is_wrong_on_many_keys(tmp_path, oracle_csv, label, script,
+                                        extra, _expect):
+    """A near-miss is not enough: each wrong strategy has to be wrong on a
+    number of independent primary keys, so passing cannot come down to luck."""
+    out = make(tmp_path, script, *extra)
+    keys_off = keys_wrong(oracle_csv, out)
+    assert keys_off >= MIN_KEYS_OFF, (
+        f"{label} is wrong on only {keys_off} key(s); the trap is too weak")
 
 
 @pytest.mark.parametrize("mode,expect", [

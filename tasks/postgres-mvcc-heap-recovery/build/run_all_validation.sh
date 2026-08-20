@@ -85,6 +85,18 @@ done
 if [ "$(sort -u "$TMP/rc" | tr -d '\n')" = "0" ]; then ok "three runs, identical verdict"
 else bad "verifier verdict varied"; fi
 
+step "7b. how far off each wrong strategy lands"
+$PY build/measure_negatives.py | sed 's/^/  /' || bad "negative measurement failed"
+$PY - <<'PYEOF' || bad "a wrong strategy is too close to correct"
+import json
+d = json.load(open("build/internal/negative_scores.json"))
+weak = {k: v["keys_wrong_in_total"] for k, v in d["strategies"].items()
+        if v["keys_wrong_in_total"] < 10}
+assert not weak, "strategies wrong on fewer than 10 keys: %r" % weak
+print("  every wrong strategy misses at least 10 independent primary keys")
+PYEOF
+ok "each naive strategy is wrong on many keys"
+
 step "8. full PASS/FAIL matrix (negatives, alternates, malformed, missing)"
 $PYTEST -q -p no:cacheprovider build/harness_test.py \
   && ok "matrix green" || bad "matrix failed"
@@ -100,15 +112,17 @@ TB_RECOVERED_CSV="$TMP/via_sh.csv" $PYTEST -q -p no:cacheprovider tests/test_out
 
 step "10. rebuild and inspect the solver ZIP"
 $PY build/make_zip.py | sed 's/^/  /' || bad "ZIP build/inspection failed"
-sha_a=$(sha256sum dist/postgres_mvcc_heap_inputs.zip | cut -d" " -f1)
+sha_a=$(sha256sum dist/postgres_mvcc_heap_inputs_v2.zip | cut -d" " -f1)
 $PY build/make_zip.py >/dev/null
-sha_b=$(sha256sum dist/postgres_mvcc_heap_inputs.zip | cut -d" " -f1)
+sha_b=$(sha256sum dist/postgres_mvcc_heap_inputs_v2.zip | cut -d" " -f1)
 [ "$sha_a" = "$sha_b" ] && ok "ZIP is byte-reproducible" || bad "ZIP is not byte-reproducible"
 
 step "11. the ZIP leaks nothing"
 $PY - <<'PYEOF' || bad "ZIP leak check failed"
 import zipfile, json, pathlib
-z = zipfile.ZipFile("dist/postgres_mvcc_heap_inputs.zip")
+stale = pathlib.Path("dist/postgres_mvcc_heap_inputs.zip")
+assert not stale.exists(), "the stale v1 bundle is still present in dist/"
+z = zipfile.ZipFile("dist/postgres_mvcc_heap_inputs_v2.zip")
 names = sorted(z.namelist())
 assert names == ["heap_pages.bin", "table_schema.json", "tx_status.csv"], names
 golden = pathlib.Path("build/internal/golden.csv").read_bytes()

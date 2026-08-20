@@ -98,8 +98,8 @@ a binary blob all fail at stage A rather than raising an uncaught error.
 ## Proven PASS/FAIL matrix
 
 `build/harness_test.py` runs the verifier over every candidate and asserts both
-the verdict and, for the negatives, which checks broke. Counts below are against
-the 210-row correct answer.
+the verdict and, for the negatives, which checks broke, plus how many
+independent primary keys each one gets wrong.
 
 ### Must PASS
 
@@ -112,32 +112,53 @@ the 210-row correct answer.
 
 ### Must FAIL
 
-| candidate | rows | dup PK | missing | extra | wrong values | first failing check |
-| --- | --- | --- | --- | --- | --- | --- |
-| A greatest `xmin` per key | 236 | 0 | 0 | 26 | 81 | values / digest |
-| B inserter committed, `xmax` ignored | 226 | 6 | 0 | 10 | 6 | duplicate keys |
-| C aborted transactions treated as committed | 170 | 0 | 44 | 4 | 0 | missing keys / digest |
-| D HOT redirects walked as tuples | 247 | 37 | 0 | 0 | 0 | duplicate keys |
-| E in-progress treated as committed | 209 | 0 | 6 | 5 | 26 | values / digest |
-| F every physical tuple | 323 | 87 | 0 | 26 | 87 | duplicate keys |
-| G one key dropped | 209 | 0 | 1 | 0 | 0 | missing key |
-| G one key duplicated | 211 | 1 | 0 | 0 | 0 | duplicate key |
-| H NULLs written as empty fields | 210 | 0 | 0 | 0 | — | NULL representation |
-| H columns reordered | 210 | — | — | — | — | header order |
-| H header omitted | 209 | — | — | — | — | header |
-| I hint bits used as the commit log | 150 | 0 | 65 | 5 | 46 | missing keys / digest |
-| J `snapshot_xip` ignored | 197 | 0 | 15 | 2 | 3 | values / digest |
-| K JSON instead of CSV | — | — | — | — | — | header / parse |
-| K binary blob | — | — | — | — | — | NUL bytes / UTF-8 |
-| K empty file | — | — | — | — | — | file non-empty |
-| missing `/app/recovered.csv` | — | — | — | — | — | file exists |
-| a directory at that path | — | — | — | — | — | regular file |
+Counts are against the 265-row correct answer, measured by
+`build/measure_negatives.py`. "keys off" counts primary keys that are missing,
+extra, duplicated or carrying wrong values.
+
+| # | strategy | rows | dup PK | missing | extra | wrong values | keys off | first failing check |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 1 | greatest `xmin` per key | 301 | 0 | 0 | 36 | 96 | **132** | unexpected keys / digest |
+| 2 | ignore `xmax` entirely | 389 | 112 | 0 | 12 | 84 | **96** | duplicate keys |
+| 3 | a committed `xmax` means deleted | 161 | 0 | 104 | 0 | 0 | **104** | missing keys |
+| 4a | HOT redirects walked as tuples | 280 | 15 | 0 | 0 | 0 | **15** | duplicate keys |
+| 4b | heap-only versions skipped | 188 | 0 | 77 | 0 | 0 | **77** | missing keys |
+| 5 | aborted treated as committed | 239 | 6 | 38 | 6 | 35 | **79** | duplicate keys / digest |
+| 6 | in-progress treated as committed | 227 | 0 | 44 | 6 | 6 | **56** | missing keys / digest |
+| 7a | `snapshot_xip` ignored | 227 | 0 | 44 | 6 | 6 | **56** | missing keys / digest |
+| 7b | every recent xid is in progress | 238 | 0 | 33 | 6 | 24 | **63** | missing keys / digest |
+| 8 | hint bits used as the commit log | 121 | 0 | 144 | 0 | 0 | **144** | missing keys |
+| 9 | every physical tuple | 555 | 254 | 0 | 36 | 168 | **204** | duplicate keys |
+| 10 | newest committed, no header state | 289 | 0 | 0 | 24 | 49 | **73** | unexpected keys / digest |
+
+Strategies 6 and 7a land on the same summary counts but produce different files;
+both are checked independently.
+
+Additional candidates that must also fail:
+
+| candidate | first failing check |
+| --- | --- |
+| one primary key dropped | missing key |
+| one primary key duplicated | duplicate key |
+| NULLs written as empty fields | NULL representation |
+| columns reordered | header order |
+| header omitted | header |
+| JSON instead of CSV | header / parse |
+| binary blob | NUL bytes / UTF-8 |
+| empty file | file non-empty |
+| missing `/app/recovered.csv` | file exists |
+| a directory at that path | regular file |
+
+`build/harness_test.py` asserts, for every strategy in the first table, both that
+the verifier rejects it **and** that it is wrong on at least 10 independent
+primary keys, so no wrong strategy can slip through as a near miss.
 
 ## Reward hacking
 
-There is nothing to hack: the answer is a 210-row table whose every field is
+There is nothing to hack: the answer is a 265-row table whose every field is
 checked and whose digest is fixed. The inputs are in the container but the
 expected answer is not, and it cannot be derived from them without performing the
 recovery. A partially correct decode fails on values; a correct decode with the
-wrong visibility rule fails on the key set; a correct visibility rule with a
-naive line-pointer walk fails on duplicate keys.
+wrong visibility rule fails on the key set; a correct visibility rule that
+ignores `HEAP_XMAX_LOCK_ONLY` loses 104 keys; and a naive line-pointer walk
+fails on duplicate keys.

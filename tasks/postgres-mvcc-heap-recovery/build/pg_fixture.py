@@ -1,14 +1,31 @@
 #!/usr/bin/env python3
-"""Build the PostgreSQL 16 MVCC heap fixture.
+"""Build the PostgreSQL 16 MVCC heap fixture (v2).
 
-This script runs INSIDE a postgres:16 container, as the `postgres` OS user, and
-drives a real server through a deterministic history of committed, aborted and
-still-running transactions.  It then captures the relation's main fork verbatim
-and records, independently, the logical rows PostgreSQL itself reports for the
-target snapshot.
+Runs INSIDE a postgres:16 container, as the `postgres` OS user, and drives a
+real server through a scripted history of committed, aborted and still-running
+transactions.  It then captures the relation's main fork verbatim and records,
+independently, the logical rows PostgreSQL itself reports for the target
+snapshot.
 
 Everything written here is synthetic and self-created; nothing is downloaded or
 derived from external material.
+
+v2 raises the difficulty over v1 without touching the solver-facing contract.
+The three ideas that do the work:
+
+  * a read-only REPEATABLE READ "horizon holder" is opened part-way through, so
+    from that point on nothing is pruned.  Physical versions therefore survive:
+    HOT chains grow to three, four and five live tuples, aborted versions stay
+    on the page, and - crucially - a lock-only xmax keeps `HEAP_XMAX_LOCK_ONLY`
+    WITHOUT PostgreSQL later stamping `HEAP_XMAX_INVALID` over it during a
+    prune.  Reading the infomask becomes mandatory rather than optional;
+  * many concurrent writers are opened *interleaved* with transactions that
+    commit between them, so `snapshot_xip` is a sparse set inside
+    [snapshot_xmin, snapshot_xmax) rather than a contiguous tail.  Neither
+    "ignore xip" nor "everything recent is in progress" survives that;
+  * most keys exercise several mechanisms at once - a committed base, an
+    aborted update, a later committed update, a row lock, a concurrent writer -
+    so no single rule reproduces the answer.
 
 Outputs (into --outdir):
     heap_pages.bin              solver input  - raw 8192-byte blocks, in order
@@ -40,11 +57,16 @@ QUALIFIED = SCHEMA + "." + TABLE
 # t_infomask / t_infomask2 bits (src/include/access/htup_details.h, PG 16)
 HEAP_HASNULL = 0x0001
 HEAP_HASEXTERNAL = 0x0004
+HEAP_XMAX_KEYSHR_LOCK = 0x0010
 HEAP_COMBOCID = 0x0020
+HEAP_XMAX_EXCL_LOCK = 0x0040
 HEAP_XMAX_LOCK_ONLY = 0x0080
+HEAP_LOCK_MASK = HEAP_XMAX_KEYSHR_LOCK | HEAP_XMAX_EXCL_LOCK
 HEAP_XMIN_COMMITTED = 0x0100
 HEAP_XMIN_INVALID = 0x0200
 HEAP_XMIN_FROZEN = HEAP_XMIN_COMMITTED | HEAP_XMIN_INVALID
+HEAP_XMAX_COMMITTED = 0x0400
+HEAP_XMAX_INVALID = 0x0800
 HEAP_XMAX_IS_MULTI = 0x1000
 HEAP_HOT_UPDATED = 0x4000
 HEAP_ONLY_TUPLE = 0x8000
@@ -73,7 +95,7 @@ CREATE TABLE %(t)s (
     opened_on      date                  NOT NULL,
     owner_note     text,
     CONSTRAINT account_ledger_pkey PRIMARY KEY (account_id)
-) WITH (fillfactor = 70, autovacuum_enabled = false,
+) WITH (fillfactor = 60, autovacuum_enabled = false,
         toast.autovacuum_enabled = false);
 CREATE INDEX account_ledger_region_idx ON %(t)s (region_code);
 """ % {"t": QUALIFIED}
@@ -85,42 +107,95 @@ NOTES = [None, "verified", "re-audit pendiente", "priority, escalated",
          "ueberprueft 2024", "manual review", None, "dormant account",
          "kyc refresh", None, "watchlist", "tier upgrade"]
 
-BASE_IDS = list(range(1, 66))
 
-# id groups - every physical scenario the fixture must contain
-G_HOT = list(range(1, 7))            # HOT churn + page pruning, pre-snapshot
-G_UPD_COMMIT = list(range(7, 13))    # committed non-HOT update, pre-snapshot
-G_DEL_COMMIT = list(range(13, 18))   # committed delete, pre-snapshot
-G_UPD_ABORT = list(range(18, 24))    # update rolled back, pre-snapshot
-G_DEL_ABORT = list(range(24, 29))    # delete rolled back, pre-snapshot
-G_MULTIVER = list(range(29, 35))     # several committed versions, pre-snapshot
-G_LOCKED = list(range(35, 38))       # SELECT FOR UPDATE in a committed txn
-G_IP_UPD = list(range(38, 42))       # updated by a still-running transaction
-G_IP_DEL = list(range(42, 45))       # deleted by a still-running transaction
-G_IP_UPD2 = list(range(45, 47))      # updated by the second running transaction
-G_POST_UPD = list(range(47, 53))     # updated by a transaction that commits AFTER
-G_POST_DEL = list(range(53, 56))     # deleted by a transaction that commits AFTER
-G_POST_ABORT = list(range(56, 59))   # updated then rolled back, after the snapshot
-G_POST_DEL_ABORT = list(range(59, 61))  # deleted then rolled back, after
-G_XIP_UPD = list(range(61, 64))      # updated by a txn listed in snapshot_xip
-G_XIP_DEL = list(range(64, 66))      # deleted by a txn listed in snapshot_xip
+class Ids:
+    """Hands out contiguous account_id ranges in allocation order.
 
-# Filler accounts.  They carry the same scenarios onto the later blocks of the
-# relation, so the file cannot be solved by looking at block 0 alone.
-FILLER_IDS = list(range(1001, 1161))
-F_POST_UPD = list(range(1001, 1041))    # committed after the snapshot
-F_UPD_ABORT = list(range(1041, 1071))   # update rolled back
-F_IP_UPD = list(range(1071, 1091))      # updated by a still-running transaction
-F_UPD_COMMIT = list(range(1091, 1121))  # committed before the snapshot
-F_DEL_COMMIT = list(range(1121, 1131))  # committed delete before the snapshot
-F_XIP_DEL = list(range(1131, 1141))     # deleted by a transaction in snapshot_xip
-F_POST_DEL = list(range(1141, 1151))    # deleted after the snapshot, committed
+    Base rows are inserted in id order, so allocation order is also physical
+    order: the groups allocated last land on the last blocks of the relation.
+    """
 
-INS_ABORT_IDS = [501, 502, 503, 504]      # inserted by an aborted transaction
-INS_IP1_IDS = [601, 602, 603]             # inserted by a running transaction
-INS_IP2_IDS = [604, 605]
-INS_XIP_IDS = [606, 607]                  # inserted by the snapshot_xip transaction
-INS_POST_IDS = [701, 702, 703, 704, 705]  # inserted after the snapshot, committed
+    def __init__(self, start):
+        self.next = start
+        self.groups = {}
+
+    def take(self, name, n):
+        r = list(range(self.next, self.next + n))
+        self.next += n
+        self.groups[name] = r
+        return r
+
+
+IDS = Ids(1)
+
+# --- phase A: written before the horizon holder opens, so these pages prune ---
+A_CHURN = IDS.take("A_churn", 8)               # HOT churn -> LP_REDIRECT / LP_DEAD
+A_CHURN_LONG = IDS.take("A_churn_long", 6)     # churn, then extended after the snapshot
+# dead root tuples created and pruned before the horizon is pinned: a non-HOT
+# update and a delete leave root line pointers that still have index entries,
+# so pruning retires them as LP_DEAD rather than LP_UNUSED
+A_NONHOT_PRUNED = IDS.take("A_nonhot_pruned", 8)
+A_DEL_PRUNED = IDS.take("A_del_pruned", 6)
+
+# --- phase B: committed work, still before any writer opens ------------------
+B_UPD_COMMIT = IDS.take("B_upd_commit", 8)     # one committed non-HOT update
+B_MULTI3 = IDS.take("B_multi3", 8)             # three committed updates
+B_DEL_COMMIT = IDS.take("B_del_commit", 6)     # committed delete
+B_UPD_ABORT = IDS.take("B_upd_abort", 8)       # update rolled back
+B_DEL_ABORT = IDS.take("B_del_abort", 6)       # delete rolled back
+B_ABORT_THEN_COMMIT = IDS.take("B_abort_then_commit", 6)
+B_COMMIT_ABORT_LOCK = IDS.take("B_commit_abort_lock", 6)
+B_PRESNAP_CHAIN = IDS.take("B_presnap_chain", 6)   # extended again after the snapshot
+
+# --- phase C: concurrent writers, interleaved with committed transactions ----
+C_XIP_UPD_C = IDS.take("C_xip_upd_c", 6)       # writer commits after the snapshot
+C_GAP_UPD_1 = IDS.take("C_gap_upd_1", 6)       # committed between writers -> visible
+C_XIP_DEL_C = IDS.take("C_xip_del_c", 6)
+C_GAP_DEL = IDS.take("C_gap_del", 6)           # committed delete between writers
+C_GAP_UPD_2 = IDS.take("C_gap_upd_2", 6)
+C_XIP_LOCK_C = IDS.take("C_xip_lock_c", 5)     # locked by a writer that commits later
+C_XIP_UPD_A = IDS.take("C_xip_upd_a", 6)       # writer aborts after the snapshot
+C_GAP_UPD_3 = IDS.take("C_gap_upd_3", 6)
+C_IP_UPD = IDS.take("C_ip_upd", 6)             # writer never finishes
+C_IP_DEL = IDS.take("C_ip_del", 6)
+C_IP_LOCK = IDS.take("C_ip_lock", 5)
+C_GAP_UPD_4 = IDS.take("C_gap_upd_4", 6)
+
+# --- phase D: committed or aborted after the snapshot was taken -------------
+D_POST_UPD = IDS.take("D_post_upd", 8)
+D_POST_DEL = IDS.take("D_post_del", 6)
+D_HOT_CHAIN = IDS.take("D_hot_chain", 8)       # three post-snapshot HOT rounds
+D_POST_UPD_ABORT = IDS.take("D_post_upd_abort", 6)
+D_POST_DEL_ABORT = IDS.take("D_post_del_abort", 6)
+D_POST_LOCK = IDS.take("D_post_lock", 5)
+
+# --- filler: ordinary rows, so not every key is a trap ----------------------
+FILLER = IDS.take("filler", 60)
+F_UPD_COMMIT = FILLER[0:20]
+F_UPD_ABORT = FILLER[20:35]
+F_POST_UPD = FILLER[35:50]
+# FILLER[50:60] stay exactly as inserted
+
+# --- the quiet lock zone: allocated last, so it lands on the last blocks -----
+# Nothing updates or deletes these rows, so their pages never acquire a
+# pd_prune_xid and are never pruned.  That is what keeps HEAP_XMAX_LOCK_ONLY
+# visible in the captured bytes instead of being overwritten by
+# HEAP_XMAX_INVALID during a later prune.
+A_LOCK_UPDATE = IDS.take("A_lock_for_update", 6)
+A_LOCK_NOKEY = IDS.take("A_lock_for_no_key_update", 5)
+A_LOCK_SHARE = IDS.take("A_lock_for_share", 5)
+A_LOCK_KEYSHARE = IDS.take("A_lock_for_key_share", 5)
+A_LOCK_ABORTED = IDS.take("A_lock_aborted", 5)
+A_UPD_THEN_LOCK = IDS.take("A_upd_then_lock", 6)
+
+BASE_IDS = list(range(1, IDS.next))
+
+# ids that do not exist in the base population
+EXTRA = Ids(5001)
+INS_ABORT_IDS = EXTRA.take("ins_abort", 6)          # inserted by an aborted txn
+INS_XIP_IDS = EXTRA.take("ins_xip_committed", 6)    # inserted by a writer in xip
+INS_IP_IDS = EXTRA.take("ins_in_progress", 6)       # inserted by a running writer
+INS_POST_IDS = EXTRA.take("ins_post_snapshot", 6)   # inserted after the snapshot
 
 
 def base_row(i):
@@ -213,188 +288,326 @@ def build(outdir):
            ") VALUES (%s,%s,%s,%s,%s,%s,%s)")
     upd = "UPDATE " + QUALIFIED + " SET "
     dele = "DELETE FROM " + QUALIFIED + " WHERE account_id = ANY(%s)"
+    lock = "SELECT account_id FROM " + QUALIFIED + " WHERE account_id = ANY(%s) ORDER BY account_id "
 
-    # ---- phase 1: base population, committed, before the snapshot -----------
+    def do_lock(s, ids, mode):
+        s.run(lock + mode, (ids,))
+        s.cur.fetchall()
+
+    # ================= phase A: before the horizon holder opens ==============
     def _base(s):
         for i in BASE_IDS:
             s.run(ins, base_row(i))
-        for i in FILLER_IDS:
-            s.run(ins, base_row(i))
-    xids["T_base_insert"] = one_shot("base-insert", _base, True)
+    xids["A_base_insert"] = one_shot("base-insert", _base, True)
 
-    # ---- phase 2: HOT churn, then page pruning -----------------------------
-    # No long-lived transaction is open here, so the pruning horizon is current
-    # and the dead intermediate versions really are reclaimed, leaving
-    # LP_REDIRECT roots and LP_DEAD/LP_UNUSED slots behind.
-    hot_xids = []
-    for rnd in range(24):
+    # HOT churn with a scan between rounds, so pruning really runs and leaves
+    # LP_REDIRECT roots and LP_DEAD slots behind.  Nothing holds the horizon
+    # back yet, which is exactly why these chains collapse.
+    churn = []
+    for rnd in range(22):
         def _hot(s, rnd=rnd):
-            for i in G_HOT:
+            for i in A_CHURN + A_CHURN_LONG:
                 s.run(upd + "balance_cents = balance_cents + %s, owner_note = %s "
-                      "WHERE account_id = %s", (rnd + 1, "hot round " + str(rnd), i))
-        hot_xids.append(one_shot("hot-" + str(rnd), _hot, True))
+                      "WHERE account_id = %s", (rnd + 1, "churn " + str(rnd), i))
+        churn.append(one_shot("churn-" + str(rnd), _hot, True))
         acur.execute("SELECT count(*) FROM " + QUALIFIED)   # provoke pruning
-    xids["T_hot_rounds"] = hot_xids
+    xids["A_churn_rounds"] = churn
 
-    def _hot_final(s):
-        for i in G_HOT:
+    def _churn_final(s):
+        for i in A_CHURN + A_CHURN_LONG:
             s.run(upd + "balance_cents = %s, owner_note = %s, risk_tier = %s "
                   "WHERE account_id = %s",
-                  (250000 + i, None if i % 2 else "settled " + str(i), (i % 4) + 1, i))
-    xids["T_hot_final"] = one_shot("hot-final", _hot_final, True)
+                  (250000 + i, None if i % 2 else "settled " + str(i),
+                   (i % 4) + 1, i))
+    xids["A_churn_final"] = one_shot("churn-final", _churn_final, True)
     acur.execute("SELECT count(*) FROM " + QUALIFIED)
 
-    # ---- phase 3: committed non-HOT update (an indexed column changes) ------
-    def _upd(s):
-        for i in G_UPD_COMMIT:
+    # A non-HOT update (it changes the indexed column) and a delete, both
+    # committed while the horizon is still current.  Their old versions are root
+    # line pointers with index entries pointing at them, so the prune that
+    # follows retires them as LP_DEAD instead of freeing the slot outright.
+    def _nonhot_pruned(s):
+        for i in A_NONHOT_PRUNED:
+            s.run(upd + "region_code = %s, balance_cents = %s, owner_note = %s "
+                  "WHERE account_id = %s",
+                  ("ME-CENTRAL", 210000 + i, "reindexed", i))
+    xids["A_nonhot_update_pruned"] = one_shot("a-nonhot", _nonhot_pruned, True)
+
+    def _del_pruned(s):
+        s.run(dele, (A_DEL_PRUNED,))
+    xids["A_delete_pruned"] = one_shot("a-del-pruned", _del_pruned, True)
+
+    for _ in range(4):
+        acur.execute("SELECT count(*) FROM " + QUALIFIED)
+        acur.execute("SELECT sum(balance_cents) FROM " + QUALIFIED)
+
+    # ================= the horizon holder ====================================
+    # A read-only REPEATABLE READ session.  It is never assigned an xid, so it
+    # appears in no snapshot and in no commit log - but it pins the vacuum
+    # horizon, so from here on PostgreSQL prunes nothing.  Every physical
+    # version created below therefore survives into the captured file.
+    horizon = Session("horizon-holder", isolation="repeatable read")
+    horizon.run("SELECT 1")
+    if horizon.xid() is not None:
+        raise SystemExit("the horizon holder must stay read-only")
+
+    # ================= phase B: committed work, still before any writer ======
+    # Row locks in the quiet zone.  Each is a single locker, so no MultiXact is
+    # created, and every one of these transactions completes before any writer
+    # opens - so their xids end up below snapshot_xmin and are plainly visible.
+    # A solver that reads "xmax names a committed transaction" as "the row was
+    # deleted" therefore loses all of these rows.
+    #
+    # They run *after* the horizon holder deliberately.  Once the horizon is
+    # pinned PostgreSQL stops pruning, and it is pruning - through
+    # HeapTupleSatisfiesVacuum - that would otherwise stamp HEAP_XMAX_INVALID
+    # over a completed locker's xmax and hand the answer to a solver that never
+    # looks at HEAP_XMAX_LOCK_ONLY at all.
+    def _lock_upd(s):
+        do_lock(s, A_LOCK_UPDATE, "FOR UPDATE")
+    xids["B_lock_for_update"] = one_shot("lock-upd", _lock_upd, True)
+
+    def _lock_nokey(s):
+        do_lock(s, A_LOCK_NOKEY, "FOR NO KEY UPDATE")
+    xids["B_lock_for_no_key_update"] = one_shot("lock-nokey", _lock_nokey, True)
+
+    def _lock_share(s):
+        do_lock(s, A_LOCK_SHARE, "FOR SHARE")
+    xids["B_lock_for_share"] = one_shot("lock-share", _lock_share, True)
+
+    def _lock_keyshare(s):
+        do_lock(s, A_LOCK_KEYSHARE, "FOR KEY SHARE")
+    xids["B_lock_for_key_share"] = one_shot("lock-keyshare", _lock_keyshare, True)
+
+    def _lock_abort(s):
+        do_lock(s, A_LOCK_ABORTED, "FOR UPDATE")
+    xids["B_lock_aborted"] = one_shot("lock-abort", _lock_abort, False)
+
+    # a committed update, then a committed lock of the *new* version: the
+    # surviving tuple carries one transaction in xmin and a different one in
+    # xmax, and is still live
+    def _upd_then_lock_a(s):
+        for i in A_UPD_THEN_LOCK:
+            s.run(upd + "balance_cents = %s, owner_note = %s WHERE account_id = %s",
+                  (330000 + i, "relocated", i))
+    xids["B_upd_before_lock"] = one_shot("upd-before-lock", _upd_then_lock_a, True)
+
+    def _upd_then_lock_b(s):
+        do_lock(s, A_UPD_THEN_LOCK, "FOR UPDATE")
+    xids["B_lock_after_update"] = one_shot("lock-after-upd", _upd_then_lock_b, True)
+
+    def _upd_commit(s):
+        for i in B_UPD_COMMIT:
             s.run(upd + "region_code = %s, balance_cents = %s, owner_note = %s "
                   "WHERE account_id = %s",
                   ("EU-NORTH-1", 310000 + i, "regional transfer", i))
         for i in F_UPD_COMMIT:
-            s.run(upd + "balance_cents = %s, risk_tier = %s, owner_note = %s "
-                  "WHERE account_id = %s",
-                  (320000 + i, None if i % 5 == 0 else (i % 3) + 1,
-                   None if i % 4 == 0 else "settled batch", i))
-    xids["T_update_committed"] = one_shot("upd-commit", _upd, True)
+            s.run(upd + "balance_cents = %s, risk_tier = %s WHERE account_id = %s",
+                  (320000 + i, None if i % 5 == 0 else (i % 3) + 1, i))
+    xids["B_update_committed"] = one_shot("b-upd-commit", _upd_commit, True)
 
-    # ---- phase 4: committed delete ----------------------------------------
-    def _del(s):
-        s.run(dele, (G_DEL_COMMIT + F_DEL_COMMIT,))
-    xids["T_delete_committed"] = one_shot("del-commit", _del, True)
-
-    # ---- phase 5: several committed versions of the same key ---------------
-    mv = []
+    multi = []
     for rnd in range(3):
-        def _mv(s, rnd=rnd):
-            for i in G_MULTIVER:
-                s.run(upd + "region_code = %s, balance_cents = %s, risk_tier = %s, "
-                      "owner_note = %s WHERE account_id = %s",
-                      (REGIONS[(i + rnd) % len(REGIONS)], 400000 + rnd * 1000 + i,
-                       None if rnd == 1 else (rnd + 1),
+        def _multi(s, rnd=rnd):
+            for i in B_MULTI3 + B_PRESNAP_CHAIN:
+                s.run(upd + "balance_cents = %s, risk_tier = %s, owner_note = %s "
+                      "WHERE account_id = %s",
+                      (400000 + rnd * 1000 + i, None if rnd == 1 else (rnd + 1),
                        None if (i + rnd) % 3 == 0 else "revision " + str(rnd), i))
-        mv.append(one_shot("multiver-" + str(rnd), _mv, True))
-    xids["T_multiversion"] = mv
+        multi.append(one_shot("b-multi-" + str(rnd), _multi, True))
+    xids["B_multi_version"] = multi
 
-    # ---- phase 6: aborted insert ------------------------------------------
+    def _del_commit(s):
+        s.run(dele, (B_DEL_COMMIT,))
+    xids["B_delete_committed"] = one_shot("b-del-commit", _del_commit, True)
+
     def _ins_abort(s):
         for i in INS_ABORT_IDS:
             s.run(ins, extra_row(i, "phantom"))
-    xids["T_insert_aborted"] = one_shot("ins-abort", _ins_abort, False)
+    xids["B_insert_aborted"] = one_shot("b-ins-abort", _ins_abort, False)
 
-    # ---- phase 7: aborted update ------------------------------------------
     def _upd_abort(s):
-        for i in G_UPD_ABORT:
+        for i in B_UPD_ABORT:
             s.run(upd + "balance_cents = %s, region_code = %s, is_active = %s, "
                   "owner_note = %s WHERE account_id = %s",
                   (-1, "XX-BOGUS-1", False, "rolled back", i))
-        s.run(upd + "balance_cents = %s, is_active = %s, owner_note = %s "
-              "WHERE account_id = ANY(%s)",
-              (-2, False, "rolled back batch", F_UPD_ABORT))
-    xids["T_update_aborted"] = one_shot("upd-abort", _upd_abort, False)
+        s.run(upd + "balance_cents = %s, owner_note = %s WHERE account_id = ANY(%s)",
+              (-2, "rolled back batch", F_UPD_ABORT))
+    xids["B_update_aborted"] = one_shot("b-upd-abort", _upd_abort, False)
 
-    # ---- phase 8: aborted delete ------------------------------------------
     def _del_abort(s):
-        s.run(dele, (G_DEL_ABORT,))
-    xids["T_delete_aborted"] = one_shot("del-abort", _del_abort, False)
+        s.run(dele, (B_DEL_ABORT,))
+    xids["B_delete_aborted"] = one_shot("b-del-abort", _del_abort, False)
 
-    # ---- phase 9: committed row lock (xmax present, but lock-only) ----------
-    def _lock(s):
-        s.run("SELECT account_id FROM " + QUALIFIED +
-              " WHERE account_id = ANY(%s) ORDER BY account_id FOR UPDATE",
-              (G_LOCKED,))
-        s.cur.fetchall()
-    xids["T_lock_only"] = one_shot("lock-only", _lock, True)
-
-    # ---- phase 10: two transactions that stay open across the capture ------
-    ip1 = Session("in-progress-1")
-    ip1.run(upd + "balance_cents = %s, owner_note = %s, is_active = %s "
-            "WHERE account_id = ANY(%s)",
-            (-999, "uncommitted write", False, G_IP_UPD))
-    ip1.run(upd + "balance_cents = %s, owner_note = %s WHERE account_id = ANY(%s)",
-            (-777, "uncommitted batch", F_IP_UPD))
-    for i in INS_IP1_IDS:
-        ip1.run(ins, extra_row(i, "uncommitted"))
-    xids["T_in_progress_1"] = ip1.xid()
-
-    ip2 = Session("in-progress-2")
-    ip2.run(dele, (G_IP_DEL,))
-    ip2.run(upd + "region_code = %s, balance_cents = %s WHERE account_id = ANY(%s)",
-            ("XX-PENDING", -888, G_IP_UPD2))
-    for i in INS_IP2_IDS:
-        ip2.run(ins, extra_row(i, "uncommitted"))
-    xids["T_in_progress_2"] = ip2.xid()
-
-    # A third writer that is still running when the snapshot is taken, but that
-    # COMMITS before the heap is captured.  tx_status.csv therefore reports it
-    # as `committed` while snapshot_xip lists it as in progress: its rows are
-    # invisible to the target snapshot even though its commit record exists.
-    ip3 = Session("in-progress-3")
-    ip3.run(upd + "balance_cents = %s, region_code = %s, owner_note = %s "
-            "WHERE account_id = ANY(%s)",
-            (-1234, "XX-INFLIGHT", "in flight at snapshot time", G_XIP_UPD))
-    ip3.run(dele, (G_XIP_DEL + F_XIP_DEL,))
-    for i in INS_XIP_IDS:
-        ip3.run(ins, extra_row(i, "inflight"))
-    xids["T_in_xip_then_committed"] = ip3.xid()
-
-    # ---- phase 10b: a transaction that completes while ip1..ip3 are open ---
-    # Without this, the snapshot's xmax would sit below every running xid and
-    # snapshot_xip would come out empty (xmax = latestCompletedXid + 1).
-    def _mv_late(s):
-        for i in G_MULTIVER:
+    # abort an update, then commit a different one: the dead version keeps the
+    # greatest xmin of the three, and the live version is the newest committed
+    def _mix_abort(s):
+        for i in B_ABORT_THEN_COMMIT:
             s.run(upd + "balance_cents = %s, owner_note = %s WHERE account_id = %s",
-                  (500000 + i, "late but committed", i))
-    xids["T_committed_after_open_writers"] = one_shot("mv-late", _mv_late, True)
+                  (-77, "discarded attempt", i))
+    xids["B_mix_update_aborted"] = one_shot("b-mix-abort", _mix_abort, False)
 
-    # ---- phase 11: the target snapshot ------------------------------------
+    def _mix_commit(s):
+        for i in B_ABORT_THEN_COMMIT:
+            s.run(upd + "balance_cents = %s, region_code = %s, owner_note = %s "
+                  "WHERE account_id = %s",
+                  (505000 + i, "AP-SOUTH-1", "retried and kept", i))
+    xids["B_mix_update_committed"] = one_shot("b-mix-commit", _mix_commit, True)
+
+    # commit an update, abort another, then lock the survivor: the live tuple
+    # has a committed xmin, a *committed lock* in xmax, and a dead successor
+    # carrying the greatest xmin on the key
+    def _cal_commit(s):
+        for i in B_COMMIT_ABORT_LOCK:
+            s.run(upd + "balance_cents = %s, owner_note = %s WHERE account_id = %s",
+                  (515000 + i, "settled then locked", i))
+    xids["B_cal_update_committed"] = one_shot("b-cal-commit", _cal_commit, True)
+
+    def _cal_abort(s):
+        for i in B_COMMIT_ABORT_LOCK:
+            s.run(upd + "balance_cents = %s, owner_note = %s WHERE account_id = %s",
+                  (-88, "abandoned", i))
+    xids["B_cal_update_aborted"] = one_shot("b-cal-abort", _cal_abort, False)
+
+    def _cal_lock(s):
+        do_lock(s, B_COMMIT_ABORT_LOCK, "FOR UPDATE")
+    xids["B_cal_lock"] = one_shot("b-cal-lock", _cal_lock, True)
+
+    # ================= phase C: writers interleaved with committed work ======
+    writers = {}
+
+    def open_writer(name, body):
+        s = Session(name)
+        body(s)
+        x = s.xid()
+        if x is None:
+            raise SystemExit("writer " + name + " was never assigned an xid")
+        writers[name] = s
+        xids["C_writer_" + name] = x
+        return x
+
+    def committed_between(name, body):
+        xids["C_gap_" + name] = one_shot("gap-" + name, body, True)
+
+    open_writer("w1_upd_commits_later", lambda s: s.run(
+        upd + "balance_cents = %s, region_code = %s, owner_note = %s "
+        "WHERE account_id = ANY(%s)",
+        (-901, "XX-INFLIGHT", "in flight at snapshot", C_XIP_UPD_C)))
+
+    committed_between("upd_1", lambda s: s.run(
+        upd + "balance_cents = %s, owner_note = %s WHERE account_id = ANY(%s)",
+        (610000, "committed between writers", C_GAP_UPD_1)))
+
+    open_writer("w2_del_commits_later",
+                lambda s: s.run(dele, (C_XIP_DEL_C,)))
+
+    committed_between("del", lambda s: s.run(dele, (C_GAP_DEL,)))
+
+    def _w3(s):
+        for i in INS_XIP_IDS:
+            s.run(ins, extra_row(i, "inflight"))
+    open_writer("w3_ins_commits_later", _w3)
+
+    committed_between("upd_2", lambda s: s.run(
+        upd + "risk_tier = %s, owner_note = %s WHERE account_id = ANY(%s)",
+        (7, "second gap commit", C_GAP_UPD_2)))
+
+    open_writer("w4_lock_commits_later",
+                lambda s: do_lock(s, C_XIP_LOCK_C, "FOR UPDATE"))
+
+    open_writer("w5_upd_aborts_later", lambda s: s.run(
+        upd + "balance_cents = %s, owner_note = %s WHERE account_id = ANY(%s)",
+        (-902, "in flight, later abandoned", C_XIP_UPD_A)))
+
+    committed_between("upd_3", lambda s: s.run(
+        upd + "balance_cents = %s, is_active = %s WHERE account_id = ANY(%s)",
+        (620000, False, C_GAP_UPD_3)))
+
+    open_writer("w6_upd_never_finishes", lambda s: s.run(
+        upd + "balance_cents = %s, owner_note = %s WHERE account_id = ANY(%s)",
+        (-903, "uncommitted write", C_IP_UPD)))
+
+    open_writer("w7_del_never_finishes", lambda s: s.run(dele, (C_IP_DEL,)))
+
+    def _w8(s):
+        for i in INS_IP_IDS:
+            s.run(ins, extra_row(i, "uncommitted"))
+    open_writer("w8_ins_never_finishes", _w8)
+
+    open_writer("w9_lock_never_finishes",
+                lambda s: do_lock(s, C_IP_LOCK, "FOR UPDATE"))
+
+    # the last completed transaction before the snapshot: this is what lifts
+    # snapshot_xmax above every running writer, so all of them land in xip
+    committed_between("upd_4", lambda s: s.run(
+        upd + "balance_cents = %s, owner_note = %s WHERE account_id = ANY(%s)",
+        (630000, "final gap commit", C_GAP_UPD_4)))
+
+    # ================= the target snapshot ===================================
     obs = Session("observer", isolation="repeatable read")
     obs.run("SELECT pg_current_snapshot()::text")
     snapshot_text = obs.cur.fetchone()[0]
-    obs.run("SELECT pg_current_xact_id_if_assigned()")   # must stay read-only
-    if obs.cur.fetchone()[0] is not None:
+    if obs.xid() is not None:
         raise SystemExit("the observer transaction wrote; it must be read-only")
 
-    # ---- phase 12: work that COMMITS after the snapshot was taken ----------
+    # ================= phase D: after the snapshot was taken =================
     def _post_upd(s):
-        for i in G_POST_UPD:
+        for i in D_POST_UPD:
             s.run(upd + "balance_cents = %s, region_code = %s, risk_tier = %s, "
                   "owner_note = %s WHERE account_id = %s",
                   (777000 + i, "ZZ-FUTURE-9", 9, "committed after snapshot", i))
-        s.run(upd + "balance_cents = %s, region_code = %s, owner_note = %s "
-              "WHERE account_id = ANY(%s)",
-              (-31337, "ZZ-FUTURE-9", "future batch", F_POST_UPD))
-    xids["T_post_update"] = one_shot("post-upd", _post_upd, True)
+        s.run(upd + "balance_cents = %s, owner_note = %s WHERE account_id = ANY(%s)",
+              (-31337, "future batch", F_POST_UPD))
+    xids["D_post_update"] = one_shot("d-post-upd", _post_upd, True)
 
     def _post_ins(s):
         for i in INS_POST_IDS:
             s.run(ins, extra_row(i, "future"))
-    xids["T_post_insert"] = one_shot("post-ins", _post_ins, True)
+    xids["D_post_insert"] = one_shot("d-post-ins", _post_ins, True)
 
     def _post_del(s):
-        s.run(dele, (G_POST_DEL + F_POST_DEL,))
-    xids["T_post_delete"] = one_shot("post-del", _post_del, True)
+        s.run(dele, (D_POST_DEL,))
+    xids["D_post_delete"] = one_shot("d-post-del", _post_del, True)
 
-    def _post_hot(s):
-        for i in G_HOT[:3]:
-            s.run(upd + "balance_cents = %s, owner_note = %s WHERE account_id = %s",
-                  (888000 + i, "future hot version", i))
-    xids["T_post_hot_update"] = one_shot("post-hot", _post_hot, True)
+    # three more committed rounds on chains that already have versions: the
+    # visible tuple ends up in the middle of a four- or five-deep chain
+    post_chain = []
+    for rnd in range(3):
+        def _chain(s, rnd=rnd):
+            for i in D_HOT_CHAIN + B_PRESNAP_CHAIN + A_CHURN_LONG:
+                s.run(upd + "balance_cents = %s, owner_note = %s "
+                      "WHERE account_id = %s",
+                      (880000 + rnd * 1000 + i, "future version " + str(rnd), i))
+        post_chain.append(one_shot("d-chain-" + str(rnd), _chain, True))
+    xids["D_post_chain"] = post_chain
 
     def _post_upd_abort(s):
-        for i in G_POST_ABORT:
+        for i in D_POST_UPD_ABORT:
             s.run(upd + "balance_cents = %s, owner_note = %s WHERE account_id = %s",
                   (-4242, "future rollback", i))
-    xids["T_post_update_aborted"] = one_shot("post-upd-abort", _post_upd_abort, False)
+    xids["D_post_update_aborted"] = one_shot("d-post-upd-abort", _post_upd_abort,
+                                             False)
 
     def _post_del_abort(s):
-        s.run(dele, (G_POST_DEL_ABORT,))
-    xids["T_post_delete_aborted"] = one_shot("post-del-abort", _post_del_abort, False)
+        s.run(dele, (D_POST_DEL_ABORT,))
+    xids["D_post_delete_aborted"] = one_shot("d-post-del-abort", _post_del_abort,
+                                             False)
 
-    # ---- phase 12b: the xip writer commits, after the snapshot was taken ---
-    ip3.commit()
-    ip3.close()
+    def _post_lock(s):
+        do_lock(s, D_POST_LOCK, "FOR UPDATE")
+    xids["D_post_lock"] = one_shot("d-post-lock", _post_lock, True)
 
-    # ---- phase 13: flush and capture the relation file verbatim ------------
+    # ================= writers finish, after the snapshot ====================
+    for name in ("w1_upd_commits_later", "w2_del_commits_later",
+                 "w3_ins_commits_later", "w4_lock_commits_later"):
+        writers[name].commit()
+        writers[name].close()
+        del writers[name]
+    writers["w5_upd_aborts_later"].rollback()
+    writers["w5_upd_aborts_later"].close()
+    del writers["w5_upd_aborts_later"]
+
+    # ================= flush and capture the relation file verbatim ==========
     acur.execute("CHECKPOINT")
     acur.execute("SELECT current_setting('data_directory')")
     datadir = acur.fetchone()[0]
@@ -411,7 +624,7 @@ def build(outdir):
         raise SystemExit("captured %d bytes, not a multiple of 8192" % len(heap))
     nblocks = len(heap) // 8192
 
-    # ---- phase 14: inspect exactly those bytes -----------------------------
+    # ================= inspect exactly those bytes ===========================
     items = []
     for blk in range(nblocks):
         page = heap[blk * 8192:(blk + 1) * 8192]
@@ -456,6 +669,8 @@ def build(outdir):
     if lp_counts.get(2, 0) == 0:
         raise SystemExit("no LP_REDIRECT line pointer was produced; "
                          "HOT pruning did not happen")
+    if lp_counts.get(3, 0) == 0:
+        raise SystemExit("no LP_DEAD line pointer was produced")
 
     # the TOAST relation must be empty - every value stays inline
     acur.execute("SELECT reltoastrelid::regclass::text, reltoastrelid "
@@ -468,7 +683,7 @@ def build(outdir):
     if toast_rows:
         raise SystemExit("%d TOAST chunks exist; values are not inline" % toast_rows)
 
-    # ---- phase 15: transaction states -------------------------------------
+    # ================= transaction states ====================================
     needed = sorted({it["t_xmin"] for it in normals if it["t_xmin"]} |
                     {it["t_xmax"] for it in normals if it["t_xmax"]})
     if any(x >= 2 ** 32 for x in needed):
@@ -480,7 +695,7 @@ def build(outdir):
     if set(status.values()) - {"committed", "aborted", "in progress"}:
         raise SystemExit("unexpected transaction states: %r" % (set(status.values()),))
 
-    # ---- phase 16: the reference answer, computed by PostgreSQL ------------
+    # ================= the reference answer, computed by PostgreSQL ==========
     obs.run("SELECT " + ", ".join(COLNAMES) + " FROM " + QUALIFIED +
             " ORDER BY account_id")
     golden = obs.cur.fetchall()
@@ -494,40 +709,92 @@ def build(outdir):
 
     obs.rollback()
     obs.close()
-    ip1.rollback()
-    ip1.close()
-    ip2.rollback()
-    ip2.close()
+    horizon.rollback()
+    horizon.close()
+    for s in list(writers.values()):
+        s.rollback()
+        s.close()
     acur.close()
     admin.close()
 
-    # ---- phase 17: write everything out ------------------------------------
+    # ================= snapshot bookkeeping and hard assertions ==============
     xmin_s, xmax_s, xip_s = snapshot_text.split(":")
     snap_xmin, snap_xmax = int(xmin_s), int(xmax_s)
     snap_xip = sorted(int(v) for v in xip_s.split(",") if v)
     if snap_xmin >= 2 ** 32 or snap_xmax >= 2 ** 32:
         raise SystemExit("snapshot uses a non-zero xid epoch")
-    if not snap_xip:
-        raise SystemExit("the snapshot has an empty in-progress list")
+
+    def in_snapshot(x):
+        """XidInMVCCSnapshot: still running as of the target snapshot."""
+        if x >= snap_xmax:
+            return True
+        if x < snap_xmin:
+            return False
+        return x in snap_xip
 
     committed_before = [x for x, s in status.items()
-                        if s == "committed" and x < snap_xmax and x not in snap_xip]
+                        if s == "committed" and not in_snapshot(x)]
     committed_after = [x for x, s in status.items()
                        if s == "committed" and x >= snap_xmax]
-    committed_in_xip = [x for x in snap_xip if status.get(x) == "committed"]
-    in_progress = [x for x, s in status.items() if s == "in progress"]
+    committed_in_xip = sorted(x for x in snap_xip if status.get(x) == "committed")
+    aborted_in_xip = sorted(x for x in snap_xip if status.get(x) == "aborted")
+    in_progress = sorted(x for x, s in status.items() if s == "in progress")
+    committed_gap = sorted(x for x, s in status.items()
+                           if s == "committed" and snap_xmin <= x < snap_xmax
+                           and x not in snap_xip)
+
     if not committed_before or not committed_after:
         raise SystemExit("the snapshot does not separate committed transactions")
-    if not committed_in_xip:
-        raise SystemExit("no committed transaction is listed in snapshot_xip; "
-                         "ignoring xip would not be punished")
+    if len(committed_in_xip) < 3:
+        raise SystemExit("only %d committed transaction(s) in snapshot_xip; "
+                         "ignoring xip would barely be punished"
+                         % len(committed_in_xip))
+    if len(committed_gap) < 3:
+        raise SystemExit("only %d committed transaction(s) sit between "
+                         "snapshot_xmin and snapshot_xmax outside xip; treating "
+                         "every recent xid as in progress would barely be "
+                         "punished" % len(committed_gap))
     if not in_progress:
         raise SystemExit("no transaction is still in progress in tx_status.csv")
-    for x in (xids["T_in_progress_1"], xids["T_in_progress_2"],
-              xids["T_in_xip_then_committed"]):
-        if x not in snap_xip:
-            raise SystemExit("expected xid %d in snapshot_xip, got %r"
-                             % (x, snap_xip))
+    if not aborted_in_xip:
+        raise SystemExit("no aborted transaction is listed in snapshot_xip")
+    for name, x in xids.items():
+        if name.startswith("C_writer_") and x not in snap_xip:
+            raise SystemExit("writer %s (xid %d) is not in snapshot_xip %r"
+                             % (name, x, snap_xip))
+
+    # --- the load-bearing lock-only assertion -------------------------------
+    # tuples whose xmax names a transaction that both committed AND is visible
+    # to the target snapshot, but which are alive because the xmax is a lock.
+    lock_only = [it for it in normals
+                 if it["t_xmax"] and (
+                     it["t_infomask"] & HEAP_XMAX_LOCK_ONLY
+                     or (it["t_infomask"] & (HEAP_XMAX_IS_MULTI | HEAP_LOCK_MASK))
+                     == HEAP_XMAX_EXCL_LOCK)]
+    lock_only_hard = [it for it in lock_only
+                      if not (it["t_infomask"] & HEAP_XMAX_INVALID)
+                      and status.get(it["t_xmax"]) == "committed"
+                      and not in_snapshot(it["t_xmax"])]
+    if len(lock_only_hard) < 15:
+        why = {"masked_by_xmax_invalid": 0, "xmax_not_committed": 0,
+               "xmax_not_visible_to_snapshot": 0}
+        for it in lock_only:
+            if it["t_infomask"] & HEAP_XMAX_INVALID:
+                why["masked_by_xmax_invalid"] += 1
+            elif status.get(it["t_xmax"]) != "committed":
+                why["xmax_not_committed"] += 1
+            elif in_snapshot(it["t_xmax"]):
+                why["xmax_not_visible_to_snapshot"] += 1
+        raise SystemExit(
+            "only %d tuple(s) carry a lock-only xmax that is committed, visible "
+            "to the snapshot and NOT masked by HEAP_XMAX_INVALID; the infomask "
+            "would not be load-bearing (total lock-only tuples: %d, rejected: %r)"
+            % (len(lock_only_hard), len(lock_only), why))
+
+    # --- HOT chain depth ----------------------------------------------------
+    heap_only = [it for it in normals if it["t_infomask2"] & HEAP_ONLY_TUPLE]
+    if len(heap_only) < 40:
+        raise SystemExit("only %d heap-only tuple(s) survive" % len(heap_only))
 
     (outdir / "heap_pages.bin").write_bytes(heap)
 
@@ -570,6 +837,7 @@ def build(outdir):
                                               encoding="utf-8")
 
     report = {
+        "fixture_version": 2,
         "postgres_version_full": version_full,
         "block_size": block_size,
         "blocks": nblocks,
@@ -581,13 +849,16 @@ def build(outdir):
         "snapshot_xmax": snap_xmax,
         "snapshot_xip": snap_xip,
         "transaction_xids": xids,
+        "id_groups": {k: [v[0], v[-1]] for k, v in IDS.groups.items()},
         "tx_status_counts": {s: sum(1 for v in status.values() if v == s)
                              for s in sorted(set(status.values()))},
         "xids_in_tx_status": len(needed),
-        "committed_before_snapshot": len(committed_before),
-        "committed_after_snapshot": len(committed_after),
+        "committed_visible_to_snapshot": len(committed_before),
+        "committed_after_snapshot": sorted(committed_after),
         "committed_but_listed_in_xip": committed_in_xip,
-        "still_in_progress": sorted(in_progress),
+        "aborted_listed_in_xip": aborted_in_xip,
+        "committed_inside_xid_range_but_not_in_xip": committed_gap,
+        "still_in_progress": in_progress,
         "line_pointer_counts": {
             "LP_UNUSED": lp_counts.get(0, 0), "LP_NORMAL": lp_counts.get(1, 0),
             "LP_REDIRECT": lp_counts.get(2, 0), "LP_DEAD": lp_counts.get(3, 0)},
@@ -596,10 +867,16 @@ def build(outdir):
                                  if it["t_infomask"] & HEAP_HASNULL),
         "hot_updated_tuples": sum(1 for it in normals
                                   if it["t_infomask2"] & HEAP_HOT_UPDATED),
-        "heap_only_tuples": sum(1 for it in normals
-                                if it["t_infomask2"] & HEAP_ONLY_TUPLE),
-        "lock_only_tuples": sum(1 for it in normals
-                                if it["t_infomask"] & HEAP_XMAX_LOCK_ONLY),
+        "heap_only_tuples": len(heap_only),
+        "lock_only_tuples": len(lock_only),
+        "lock_only_tuples_requiring_infomask": len(lock_only_hard),
+        "tuples_without_xmin_committed_hint": sum(
+            1 for it in normals if not it["t_infomask"] & HEAP_XMIN_COMMITTED),
+        "tuples_with_aborted_xmin": sum(
+            1 for it in normals if status.get(it["t_xmin"]) == "aborted"),
+        "tuples_with_aborted_xmin_and_invalid_hint": sum(
+            1 for it in normals if status.get(it["t_xmin"]) == "aborted"
+            and it["t_infomask"] & HEAP_XMIN_INVALID),
         "toast_chunks": toast_rows,
         "golden_rows": len(golden),
         "excluded_cases_present": {"multixact": 0, "frozen": 0, "combocid": 0,

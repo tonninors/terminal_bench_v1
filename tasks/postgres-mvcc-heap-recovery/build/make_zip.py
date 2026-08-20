@@ -15,7 +15,10 @@ from pathlib import Path
 TASK = Path(__file__).resolve().parent.parent
 MEMBERS = ["heap_pages.bin", "table_schema.json", "tx_status.csv"]
 FIXED_TIME = (2026, 8, 20, 0, 0, 0)
-OUT = TASK / "dist" / "postgres_mvcc_heap_inputs.zip"
+OUT = TASK / "dist" / "postgres_mvcc_heap_inputs_v2.zip"
+# the v1 bundle carried the older fixture; shipping it now would hand out
+# inputs that no longer match artifacts/ or the verifier fixture
+STALE = [TASK / "dist" / "postgres_mvcc_heap_inputs.zip"]
 
 FORBIDDEN_NAMES = {
     "golden.csv", "golden_recover.py", "expected_state.json", "test_outputs.py",
@@ -32,6 +35,10 @@ def main() -> int:
     OUT.parent.mkdir(exist_ok=True)
     if OUT.exists():
         OUT.unlink()
+    for old in STALE:
+        if old.exists():
+            old.unlink()
+            print("removed stale bundle %s" % old.name)
 
     with zipfile.ZipFile(OUT, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
         for name in MEMBERS:

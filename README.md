@@ -9,6 +9,10 @@ Terminal Bench 3.0 task packages.
 | [`tasks/sqlite-wal-crash-recovery`](tasks/sqlite-wal-crash-recovery) | systems / databases | hard |
 | [`tasks/postgres-mvcc-heap-recovery`](tasks/postgres-mvcc-heap-recovery) | systems / databases | hard |
 
+`postgres-mvcc-heap-recovery` is at fixture generation **v2**; see
+[`V1_VS_V2_DIFFICULTY.md`](tasks/postgres-mvcc-heap-recovery/V1_VS_V2_DIFFICULTY.md)
+for what changed and why. The solver-facing contract is identical in both.
+
 Each task is self-contained; they share no code, no artifacts and no fixtures.
 
 ## Layout of a task package
@@ -45,6 +49,8 @@ bash build/run_all_validation.sh --regen  # regenerate from a live PostgreSQL 16
 bash build/run_container_checks.sh        # oracle / nop against the real task image
 pytest -q build/fixture_test.py           # properties of the fixture itself
 pytest -q build/harness_test.py           # PASS/FAIL matrix over all candidate answers
+python3 build/measure_negatives.py        # how far off each naive strategy lands
+python3 build/final_audit.py              # release checklist
 ```
 
 Solving and verifying need only the Python 3.11 standard library plus `pytest`.
