@@ -1,245 +1,125 @@
 {
-  "reference_rows": 429,
+  "reference_rows": 199,
   "strategies": {
-    "1. greatest xmin per key": {
-      "rows": 482,
+    "1. zero-fill: missing clog = aborted": {
+      "rows": 128,
       "duplicate_key_records": 0,
-      "missing": 0,
-      "extra": 53,
-      "wrong_values": 179,
-      "duplicated_keys": 0,
-      "keys_wrong_in_total": 232,
-      "script": "negative_a_max_xmin.py"
-    },
-    "2. ignore xmax entirely": {
-      "rows": 600,
-      "duplicate_key_records": 148,
-      "missing": 0,
-      "extra": 23,
-      "wrong_values": 120,
-      "duplicated_keys": 120,
-      "keys_wrong_in_total": 143,
-      "script": "negative_b_ignore_xmax.py"
-    },
-    "3. committed xmax means deleted": {
-      "rows": 230,
-      "duplicate_key_records": 0,
-      "missing": 199,
+      "missing": 71,
       "extra": 0,
-      "wrong_values": 0,
+      "wrong_values": 2,
       "duplicated_keys": 0,
-      "keys_wrong_in_total": 199,
-      "script": "negative_l_committed_xmax_deleted.py"
+      "keys_wrong_in_total": 73,
+      "script": "neg01_zero_fill_aborted.py"
     },
-    "4a. HOT redirects walked as tuples": {
-      "rows": 452,
-      "duplicate_key_records": 23,
-      "missing": 0,
+    "2. missing clog = still in progress": {
+      "rows": 128,
+      "duplicate_key_records": 0,
+      "missing": 71,
       "extra": 0,
-      "wrong_values": 0,
-      "duplicated_keys": 23,
-      "keys_wrong_in_total": 23,
-      "script": "negative_d_ignore_hot.py"
+      "wrong_values": 2,
+      "duplicated_keys": 0,
+      "keys_wrong_in_total": 73,
+      "script": "neg02_missing_in_progress.py"
     },
-    "4b. heap-only versions skipped": {
-      "rows": 322,
+    "3. discard tuples with unresolved xmin": {
+      "rows": 128,
       "duplicate_key_records": 0,
-      "missing": 107,
+      "missing": 71,
       "extra": 0,
-      "wrong_values": 0,
+      "wrong_values": 2,
       "duplicated_keys": 0,
-      "keys_wrong_in_total": 107,
-      "script": "negative_d2_skip_heap_only.py"
+      "keys_wrong_in_total": 73,
+      "script": "neg03_discard_unresolved.py"
     },
-    "5. aborted treated as committed": {
-      "rows": 486,
-      "duplicate_key_records": 51,
-      "missing": 0,
-      "extra": 6,
-      "wrong_values": 56,
-      "duplicated_keys": 51,
-      "keys_wrong_in_total": 62,
-      "script": "negative_c_aborted_visible.py"
+    "4. hint bits only, unhinted -> aborted": {
+      "rows": 132,
+      "duplicate_key_records": 1,
+      "missing": 68,
+      "extra": 0,
+      "wrong_values": 2,
+      "duplicated_keys": 1,
+      "keys_wrong_in_total": 70,
+      "script": "neg04_hints_only.py"
     },
-    "6. in-progress treated as committed": {
-      "rows": 423,
+    "5. fate resolved per tuple, not per xid": {
+      "rows": 128,
       "duplicate_key_records": 0,
-      "missing": 12,
-      "extra": 6,
-      "wrong_values": 16,
+      "missing": 71,
+      "extra": 0,
+      "wrong_values": 2,
       "duplicated_keys": 0,
-      "keys_wrong_in_total": 34,
-      "script": "negative_e_in_progress_committed.py"
+      "keys_wrong_in_total": 73,
+      "script": "neg05_per_tuple.py"
     },
-    "7a. snapshot_xip ignored": {
-      "rows": 429,
+    "6. each relation recovered on its own": {
+      "rows": 128,
       "duplicate_key_records": 0,
-      "missing": 12,
-      "extra": 12,
-      "wrong_values": 42,
+      "missing": 71,
+      "extra": 0,
+      "wrong_values": 2,
       "duplicated_keys": 0,
-      "keys_wrong_in_total": 66,
-      "script": "negative_j_ignore_xip.py"
+      "keys_wrong_in_total": 73,
+      "script": "neg06_per_relation.py"
     },
-    "7b. every recent xid is in progress": {
-      "rows": 435,
+    "7. foreign keys ignored": {
+      "rows": 131,
       "duplicate_key_records": 0,
-      "missing": 0,
-      "extra": 6,
-      "wrong_values": 46,
+      "missing": 68,
+      "extra": 0,
+      "wrong_values": 1,
       "duplicated_keys": 0,
-      "keys_wrong_in_total": 52,
-      "script": "negative_j2_recent_is_in_progress.py"
+      "keys_wrong_in_total": 69,
+      "script": "neg07_ignore_fk.py"
     },
-    "8. hint bits used as the commit log": {
-      "rows": 234,
-      "duplicate_key_records": 0,
-      "missing": 201,
-      "extra": 6,
-      "wrong_values": 43,
-      "duplicated_keys": 0,
-      "keys_wrong_in_total": 250,
-      "script": "negative_i_hint_bits_only.py"
-    },
-    "9. every physical tuple": {
-      "rows": 855,
-      "duplicate_key_records": 373,
-      "missing": 0,
-      "extra": 53,
-      "wrong_values": 287,
-      "duplicated_keys": 287,
-      "keys_wrong_in_total": 340,
-      "script": "negative_f_all_tuples.py"
-    },
-    "10. newest committed, no header state": {
-      "rows": 470,
-      "duplicate_key_records": 0,
-      "missing": 0,
-      "extra": 41,
-      "wrong_values": 95,
-      "duplicated_keys": 0,
-      "keys_wrong_in_total": 136,
-      "script": "negative_m_newest_committed.py"
-    },
-    "11. pg_subtrans ignored": {
-      "rows": 429,
-      "duplicate_key_records": 0,
-      "missing": 6,
-      "extra": 6,
-      "wrong_values": 24,
-      "duplicated_keys": 0,
-      "keys_wrong_in_total": 36,
-      "script": "negative_p_ignore_subtrans.py"
-    },
-    "12. subxact inherits parent status": {
-      "rows": 445,
-      "duplicate_key_records": 16,
+    "8. PK/UNIQUE constraints ignored": {
+      "rows": 203,
+      "duplicate_key_records": 4,
       "missing": 0,
       "extra": 0,
-      "wrong_values": 16,
-      "duplicated_keys": 16,
-      "keys_wrong_in_total": 16,
-      "script": "negative_q_subxact_inherits_parent.py"
+      "wrong_values": 1,
+      "duplicated_keys": 4,
+      "keys_wrong_in_total": 4,
+      "script": "neg08_ignore_pk.py"
     },
-    "13. multi xmax read as a plain xid": {
-      "rows": 373,
+    "9. first locally valid candidate": {
+      "rows": 131,
       "duplicate_key_records": 0,
-      "missing": 56,
+      "missing": 68,
       "extra": 0,
-      "wrong_values": 0,
+      "wrong_values": 1,
       "duplicated_keys": 0,
-      "keys_wrong_in_total": 56,
-      "script": "negative_r_multi_as_xid.py"
+      "keys_wrong_in_total": 69,
+      "script": "neg09_first_candidate.py"
     },
-    "14. every multi is just a lock": {
-      "rows": 440,
-      "duplicate_key_records": 11,
+    "10. greedy one-hop hint propagation": {
+      "rows": 200,
+      "duplicate_key_records": 1,
       "missing": 0,
       "extra": 0,
-      "wrong_values": 11,
-      "duplicated_keys": 11,
-      "keys_wrong_in_total": 11,
-      "script": "negative_s_multi_always_lock.py"
+      "wrong_values": 1,
+      "duplicated_keys": 1,
+      "keys_wrong_in_total": 1,
+      "script": "neg10_greedy_hints.py"
     },
-    "15. any committed member kills": {
-      "rows": 377,
+    "11. newest xmin per key (V1 shortcut)": {
+      "rows": 200,
       "duplicate_key_records": 0,
-      "missing": 52,
-      "extra": 0,
-      "wrong_values": 0,
-      "duplicated_keys": 0,
-      "keys_wrong_in_total": 52,
-      "script": "negative_t_any_member_kills.py"
-    },
-    "16. highest member assumed updater": {
-      "rows": 415,
-      "duplicate_key_records": 0,
-      "missing": 14,
-      "extra": 0,
-      "wrong_values": 0,
-      "duplicated_keys": 0,
-      "keys_wrong_in_total": 14,
-      "script": "negative_t2_highest_member_updates.py"
-    },
-    "17. multi updater without pg_subtrans": {
-      "rows": 399,
-      "duplicate_key_records": 0,
-      "missing": 30,
-      "extra": 0,
-      "wrong_values": 0,
-      "duplicated_keys": 0,
-      "keys_wrong_in_total": 30,
-      "script": "negative_u_updater_no_subtrans.py"
-    },
-    "18. multi updater ignores the snapshot": {
-      "rows": 401,
-      "duplicate_key_records": 0,
-      "missing": 28,
-      "extra": 0,
-      "wrong_values": 0,
-      "duplicated_keys": 0,
-      "keys_wrong_in_total": 28,
-      "script": "negative_v_updater_ignore_snapshot.py"
-    },
-    "19. reserved member offset 0 mishandled": {
-      "rows": 429,
-      "duplicate_key_records": 11,
-      "missing": 11,
-      "extra": 0,
-      "wrong_values": 11,
-      "duplicated_keys": 11,
-      "keys_wrong_in_total": 22,
-      "script": "negative_w_offset_off_by_one.py"
-    },
-    "20. member range read until a zero xid": {
-      "rows": 411,
-      "duplicate_key_records": 0,
-      "missing": 18,
-      "extra": 0,
-      "wrong_values": 0,
-      "duplicated_keys": 0,
-      "keys_wrong_in_total": 18,
-      "script": "negative_x_range_until_zero.py"
-    },
-    "21. XMIN_INVALID tested before FROZEN": {
-      "rows": 150,
-      "duplicate_key_records": 0,
-      "missing": 279,
-      "extra": 0,
-      "wrong_values": 0,
-      "duplicated_keys": 0,
-      "keys_wrong_in_total": 279,
-      "script": "negative_y_invalid_before_frozen.py"
-    },
-    "22. frozen means visible, xmax skipped": {
-      "rows": 572,
-      "duplicate_key_records": 120,
       "missing": 0,
-      "extra": 23,
-      "wrong_values": 120,
-      "duplicated_keys": 120,
-      "keys_wrong_in_total": 143,
-      "script": "negative_z_frozen_always_visible.py"
+      "extra": 1,
+      "wrong_values": 2,
+      "duplicated_keys": 0,
+      "keys_wrong_in_total": 3,
+      "script": "neg11_newest_xmin.py"
+    },
+    "12. V3/V4 pipeline, no inference layer": {
+      "rows": 128,
+      "duplicate_key_records": 0,
+      "missing": 71,
+      "extra": 0,
+      "wrong_values": 2,
+      "duplicated_keys": 0,
+      "keys_wrong_in_total": 73,
+      "script": "neg12_v4_pipeline.py"
     }
   }
 }

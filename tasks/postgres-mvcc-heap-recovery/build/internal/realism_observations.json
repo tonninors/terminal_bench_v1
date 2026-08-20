@@ -1,0 +1,42 @@
+{
+  "settings": {
+    "shared_buffers": "2MB",
+    "synchronous_commit": "off",
+    "wal_writer_delay": "10s",
+    "checkpoint_timeout": "1d",
+    "fsync": "on",
+    "full_page_writes": "off"
+  },
+  "burn": {
+    "from_xid": 758,
+    "to_xid": 32970,
+    "seconds": 0.1
+  },
+  "checkpoint": {
+    "clog_size_after": 16384,
+    "highest_pre_incident_xid": 32970
+  },
+  "capture": {
+    "clog_file_size": 16384,
+    "heap_sizes": {
+      "accounts": 49152,
+      "ledger_entries": 8192,
+      "account_tags": 8192
+    },
+    "wal_insert_write_flush_lsn": [
+      "0/22F80E0",
+      "0/22F80E0",
+      "0/22F80E0"
+    ]
+  },
+  "waldump_outcome_records_found": 17,
+  "waldump_samples": [
+    "rmgr: Transaction len (rec/tot):     34/    34, tx:      32971, lsn: 0/022EC278, prev 0/022EC238, desc: COMMIT 2026-08-20 21:54:03.972024 UTC",
+    "rmgr: Transaction len (rec/tot):     34/    34, tx:      32972, lsn: 0/022EC3D8, prev 0/022EC3A0, desc: ABORT 2026-08-20 21:54:03.975441 UTC",
+    "rmgr: Transaction len (rec/tot):     34/    34, tx:      32973, lsn: 0/022F1750, prev 0/022F1710, desc: COMMIT 2026-08-20 21:54:03.982962 UTC",
+    "rmgr: Transaction len (rec/tot):     34/    34, tx:      32975, lsn: 0/022F1910, prev 0/022F18B0, desc: ABORT 2026-08-20 21:54:03.986285 UTC",
+    "rmgr: Transaction len (rec/tot):     34/    34, tx:      32977, lsn: 0/022F1B30, prev 0/022F1AF8, desc: COMMIT 2026-08-20 21:54:03.989952 UTC",
+    "rmgr: Transaction len (rec/tot):     34/    34, tx:      32978, lsn: 0/022F1B90, prev 0/022F1B58, desc: COMMIT 2026-08-20 21:54:03.993590 UTC"
+  ],
+  "stale_clog_xids_verified": 20
+}

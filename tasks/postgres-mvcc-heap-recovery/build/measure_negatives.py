@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Run every wrong strategy and measure how far off it lands.
 
-Output feeds VERIFIER_SPEC.md and V1_VS_V2_DIFFICULTY.md.  The reference is the
-oracle's answer, which build/run_all_validation.sh separately proves identical
-to the state PostgreSQL itself reported for the target snapshot.
+Output feeds VERIFIER_SPEC.md and DIFFICULTY_EXPLANATION.md.  The reference is
+the oracle's answer, which build/run_all_validation.sh separately proves
+identical to the state PostgreSQL itself reported for the target snapshot.
 
     python3 build/measure_negatives.py [--json build/internal/negative_scores.json]
 """
@@ -22,38 +22,21 @@ NEG = TASK / "build" / "negatives"
 ART = TASK / "artifacts"
 ORACLE = TASK / "solution" / "golden_recover.py"
 
-STD = ["--heap", str(ART / "heap_pages.bin"),
-       "--pg-xact", str(ART / "pg_xact"),
-       "--pg-subtrans", str(ART / "pg_subtrans"),
-       "--pg-multixact", str(ART / "pg_multixact"),
-       "--schema", str(ART / "table_schema.json")]
+STD = ["--dir", str(ART)]
 
-# label -> (script, needs the correct answer as --src)
 STRATEGIES = [
-    ("1. greatest xmin per key", "negative_a_max_xmin.py", False),
-    ("2. ignore xmax entirely", "negative_b_ignore_xmax.py", False),
-    ("3. committed xmax means deleted", "negative_l_committed_xmax_deleted.py", False),
-    ("4a. HOT redirects walked as tuples", "negative_d_ignore_hot.py", False),
-    ("4b. heap-only versions skipped", "negative_d2_skip_heap_only.py", False),
-    ("5. aborted treated as committed", "negative_c_aborted_visible.py", False),
-    ("6. in-progress treated as committed", "negative_e_in_progress_committed.py", False),
-    ("7a. snapshot_xip ignored", "negative_j_ignore_xip.py", False),
-    ("7b. every recent xid is in progress", "negative_j2_recent_is_in_progress.py", False),
-    ("8. hint bits used as the commit log", "negative_i_hint_bits_only.py", False),
-    ("9. every physical tuple", "negative_f_all_tuples.py", False),
-    ("10. newest committed, no header state", "negative_m_newest_committed.py", False),
-    ("11. pg_subtrans ignored", "negative_p_ignore_subtrans.py", False),
-    ("12. subxact inherits parent status", "negative_q_subxact_inherits_parent.py", False),
-    ("13. multi xmax read as a plain xid", "negative_r_multi_as_xid.py", False),
-    ("14. every multi is just a lock", "negative_s_multi_always_lock.py", False),
-    ("15. any committed member kills", "negative_t_any_member_kills.py", False),
-    ("16. highest member assumed updater", "negative_t2_highest_member_updates.py", False),
-    ("17. multi updater without pg_subtrans", "negative_u_updater_no_subtrans.py", False),
-    ("18. multi updater ignores the snapshot", "negative_v_updater_ignore_snapshot.py", False),
-    ("19. reserved member offset 0 mishandled", "negative_w_offset_off_by_one.py", False),
-    ("20. member range read until a zero xid", "negative_x_range_until_zero.py", False),
-    ("21. XMIN_INVALID tested before FROZEN", "negative_y_invalid_before_frozen.py", False),
-    ("22. frozen means visible, xmax skipped", "negative_z_frozen_always_visible.py", False),
+    ("1. zero-fill: missing clog = aborted", "neg01_zero_fill_aborted.py"),
+    ("2. missing clog = still in progress", "neg02_missing_in_progress.py"),
+    ("3. discard tuples with unresolved xmin", "neg03_discard_unresolved.py"),
+    ("4. hint bits only, unhinted -> aborted", "neg04_hints_only.py"),
+    ("5. fate resolved per tuple, not per xid", "neg05_per_tuple.py"),
+    ("6. each relation recovered on its own", "neg06_per_relation.py"),
+    ("7. foreign keys ignored", "neg07_ignore_fk.py"),
+    ("8. PK/UNIQUE constraints ignored", "neg08_ignore_pk.py"),
+    ("9. first locally valid candidate", "neg09_first_candidate.py"),
+    ("10. greedy one-hop hint propagation", "neg10_greedy_hints.py"),
+    ("11. newest xmin per key (V1 shortcut)", "neg11_newest_xmin.py"),
+    ("12. V3/V4 pipeline, no inference layer", "neg12_v4_pipeline.py"),
 ]
 
 
@@ -96,7 +79,8 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as d:
         d = Path(d)
         good = d / "correct.csv"
-        r = subprocess.run([sys.executable, str(ORACLE), *STD, "--out", str(good)],
+        r = subprocess.run([sys.executable, str(ORACLE), *STD,
+                            "--out", str(good)],
                            capture_output=True, text=True)
         if r.returncode:
             raise SystemExit("the oracle failed: " + r.stderr)
@@ -104,22 +88,20 @@ def main() -> int:
 
         results = {}
         print("reference answer: %d rows\n" % len(correct_rows))
-        print("%-42s %6s %6s %8s %6s %6s %9s"
+        print("%-44s %6s %6s %8s %6s %6s %9s"
               % ("naive strategy", "rows", "dupPK", "missing", "extra", "wrong",
                  "keys off"))
-        print("-" * 92)
-        for label, script, needs_src in STRATEGIES:
+        print("-" * 94)
+        for label, script in STRATEGIES:
             out = d / (script + ".csv")
-            cmd = [sys.executable, str(NEG / script)]
-            cmd += ["--src", str(good)] if needs_src else STD
-            cmd += ["--out", str(out)]
+            cmd = [sys.executable, str(NEG / script), *STD, "--out", str(out)]
             r = subprocess.run(cmd, capture_output=True, text=True)
             if r.returncode:
                 raise SystemExit("%s failed:\n%s\n%s" % (script, r.stdout, r.stderr))
             _h, rows = read_rows(out)
             s = score(correct_rows, rows)
             results[label] = dict(s, script=script)
-            print("%-42s %6d %6d %8d %6d %6d %9d"
+            print("%-44s %6d %6d %8d %6d %6d %9d"
                   % (label, s["rows"], s["duplicate_key_records"], s["missing"],
                      s["extra"], s["wrong_values"], s["keys_wrong_in_total"]))
 
@@ -130,6 +112,8 @@ def main() -> int:
     weakest = min(results.items(), key=lambda kv: kv[1]["keys_wrong_in_total"])
     print("weakest strategy: %s is wrong on %d key(s)"
           % (weakest[0], weakest[1]["keys_wrong_in_total"]))
+    if weakest[1]["keys_wrong_in_total"] == 0:
+        raise SystemExit("a negative strategy produced the CORRECT answer")
     return 0
 
 

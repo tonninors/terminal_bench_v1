@@ -23,10 +23,12 @@ OUT = TASK / "tests" / "expected_state.json"
 
 def main() -> int:
     schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
-    columns = [c["name"] for c in schema["columns"]]
-    coltypes = [c["type"] for c in schema["columns"]]
-    nullable = [c["name"] for c in schema["columns"] if c["nullable"]]
-    pk = schema["primary_key"]
+    rel = next(r for r in schema["relations"]
+               if r["name"] == schema["output_relation"])
+    columns = [c["name"] for c in rel["columns"]]
+    coltypes = [c["type"] for c in rel["columns"]]
+    nullable = [c["name"] for c in rel["columns"] if c["nullable"]]
+    pk = rel["primary_key"]
     pk_pos = [columns.index(c) for c in pk]
 
     with GOLDEN.open("r", encoding="utf-8", newline="") as fh:
@@ -54,7 +56,7 @@ def main() -> int:
          for i, v in enumerate(r) if v == "\x00NULL"])
 
     expected = {
-        "table_name": schema["table_name"],
+        "table_name": schema["output_relation"],
         "postgres_version": schema["postgres_version"],
         "columns": columns,
         "column_types": coltypes,

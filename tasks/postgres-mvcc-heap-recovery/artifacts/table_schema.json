@@ -2,64 +2,146 @@
   "postgres_version": "16.15 (Debian 16.15-1.pgdg13+2)",
   "postgres_version_full": "PostgreSQL 16.15 (Debian 16.15-1.pgdg13+2) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
   "block_size": 8192,
-  "table_name": "public.account_ledger",
-  "primary_key": [
-    "account_id"
-  ],
-  "columns": [
+  "incident": "The WAL volume of this cluster was lost in a crash. The relation heap files and the surviving pg_xact and pg_subtrans segments were recovered from the data volume. The on-disk pg_xact does not record an outcome for every transaction the heap pages reference.",
+  "relations": [
     {
-      "name": "account_id",
-      "type": "integer",
-      "nullable": false
+      "name": "accounts",
+      "file": "heap_pages.bin",
+      "columns": [
+        {
+          "name": "account_id",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "holder_name",
+          "type": "text",
+          "nullable": false
+        },
+        {
+          "name": "region",
+          "type": "character varying(12)",
+          "nullable": false
+        },
+        {
+          "name": "balance_cents",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "is_active",
+          "type": "boolean",
+          "nullable": false
+        },
+        {
+          "name": "risk_tier",
+          "type": "smallint",
+          "nullable": true
+        },
+        {
+          "name": "opened_on",
+          "type": "date",
+          "nullable": false
+        },
+        {
+          "name": "note",
+          "type": "text",
+          "nullable": true
+        }
+      ],
+      "primary_key": [
+        "account_id"
+      ],
+      "checks": [
+        "balance_cents > -10000000"
+      ]
     },
     {
-      "name": "region_code",
-      "type": "character varying(12)",
-      "nullable": false
+      "name": "ledger_entries",
+      "file": "ledger_entries_heap.bin",
+      "columns": [
+        {
+          "name": "entry_id",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "account_id",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "amount_cents",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "entered_on",
+          "type": "date",
+          "nullable": false
+        },
+        {
+          "name": "memo",
+          "type": "text",
+          "nullable": true
+        }
+      ],
+      "primary_key": [
+        "entry_id"
+      ],
+      "checks": [
+        "amount_cents <> 0"
+      ],
+      "foreign_keys": [
+        {
+          "columns": [
+            "account_id"
+          ],
+          "references": "accounts",
+          "referenced_columns": [
+            "account_id"
+          ]
+        }
+      ]
     },
     {
-      "name": "balance_cents",
-      "type": "integer",
-      "nullable": false
-    },
-    {
-      "name": "is_active",
-      "type": "boolean",
-      "nullable": false
-    },
-    {
-      "name": "risk_tier",
-      "type": "smallint",
-      "nullable": true
-    },
-    {
-      "name": "opened_on",
-      "type": "date",
-      "nullable": false
-    },
-    {
-      "name": "owner_note",
-      "type": "text",
-      "nullable": true
+      "name": "account_tags",
+      "file": "account_tags_heap.bin",
+      "columns": [
+        {
+          "name": "account_id",
+          "type": "integer",
+          "nullable": false
+        },
+        {
+          "name": "tag",
+          "type": "character varying(20)",
+          "nullable": false
+        }
+      ],
+      "primary_key": [
+        "account_id",
+        "tag"
+      ],
+      "foreign_keys": [
+        {
+          "columns": [
+            "account_id"
+          ],
+          "references": "accounts",
+          "referenced_columns": [
+            "account_id"
+          ]
+        }
+      ]
     }
   ],
-  "snapshot_xmin": 804,
-  "snapshot_xmax": 842,
+  "output_relation": "accounts",
+  "snapshot_xmin": 32994,
+  "snapshot_xmax": 32998,
   "snapshot_xip": [
-    804,
-    810,
-    814,
-    816,
-    818,
-    820,
-    821,
-    827,
-    829,
-    830,
-    831,
-    832,
-    833,
-    836,
-    838
+    32994,
+    32995,
+    32996
   ]
 }

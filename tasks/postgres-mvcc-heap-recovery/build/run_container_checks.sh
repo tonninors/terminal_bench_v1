@@ -36,13 +36,23 @@ docker cp tests "$NAME:/app/tests" >/dev/null
 docker cp run-tests.sh "$NAME:/app/run-tests.sh" >/dev/null
 docker cp solution.sh "$NAME:/tmp/solution.sh" >/dev/null
 
-printf '\n=== the decoded transaction table is gone ===\n'
+printf '\n=== only the six named inputs are present ===\n'
 if docker exec "$NAME" test -e /app/tx_status.csv; then
   bad "tx_status.csv is present in the image"
 else
-  ok "no /app/tx_status.csv; state must come from pg_xact and pg_subtrans"
+  ok "no /app/tx_status.csv; transaction state must come from the SLRU files"
 fi
-for seg in pg_xact pg_subtrans pg_multixact/offsets pg_multixact/members; do
+if docker exec "$NAME" test -e /app/pg_multixact; then
+  bad "pg_multixact/ is present in the image (dropped in v5)"
+else
+  ok "no /app/pg_multixact/ (not part of fixture v5)"
+fi
+for f in heap_pages.bin ledger_entries_heap.bin account_tags_heap.bin \
+         table_schema.json; do
+  docker exec "$NAME" test -f "/app/$f" && ok "/app/$f present" \
+    || bad "/app/$f missing"
+done
+for seg in pg_xact pg_subtrans; do
   n=$(docker exec "$NAME" sh -c "ls -1 /app/$seg | wc -l")
   if [ "$n" -ge 1 ]; then ok "/app/$seg/ ships $n segment file(s)"
   else bad "/app/$seg/ is empty"; fi
@@ -58,7 +68,7 @@ tail -2 $WORK/nop.log | sed 's/^/  /'
 printf '\n=== oracle: solution.sh, then run-tests.sh ===\n'
 docker exec "$NAME" bash /tmp/solution.sh >$WORK/oracle.log 2>&1 \
   || { bad "solution.sh failed inside the container"; tail -5 $WORK/oracle.log; }
-grep -E '"visible_rows"|"blocks"|"physical_tuples"' $WORK/oracle.log | sed 's/^/  /'
+tail -3 $WORK/oracle.log | sed 's/^/  /'
 docker exec "$NAME" bash /app/run-tests.sh >$WORK/verify.log 2>&1
 rc=$?
 tail -2 $WORK/verify.log | sed 's/^/  /'
@@ -66,10 +76,7 @@ tail -2 $WORK/verify.log | sed 's/^/  /'
 
 printf '\n=== the in-container answer matches the host oracle byte for byte ===\n'
 docker exec "$NAME" sha256sum /app/recovered.csv | sed 's/^/  /'
-$PY solution/golden_recover.py --heap artifacts/heap_pages.bin \
-    --pg-xact artifacts/pg_xact --pg-subtrans artifacts/pg_subtrans \
-    --pg-multixact artifacts/pg_multixact \
-    --schema artifacts/table_schema.json \
+$PY solution/golden_recover.py --dir artifacts \
     --out "$WORK/host_recovered.csv" >/dev/null \
   || bad "the host oracle run failed"
 host=$(sha256sum "$WORK/host_recovered.csv" | cut -d' ' -f1)

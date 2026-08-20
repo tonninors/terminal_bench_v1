@@ -1,56 +1,57 @@
 #!/usr/bin/env python3
-"""Reference recovery of the MVCC-visible rows of a PostgreSQL 16 heap.
+"""Reference recovery for the v5 lost-clog-tail PostgreSQL 16 incident.
 
-Reads only what the solver is given - the raw relation blocks, the cluster's
-pg_xact and pg_subtrans segments, and the schema/snapshot description - and
-reconstructs the logical table as PostgreSQL would have seen it under the
-supplied snapshot.
+Reads only what the solver is given - the raw heap files of three relations,
+the surviving pg_xact and pg_subtrans SLRU segments, and the schema/snapshot
+description - and reconstructs the rows of the output relation exactly as
+PostgreSQL saw them under the supplied snapshot.
 
-    golden_recover.py [--heap /app/heap_pages.bin] [--pg-xact /app/pg_xact]
-                      [--pg-subtrans /app/pg_subtrans]
-                      [--pg-multixact /app/pg_multixact]
-                      [--schema /app/table_schema.json] [--out /app/recovered.csv]
-                      [--report]
+    golden_recover.py [--dir /app] [--schema /app/table_schema.json]
+                      [--out /app/recovered.csv] [--report]
 
-Transaction state comes from the cluster's own SLRU segments: `pg_xact` is the
-commit log (two bits per xid) and `pg_subtrans` maps a subtransaction xid to its
-immediate parent.  Both matter.  `pg_current_snapshot()` exports only *top-level*
-xids in its xip list, so a tuple written by a subtransaction of a transaction
-that was still running carries a subxid that reads COMMITTED in the commit log
-and is absent from snapshot_xip; only the subtransaction map shows that its
-topmost parent was in flight.
+The surviving commit log does not record an outcome for every transaction the
+pages reference: the cluster's WAL volume was lost, and pg_xact writeback is
+lazy, so the bits for the most recent transactions were never flushed.  Those
+entries read zero (nominally "in progress"), which the supplied snapshot
+refutes for any xid below snapshot_xmin - or inside [xmin, xmax) and absent
+from snapshot_xip - because such a transaction had already completed when the
+snapshot was taken.  Each such xid therefore committed or aborted, and the
+file cannot say which.
 
-When several transactions lock one row, or a locker coexists with an updater,
-t_xmax holds a MultiXactId instead of a transaction id, flagged by
-HEAP_XMAX_IS_MULTI.  The mxid resolves through pg_multixact/offsets (start of
-its member list; the next multi's entry bounds it) and pg_multixact/members
-(member xids plus a status flag each).  Locker members never delete the tuple;
-the at-most-one update member deletes it exactly when that transaction committed
-and is outside the snapshot - resolved through pg_subtrans like any other xid.
+This oracle resolves them by GLOBAL INFERENCE rather than any per-file rule:
 
-No hidden expected answer is consulted and no row is hard-coded anywhere in this
-file.  Structure references: src/include/storage/bufpage.h (PageHeaderData,
-ItemIdData), src/include/access/htup_details.h (HeapTupleHeaderData, t_infomask
-bits, att_align/att_addlength), src/include/access/clog.h and
-src/backend/access/transam/subtrans.c (SLRU geometry), and
-src/backend/utils/time/snapmgr.c plus heapam_visibility.c
-(HeapTupleSatisfiesMVCC, XidInMVCCSnapshot, TransactionIdDidCommit,
-SubTransGetTopmostTransaction).
+  1. every tuple hint bit PostgreSQL genuinely stamped is authoritative
+     evidence about one transaction's outcome (and, by atomicity, about every
+     tuple of that transaction in every relation);
+  2. all remaining assignments of {committed, aborted} to the unresolved
+     transactions are enumerated exhaustively;
+  3. for each candidate assignment the full MVCC-visible state of ALL THREE
+     relations is computed under the supplied snapshot, and the candidate is
+     rejected if that state violates any declared PRIMARY KEY / UNIQUE,
+     FOREIGN KEY, NOT NULL or CHECK constraint, or contradicts any hint bit;
+  4. exactly one assignment must survive; its accounts state is the answer.
+
+No hidden expected answer is consulted and no row or outcome is hard-coded.
+Structure references: bufpage.h, htup_details.h, heapam_visibility.c
+(HeapTupleSatisfiesMVCC, XidInMVCCSnapshot, SetHintBits), clog.c/subtrans.c
+(SLRU geometry, lazy writeback), transam/README (WAL closes the clog gap
+during crash recovery - which is exactly what a lost WAL volume prevents).
 """
 from __future__ import annotations
 
 import argparse
 import csv
 import datetime as dt
+import itertools
 import json
+import re
 import struct
 import sys
 from pathlib import Path
 
 # ---------------------------------------------------------------- page layout
-PAGE_HEADER_SIZE = 24          # sizeof(PageHeaderData) up to pd_linp[]
+PAGE_HEADER_SIZE = 24
 ITEM_ID_SIZE = 4
-
 LP_UNUSED, LP_NORMAL, LP_REDIRECT, LP_DEAD = 0, 1, 2, 3
 
 # ---------------------------------------------------------------- tuple header
@@ -61,7 +62,6 @@ HEAP_XMAX_KEYSHR_LOCK = 0x0010
 HEAP_COMBOCID = 0x0020
 HEAP_XMAX_EXCL_LOCK = 0x0040
 HEAP_XMAX_LOCK_ONLY = 0x0080
-# HEAP_LOCK_MASK = HEAP_XMAX_SHR_LOCK | HEAP_XMAX_EXCL_LOCK | HEAP_XMAX_KEYSHR_LOCK
 HEAP_LOCK_MASK = HEAP_XMAX_KEYSHR_LOCK | HEAP_XMAX_EXCL_LOCK
 HEAP_XMIN_COMMITTED = 0x0100
 HEAP_XMIN_INVALID = 0x0200
@@ -69,33 +69,19 @@ HEAP_XMIN_FROZEN = HEAP_XMIN_COMMITTED | HEAP_XMIN_INVALID
 HEAP_XMAX_COMMITTED = 0x0400
 HEAP_XMAX_INVALID = 0x0800
 HEAP_XMAX_IS_MULTI = 0x1000
-
 HEAP_NATTS_MASK = 0x07FF
 HEAP_HOT_UPDATED = 0x4000
 HEAP_ONLY_TUPLE = 0x8000
 
 INVALID_XID = 0
-BOOTSTRAP_XID = 1
 FROZEN_XID = 2
 
 # ---------------------------------------------------------------- SLRU layout
 BLCKSZ = 8192
 SLRU_PAGES_PER_SEGMENT = 32
-CLOG_BITS_PER_XACT = 2
 CLOG_XACTS_PER_BYTE = 4
-CLOG_XACTS_PER_PAGE = BLCKSZ * CLOG_XACTS_PER_BYTE          # 32768
-CLOG_XACT_BITMASK = (1 << CLOG_BITS_PER_XACT) - 1
-SUBTRANS_XACTS_PER_PAGE = BLCKSZ // 4                       # 2048
-
-# pg_multixact geometry (src/backend/access/transam/multixact.c)
-MULTIXACT_OFFSETS_PER_PAGE = BLCKSZ // 4                    # 2048
-MULTIXACT_MEMBERS_PER_GROUP = 4
-MULTIXACT_MEMBERGROUP_SIZE = 4 + 4 * 4                      # 4 flag bytes + 4 xids
-MULTIXACT_GROUPS_PER_PAGE = BLCKSZ // MULTIXACT_MEMBERGROUP_SIZE   # 409
-MULTIXACT_MEMBERS_PER_PAGE = MULTIXACT_GROUPS_PER_PAGE * MULTIXACT_MEMBERS_PER_GROUP
-# MultiXactStatus: 0 ForKeyShare, 1 ForShare, 2 ForNoKeyUpdate, 3 ForUpdate are
-# LOCKERS; 4 NoKeyUpdate, 5 Update are UPDATERS (ISUPDATE_from_mxstatus)
-MXS_IS_UPDATE = (4, 5)
+CLOG_XACTS_PER_PAGE = BLCKSZ * CLOG_XACTS_PER_BYTE
+SUBTRANS_XACTS_PER_PAGE = BLCKSZ // 4
 
 XACT_IN_PROGRESS = 0x00
 XACT_COMMITTED = 0x01
@@ -111,8 +97,6 @@ def maxalign(x: int, align: int = 8) -> int:
 
 # ---------------------------------------------------------------- type support
 class Attr:
-    """One column, in the physical order it appears inside a tuple."""
-
     def __init__(self, name: str, typename: str, nullable: bool):
         self.name = name
         self.typename = typename
@@ -128,16 +112,11 @@ class Attr:
             self.typlen, self.align, self.kind = 1, 1, "bool"
         elif base == "date":
             self.typlen, self.align, self.kind = 4, 4, "date"
-        elif base in ("real", "float4"):
-            self.typlen, self.align, self.kind = 4, 4, "float4"
-        elif base in ("double precision", "float8"):
-            self.typlen, self.align, self.kind = 8, 8, "float8"
-        elif base in ("text", "character varying", "varchar", "citext"):
+        elif base in ("text", "character varying", "varchar"):
             self.typlen, self.align, self.kind = -1, 4, "text"
-        elif base in ("character", "char", "bpchar"):
-            self.typlen, self.align, self.kind = -1, 4, "bpchar"
         else:
-            raise SystemExit("column %r has unsupported type %r" % (name, typename))
+            raise SystemExit("column %r has unsupported type %r"
+                             % (name, typename))
 
     def decode(self, raw: bytes):
         if self.kind == "int":
@@ -147,270 +126,123 @@ class Attr:
         if self.kind == "date":
             return PG_EPOCH + dt.timedelta(
                 days=int.from_bytes(raw, "little", signed=True))
-        if self.kind == "float4":
-            return struct.unpack("<f", raw)[0]
-        if self.kind == "float8":
-            return struct.unpack("<d", raw)[0]
-        if self.kind == "bpchar":
-            return raw.decode("utf-8")
         return raw.decode("utf-8")
 
 
 def read_varlena(buf: bytes, off: int):
-    """Return (payload, total_bytes_consumed) for the varlena datum at `off`."""
     b = buf[off]
-    if b == 0x01:                                  # VARATT_IS_1B_E - TOAST/expanded
-        raise SystemExit(
-            "tuple at offset %d holds an out-of-line (TOAST) datum; the task "
-            "states every required value is inline" % off)
-    if b & 0x01:                                   # VARATT_IS_1B - short header
+    if b == 0x01:
+        raise SystemExit("out-of-line TOAST datum at offset %d; the task "
+                         "states every value is inline" % off)
+    if b & 0x01:
         total = (b >> 1) & 0x7F
         return buf[off + 1: off + total], total
     header = struct.unpack_from("<I", buf, off)[0]
-    if (header & 0x03) == 0x02:                    # VARATT_IS_4B_C - compressed
-        raise SystemExit("tuple at offset %d holds a compressed datum" % off)
+    if (header & 0x03) == 0x02:
+        raise SystemExit("compressed datum at offset %d" % off)
     total = (header >> 2) & 0x3FFFFFFF
     return buf[off + 4: off + total], total
 
 
 # ---------------------------------------------------------------- tuple parsing
 class Tuple:
-    __slots__ = ("block", "lp", "lp_off", "lp_len", "xmin", "xmax", "field3",
-                 "ctid", "infomask2", "infomask", "hoff", "natts", "values")
+    __slots__ = ("rel", "block", "lp", "xmin", "xmax", "ctid", "infomask2",
+                 "infomask", "hoff", "natts", "values")
 
 
-def parse_tuple(page: bytes, block: int, lp: int, off: int, length: int,
-                attrs: list[Attr]) -> Tuple:
+def parse_tuple(page, rel, block, lp, off, length, attrs):
     if off + length > len(page) or length < 23:
-        raise SystemExit("block %d line pointer %d is out of range (off=%d len=%d)"
-                         % (block, lp, off, length))
+        raise SystemExit("%s block %d lp %d out of range" % (rel, block, lp))
     body = page[off: off + length]
-    xmin, xmax, field3 = struct.unpack_from("<III", body, 0)
-    ctid_blk_hi, ctid_blk_lo, ctid_off = struct.unpack_from("<HHH", body, 12)
+    xmin, xmax, _field3 = struct.unpack_from("<III", body, 0)
+    b_hi, b_lo, c_off = struct.unpack_from("<HHH", body, 12)
     infomask2, infomask, hoff = struct.unpack_from("<HHB", body, 18)
 
     t = Tuple()
-    t.block, t.lp, t.lp_off, t.lp_len = block, lp, off, length
-    t.xmin, t.xmax, t.field3 = xmin, xmax, field3
-    t.ctid = ((ctid_blk_hi << 16) | ctid_blk_lo, ctid_off)
+    t.rel, t.block, t.lp = rel, block, lp
+    t.xmin, t.xmax = xmin, xmax
+    t.ctid = ((b_hi << 16) | b_lo, c_off)
     t.infomask2, t.infomask, t.hoff = infomask2, infomask, hoff
     t.natts = infomask2 & HEAP_NATTS_MASK
-
     if t.natts > len(attrs):
-        raise SystemExit("block %d lp %d claims %d attributes, the schema has %d"
-                         % (block, lp, t.natts, len(attrs)))
+        raise SystemExit("%s block %d lp %d claims %d attrs"
+                         % (rel, block, lp, t.natts))
 
     nulls = None
     if infomask & HEAP_HASNULL:
-        bitmap_len = (t.natts + 7) // 8
-        if 23 + bitmap_len > hoff:
-            raise SystemExit("block %d lp %d: null bitmap does not fit in t_hoff"
-                             % (block, lp))
-        nulls = body[23: 23 + bitmap_len]
+        blen = (t.natts + 7) // 8
+        if 23 + blen > hoff:
+            raise SystemExit("null bitmap does not fit t_hoff")
+        nulls = body[23: 23 + blen]
     if hoff > length or hoff % 8:
-        raise SystemExit("block %d lp %d has an implausible t_hoff %d"
-                         % (block, lp, hoff))
+        raise SystemExit("implausible t_hoff %d" % hoff)
 
     values = []
     cur = hoff
     for i, a in enumerate(attrs):
-        if i >= t.natts:                      # attribute added after this tuple
+        if i >= t.natts:
             values.append(None)
             continue
         if nulls is not None and not (nulls[i >> 3] >> (i & 7)) & 1:
-            values.append(None)               # NULL consumes no storage at all
+            values.append(None)
             continue
         if a.typlen < 0:
-            # att_align_pointer: a varlena with a non-zero leading byte is never
-            # preceded by alignment padding, so the 1-byte-header case packs tight
-            if body[cur] != 0:
-                pass
-            else:
+            if body[cur] == 0:
                 cur = maxalign(cur, a.align)
-            payload, consumed = read_varlena(body, cur)
+            payload, used = read_varlena(body, cur)
             values.append(a.decode(payload))
-            cur += consumed
+            cur += used
         else:
             cur = maxalign(cur, a.align)
             values.append(a.decode(body[cur: cur + a.typlen]))
             cur += a.typlen
         if cur > length:
-            raise SystemExit("block %d lp %d: attribute %s runs past the tuple"
-                             % (block, lp, a.name))
+            raise SystemExit("attribute %s runs past the tuple" % a.name)
     t.values = values
     return t
 
 
-def parse_page(page: bytes, block: int, attrs: list[Attr]):
-    """Yield the tuples of one block plus a per-block line-pointer census."""
-    if len(page) != 8192:
-        raise SystemExit("block %d is %d bytes, expected 8192" % (block, len(page)))
-    (pd_lsn_hi, pd_lsn_lo, pd_checksum, pd_flags, pd_lower, pd_upper,
-     pd_special, pd_pagesize_version, pd_prune_xid) = struct.unpack_from(
-        "<IIHHHHHHI", page, 0)
-
-    census = {"LP_UNUSED": 0, "LP_NORMAL": 0, "LP_REDIRECT": 0, "LP_DEAD": 0}
+def parse_heap(data: bytes, rel: str, attrs):
+    if len(data) % BLCKSZ:
+        raise SystemExit("%s heap is not whole 8192-byte blocks" % rel)
     tuples = []
-    if pd_lower == 0 and pd_upper == 0:
-        return tuples, census, {"empty": True}          # never-initialised block
-
-    page_size = pd_pagesize_version & 0xFF00
-    layout_version = pd_pagesize_version & 0x00FF
-    if page_size != 8192:
-        raise SystemExit("block %d declares page size %d" % (block, page_size))
-    if layout_version != 4:
-        raise SystemExit("block %d has page layout version %d, expected 4 "
-                         "(PostgreSQL 8.3-16)" % (block, layout_version))
-    if not (PAGE_HEADER_SIZE <= pd_lower <= pd_upper <= pd_special <= 8192):
-        raise SystemExit("block %d has an inconsistent page header "
-                         "(lower=%d upper=%d special=%d)"
-                         % (block, pd_lower, pd_upper, pd_special))
-
-    n_line_pointers = (pd_lower - PAGE_HEADER_SIZE) // ITEM_ID_SIZE
-    for i in range(n_line_pointers):
-        raw = struct.unpack_from("<I", page, PAGE_HEADER_SIZE + i * ITEM_ID_SIZE)[0]
-        lp_off = raw & 0x7FFF
-        lp_flags = (raw >> 15) & 0x3
-        lp_len = (raw >> 17) & 0x7FFF
-        lp = i + 1                                   # OffsetNumber is 1-based
-        if lp_flags == LP_UNUSED:
-            census["LP_UNUSED"] += 1
-        elif lp_flags == LP_REDIRECT:
-            # A HOT redirect root holds no tuple: lp_off is the OffsetNumber of
-            # the first live version, not a byte offset.  Parsing it as a tuple
-            # would read arbitrary page bytes.
-            census["LP_REDIRECT"] += 1
-        elif lp_flags == LP_DEAD:
-            census["LP_DEAD"] += 1                   # pruned; no storage remains
-        else:
-            census["LP_NORMAL"] += 1
-            tuples.append(parse_tuple(page, block, lp, lp_off, lp_len, attrs))
-
-    header = {"pd_lower": pd_lower, "pd_upper": pd_upper, "pd_special": pd_special,
-              "pd_flags": pd_flags, "pd_prune_xid": pd_prune_xid,
-              "layout_version": layout_version, "line_pointers": n_line_pointers,
-              "lsn": (pd_lsn_hi, pd_lsn_lo), "checksum": pd_checksum}
-    return tuples, census, header
+    census = {"LP_UNUSED": 0, "LP_NORMAL": 0, "LP_REDIRECT": 0, "LP_DEAD": 0}
+    for blk in range(len(data) // BLCKSZ):
+        page = data[blk * BLCKSZ:(blk + 1) * BLCKSZ]
+        (lower, upper, special, pv) = struct.unpack_from("<HHHH", page, 12)
+        if lower == 0 and upper == 0:
+            continue
+        if pv & 0xFF00 != BLCKSZ or pv & 0xFF != 4:
+            raise SystemExit("%s block %d is not a v4-layout 8192 page"
+                             % (rel, blk))
+        if not (PAGE_HEADER_SIZE <= lower <= upper <= special <= BLCKSZ):
+            raise SystemExit("%s block %d header inconsistent" % (rel, blk))
+        n = (lower - PAGE_HEADER_SIZE) // ITEM_ID_SIZE
+        for i in range(n):
+            raw = struct.unpack_from("<I", page,
+                                     PAGE_HEADER_SIZE + i * ITEM_ID_SIZE)[0]
+            lp_off, lp_flags, lp_len = raw & 0x7FFF, (raw >> 15) & 3, \
+                (raw >> 17) & 0x7FFF
+            if lp_flags == LP_UNUSED:
+                census["LP_UNUSED"] += 1
+            elif lp_flags == LP_REDIRECT:
+                census["LP_REDIRECT"] += 1
+            elif lp_flags == LP_DEAD:
+                census["LP_DEAD"] += 1
+            else:
+                census["LP_NORMAL"] += 1
+                tuples.append(parse_tuple(page, rel, blk, i + 1, lp_off,
+                                          lp_len, attrs))
+    return tuples, census
 
 
-class MultiXactLog:
-    """pg_multixact/offsets and pg_multixact/members, read from the raw SLRU
-    segment files.
-
-    offsets holds one 32-bit member index per MultiXactId (2048 per page); the
-    member list of multi M spans [offsets[M], offsets[M+1]).  Member index 0 is
-    reserved so that a zero entry can mean 'never written', which is also why
-    the list of the newest multi on disk can only be bounded if one more multi
-    was created after it.  members packs groups of four: four status-flag bytes
-    followed by four 32-bit xids (20 bytes per group, 409 groups per page)."""
-
-    def __init__(self, root: Path):
-        self.offsets = TransactionLog._load(root / "offsets",
-                                            "pg_multixact/offsets")
-        self.member_segs = TransactionLog._load(root / "members",
-                                                "pg_multixact/members")
-        self.resolved = {}
-
-    def _offset(self, mxid: int) -> int:
-        pageno = mxid // MULTIXACT_OFFSETS_PER_PAGE
-        segno, page = divmod(pageno, SLRU_PAGES_PER_SEGMENT)
-        blob = self.offsets.get(segno)
-        if blob is None:
-            raise SystemExit("pg_multixact/offsets has no segment %04X, needed "
-                             "for multi %d" % (segno, mxid))
-        off = page * BLCKSZ + (mxid % MULTIXACT_OFFSETS_PER_PAGE) * 4
-        return struct.unpack_from("<I", blob, off)[0]
-
-    def members(self, mxid: int):
-        """[(xid, status)] for one multi."""
-        if mxid in self.resolved:
-            return self.resolved[mxid]
-        start, end = self._offset(mxid), self._offset(mxid + 1)
-        if start == 0:
-            raise SystemExit("multi %d was never created (offsets entry is 0)"
-                             % mxid)
-        if end == 0 or end < start or end - start > 64:
-            raise SystemExit("cannot bound the member list of multi %d "
-                             "(offsets[%d]=%d, offsets[%d]=%d)"
-                             % (mxid, mxid, start, mxid + 1, end))
-        out = []
-        for i in range(start, end):
-            pageno, within = divmod(i, MULTIXACT_MEMBERS_PER_PAGE)
-            segno, page = divmod(pageno, SLRU_PAGES_PER_SEGMENT)
-            blob = self.member_segs.get(segno)
-            if blob is None:
-                raise SystemExit("pg_multixact/members has no segment %04X"
-                                 % segno)
-            group, idx = divmod(within, MULTIXACT_MEMBERS_PER_GROUP)
-            base = page * BLCKSZ + group * MULTIXACT_MEMBERGROUP_SIZE
-            flag = blob[base + idx]
-            xid = struct.unpack_from("<I", blob, base + 4 + idx * 4)[0]
-            if xid == INVALID_XID:
-                raise SystemExit("multi %d member %d decodes to xid 0" % (mxid, i))
-            out.append((xid, flag))
-        self.resolved[mxid] = out
-        return out
-
-    def updater(self, mxid: int):
-        """The xid of the at-most-one update member, or None (pure lock)."""
-        ups = [x for x, f in self.members(mxid) if f in MXS_IS_UPDATE]
-        if len(ups) > 1:
-            raise SystemExit("multi %d has %d update members" % (mxid, len(ups)))
-        return ups[0] if ups else None
-
-
-# ---------------------------------------------------------------- visibility
-class Snapshot:
-    def __init__(self, xmin: int, xmax: int, xip):
-        self.xmin, self.xmax, self.xip = xmin, xmax, set(xip)
-
-    def in_progress(self, xid: int, log=None) -> bool:
-        """XidInMVCCSnapshot: was `xid` still running when the snapshot was taken?
-
-        Transactions at or above xmax had not finished (indeed, may not even have
-        started); transactions below xmin had all finished; in between, the
-        explicit in-progress list decides.  A transaction that COMMITTED after
-        the snapshot was taken is therefore still 'in progress' for this
-        snapshot, no matter what its commit log entry says today.
-
-        The list holds **top-level** xids only.  A tuple stamped by a
-        subtransaction therefore has to be resolved through pg_subtrans first,
-        or it will look like an unrelated transaction that had already
-        finished."""
-        if xid >= self.xmax:
-            return True
-        if xid < self.xmin:
-            return False
-        if xid in self.xip:
-            return True
-        if log is None:
-            return False
-        top = log.topmost(xid)
-        if top == xid:
-            return False
-        if top >= self.xmax:
-            return True
-        if top < self.xmin:
-            return False
-        return top in self.xip
-
-
+# ---------------------------------------------------------------- SLRU logs
 class TransactionLog:
-    """The cluster's commit log and subtransaction map, read straight from the
-    SLRU segment files.
-
-    pg_xact stores two bits per transaction id; pg_subtrans stores a four-byte
-    parent transaction id per entry, zero for a top-level transaction.  Segments
-    hold SLRU_PAGES_PER_SEGMENT pages and are named with the segment number in
-    four hex digits."""
+    """Surviving pg_xact + pg_subtrans, read from the raw segment files."""
 
     def __init__(self, clog_dir: Path, subtrans_dir: Path):
         self.clog = self._load(clog_dir, "pg_xact")
         self.subtrans = self._load(subtrans_dir, "pg_subtrans")
-        self.multi = None              # MultiXactLog, attached by the loader
-        self.consulted = set()
-        self.subtrans_lookups = 0
-        self.resolved_subxids = {}
 
     @staticmethod
     def _load(directory: Path, label: str) -> dict:
@@ -422,209 +254,357 @@ class TransactionLog:
                 continue
             name = f.name.upper()
             if len(name) < 4 or any(c not in "0123456789ABCDEF" for c in name):
-                continue                      # not an SLRU segment
+                continue
             blob = f.read_bytes()
             if len(blob) % BLCKSZ:
-                raise SystemExit("%s/%s is %d bytes, not a multiple of %d"
-                                 % (label, f.name, len(blob), BLCKSZ))
+                raise SystemExit("%s/%s is not whole SLRU pages"
+                                 % (label, f.name))
             out[int(name, 16)] = blob
         if not out:
-            raise SystemExit("%s holds no SLRU segment files" % label)
+            raise SystemExit("%s holds no SLRU segments" % label)
         return out
 
-    # -------------------------------------------------------------- pg_xact
-    def raw_status(self, xid: int) -> int:
+    def raw_status(self, xid: int):
+        """The two clog bits, or None when the file does not extend that far
+        (equally unrecorded)."""
         pageno = xid // CLOG_XACTS_PER_PAGE
         segno, page = divmod(pageno, SLRU_PAGES_PER_SEGMENT)
         blob = self.clog.get(segno)
         if blob is None:
-            raise SystemExit("pg_xact has no segment %04X, needed for xid %d"
-                             % (segno, xid))
+            return None
         off = page * BLCKSZ + (xid % CLOG_XACTS_PER_PAGE) // CLOG_XACTS_PER_BYTE
         if off >= len(blob):
-            raise SystemExit("pg_xact segment %04X is too short for xid %d"
-                             % (segno, xid))
-        shift = (xid % CLOG_XACTS_PER_BYTE) * CLOG_BITS_PER_XACT
-        return (blob[off] >> shift) & CLOG_XACT_BITMASK
+            return None
+        return (blob[off] >> ((xid % CLOG_XACTS_PER_BYTE) * 2)) & 3
 
-    # ----------------------------------------------------------- pg_subtrans
     def parent(self, xid: int) -> int:
         pageno = xid // SUBTRANS_XACTS_PER_PAGE
         segno, page = divmod(pageno, SLRU_PAGES_PER_SEGMENT)
         blob = self.subtrans.get(segno)
         if blob is None:
-            return INVALID_XID              # never written: a top-level xid
+            return INVALID_XID
         off = page * BLCKSZ + (xid % SUBTRANS_XACTS_PER_PAGE) * 4
         if off + 4 > len(blob):
             return INVALID_XID
-        self.subtrans_lookups += 1
         return struct.unpack_from("<I", blob, off)[0]
 
     def topmost(self, xid: int) -> int:
-        """SubTransGetTopmostTransaction: walk parents until a top-level xid.
-
-        Savepoints nest, so pg_subtrans records the *immediate* parent and the
-        walk can take several hops.  A parent id is always lower than its child,
-        which bounds the loop."""
         seen = set()
         cur = xid
         while True:
-            parent = self.parent(cur)
-            if parent == INVALID_XID or parent >= cur or parent in seen:
-                if cur != xid:
-                    self.resolved_subxids[xid] = cur
+            p = self.parent(cur)
+            if p == INVALID_XID or p >= cur or p in seen:
                 return cur
             seen.add(cur)
-            cur = parent
+            cur = p
 
-    def is_subtransaction(self, xid: int) -> bool:
-        return self.parent(xid) != INVALID_XID
-
-    # --------------------------------------------------------- commit state
-    def state(self, xid: int) -> str:
-        """committed / aborted / in_progress, as TransactionIdDidCommit sees it.
-
-        A SUB_COMMITTED entry means the subtransaction finished but its parent
-        had not yet, so the parent decides."""
-        self.consulted.add(xid)
+    def recorded_state(self, xid: int):
+        """committed / aborted when the surviving file records it; None when
+        the bits are zero or beyond the file (unrecorded)."""
         seen = set()
         cur = xid
         while True:
             st = self.raw_status(cur)
+            if st is None or st == XACT_IN_PROGRESS:
+                return None
             if st == XACT_COMMITTED:
                 return "committed"
             if st == XACT_ABORTED:
                 return "aborted"
-            if st == XACT_IN_PROGRESS:
-                return "in_progress"
-            parent = self.parent(cur)          # XACT_SUB_COMMITTED
-            if parent == INVALID_XID or parent in seen:
-                return "in_progress"
+            p = self.parent(cur)                # SUB_COMMITTED: parent decides
+            if p == INVALID_XID or p in seen:
+                return None
             seen.add(cur)
-            cur = parent
+            cur = p
 
-    def __call__(self, xid: int) -> str:
-        return self.state(xid)
+
+class Snapshot:
+    def __init__(self, xmin, xmax, xip):
+        self.xmin, self.xmax, self.xip = xmin, xmax, set(xip)
+
+    def in_progress(self, xid: int, log: TransactionLog) -> bool:
+        if xid >= self.xmax:
+            return True
+        if xid < self.xmin:
+            return False
+        if xid in self.xip:
+            return True
+        top = log.topmost(xid)
+        if top == xid:
+            return False
+        if top >= self.xmax:
+            return True
+        if top < self.xmin:
+            return False
+        return top in self.xip
+
+    def completed(self, xid: int, log: TransactionLog) -> bool:
+        """The snapshot itself proves this xid had finished (committed or
+        aborted) when the snapshot was taken."""
+        return not self.in_progress(xid, log)
 
 
 def xmax_is_locked_only(infomask: int) -> bool:
-    """HEAP_XMAX_IS_LOCKED_ONLY (htup_details.h).
-
-    An xmax that records a row lock rather than a deletion.  The explicit
-    HEAP_XMAX_LOCK_ONLY bit covers every lock mode on a modern page; the second
-    arm keeps faith with the macro, which also treats a bare exclusive lock bit
-    (no MultiXact, no key-share) as lock-only for tuples written by older
-    servers."""
     if infomask & HEAP_XMAX_LOCK_ONLY:
         return True
-    return (infomask & (HEAP_XMAX_IS_MULTI | HEAP_LOCK_MASK)) == HEAP_XMAX_EXCL_LOCK
+    return (infomask & (HEAP_XMAX_IS_MULTI | HEAP_LOCK_MASK)) \
+        == HEAP_XMAX_EXCL_LOCK
 
 
-def xmin_committed(t: Tuple, status, notes: dict) -> bool:
-    if (t.infomask & HEAP_XMIN_FROZEN) == HEAP_XMIN_FROZEN or t.xmin == FROZEN_XID:
-        notes["frozen"] += 1
-        return True                       # frozen: committed and older than all
-    if t.infomask & HEAP_XMIN_INVALID:
-        return False                      # hint bit: the inserter aborted
-    st = status(t.xmin)
-    if t.infomask & HEAP_XMIN_COMMITTED and st != "committed":
-        notes["hint_conflicts"] += 1
-    return st == "committed"
+# ---------------------------------------------------------------- relations
+class Relation:
+    def __init__(self, meta: dict, base_dir: Path):
+        self.name = meta["name"]
+        self.attrs = [Attr(c["name"], c["type"], c["nullable"])
+                      for c in meta["columns"]]
+        self.colnames = [a.name for a in self.attrs]
+        self.pk = meta["primary_key"]
+        self.pk_idx = [self.colnames.index(c) for c in self.pk]
+        self.checks = meta.get("checks", [])
+        self.fks = meta.get("foreign_keys", [])
+        data = (base_dir / meta["file"]).read_bytes()
+        self.tuples, self.census = parse_heap(data, self.name, self.attrs)
+        self.heap_bytes = len(data)
+
+    def key_of(self, t: Tuple):
+        return tuple(t.values[i] for i in self.pk_idx)
 
 
-def tuple_visible(t: Tuple, snap: Snapshot, status, notes: dict) -> bool:
-    """HeapTupleSatisfiesMVCC, minus the cases this fixture excludes."""
-    if t.infomask & HEAP_COMBOCID:
-        raise SystemExit("block %d lp %d carries a combo command id"
-                         % (t.block, t.lp))
+CHECK_RE = re.compile(r"^\s*(\w+)\s*(<>|!=|>=|<=|>|<|=)\s*(-?\d+)\s*$")
 
-    if not xmin_committed(t, status, notes):
-        return False                      # inserter aborted or is still running
-    if not ((t.infomask & HEAP_XMIN_FROZEN) == HEAP_XMIN_FROZEN
-            or t.xmin == FROZEN_XID):
-        if snap.in_progress(t.xmin, status):
-            return False                  # inserted after this snapshot was taken
 
-    # Same order as HeapTupleSatisfiesMVCC.
-    if t.infomask & HEAP_XMAX_INVALID:
-        return True                       # hint bit: xmax is aborted or unset
+def check_fn(expr: str, colnames):
+    m = CHECK_RE.match(expr)
+    if not m:
+        raise SystemExit("unsupported CHECK expression %r" % expr)
+    col, op, lit = m.group(1), m.group(2), int(m.group(3))
+    idx = colnames.index(col)
+    ops = {"<>": lambda v: v != lit, "!=": lambda v: v != lit,
+           ">": lambda v: v > lit, "<": lambda v: v < lit,
+           ">=": lambda v: v >= lit, "<=": lambda v: v <= lit,
+           "=": lambda v: v == lit}[op]
+    return lambda row: row[idx] is None or ops(row[idx])
+
+
+# ---------------------------------------------------------------- inference
+class Evidence:
+    """Everything the artifacts say about transaction outcomes."""
+
+    def __init__(self, relations, log: TransactionLog, snap: Snapshot):
+        self.log, self.snap = log, snap
+        self.recorded = {}       # xid -> committed/aborted from surviving clog
+        self.unknown = set()     # completed at the snapshot, outcome unrecorded
+        self.irrelevant = set()  # unrecorded but in-progress at the snapshot
+        self.hints = {}          # xid -> committed/aborted from hint bits
+        self.hint_sources = {}
+
+        xids = set()
+        for rel in relations:
+            for t in rel.tuples:
+                if t.infomask & HEAP_XMAX_IS_MULTI:
+                    raise SystemExit("MultiXact xmax at %s (%d,%d): out of "
+                                     "scope for this fixture"
+                                     % (t.rel, t.block, t.lp))
+                if t.infomask & HEAP_COMBOCID:
+                    raise SystemExit("combo CID present")
+                xids.add(t.xmin)
+                if t.xmax:
+                    xids.add(t.xmax)
+        xids.discard(INVALID_XID)
+
+        for x in sorted(xids):
+            st = log.recorded_state(x)
+            if st is not None:
+                self.recorded[x] = st
+            elif snap.completed(x, log):
+                # zero clog bits, yet the snapshot proves the transaction had
+                # completed: the surviving commit log is stale for this xid
+                self.unknown.add(x)
+            else:
+                self.irrelevant.add(x)
+
+        # authoritative hint bits -> outcome facts (atomicity: one fact per
+        # xid, regardless of which relation carries the stamp)
+        def note(xid, outcome, src):
+            if xid in self.recorded:
+                if self.recorded[xid] != outcome:
+                    raise SystemExit("hint %s contradicts recorded clog for "
+                                     "xid %d" % (src, xid))
+                return
+            prev = self.hints.get(xid)
+            if prev is not None and prev != outcome:
+                raise SystemExit("contradictory hints for xid %d" % xid)
+            self.hints[xid] = outcome
+            self.hint_sources.setdefault(xid, []).append(src)
+
+        for rel in relations:
+            for t in rel.tuples:
+                m = t.infomask
+                if (m & HEAP_XMIN_FROZEN) == HEAP_XMIN_FROZEN:
+                    pass                        # frozen: predates everything
+                elif m & HEAP_XMIN_COMMITTED:
+                    note(t.xmin, "committed",
+                         "%s(%d,%d).xmin" % (t.rel, t.block, t.lp))
+                elif m & HEAP_XMIN_INVALID:
+                    note(t.xmin, "aborted",
+                         "%s(%d,%d).xmin" % (t.rel, t.block, t.lp))
+                if t.xmax and not xmax_is_locked_only(m):
+                    if m & HEAP_XMAX_COMMITTED:
+                        note(t.xmax, "committed",
+                             "%s(%d,%d).xmax" % (t.rel, t.block, t.lp))
+                    elif m & HEAP_XMAX_INVALID:
+                        note(t.xmax, "aborted",
+                             "%s(%d,%d).xmax" % (t.rel, t.block, t.lp))
+
+
+def outcome_fn(evidence, assignment):
+    """xid -> committed/aborted/None(in-progress) for one candidate."""
+    rec, irr = evidence.recorded, evidence.irrelevant
+
+    def fn(xid):
+        st = rec.get(xid)
+        if st is not None:
+            return st
+        if xid in assignment:
+            return assignment[xid]
+        if xid in irr:
+            return None                       # in progress at the snapshot
+        return None
+    return fn
+
+
+def tuple_visible(t: Tuple, snap: Snapshot, log, outcome) -> bool:
+    """HeapTupleSatisfiesMVCC under a candidate outcome function."""
+    m = t.infomask
+    if (m & HEAP_XMIN_FROZEN) != HEAP_XMIN_FROZEN and t.xmin != FROZEN_XID:
+        if outcome(t.xmin) != "committed":
+            return False
+        if snap.in_progress(t.xmin, log):
+            return False
+    if m & HEAP_XMAX_INVALID:
+        return True
     if t.xmax == INVALID_XID:
         return True
-
-    if t.infomask & HEAP_XMAX_IS_MULTI:
-        # xmax is a MultiXactId, NOT a transaction id.  In a fresh cluster the
-        # mxids are small integers that collide with committed bootstrap xids,
-        # so misreading this field silently deletes live rows.
-        notes["multixact"] = notes.get("multixact", 0) + 1
-        if t.infomask & HEAP_XMAX_LOCK_ONLY:
-            notes["multi_lock_only"] = notes.get("multi_lock_only", 0) + 1
-            return True                   # every member is a locker
-        if status.multi is None:
-            raise SystemExit(
-                "block %d lp %d has a MultiXact xmax but no pg_multixact "
-                "evidence was supplied" % (t.block, t.lp))
-        u = status.multi.updater(t.xmax)
-        if u is None:
-            notes["multi_lock_only"] = notes.get("multi_lock_only", 0) + 1
-            return True                   # defensive: no update member after all
-        notes["multi_updater"] = notes.get("multi_updater", 0) + 1
-        if status(u) != "committed":
-            return True                   # the updater aborted or is running
-        if snap.in_progress(u, status):
-            notes["multi_updater_snapshot"] = \
-                notes.get("multi_updater_snapshot", 0) + 1
-            return True                   # updater finished after the snapshot
-        return False
-
-    if xmax_is_locked_only(t.infomask):
-        notes["lock_only"] += 1           # a row lock, not a deletion
-        # SELECT ... FOR UPDATE / FOR SHARE / FOR KEY SHARE puts the locker's
-        # xid in xmax.  The row is still live no matter what the commit log
-        # says about that transaction, and PostgreSQL only stamps
-        # HEAP_XMAX_INVALID over it if the page is later pruned - which never
-        # happened for these pages.  Reading xmax without this test deletes
-        # rows that were merely locked.
+    if xmax_is_locked_only(m):
         return True
-
-    st = status(t.xmax)
-    if st != "committed":
-        return True                       # the deleter aborted or is still running
-    if snap.in_progress(t.xmax, status):
-        return True                       # deleted after this snapshot was taken
+    if outcome(t.xmax) != "committed":
+        return True
+    if snap.in_progress(t.xmax, log):
+        return True
     return False
 
 
+class Engine:
+    """Enumerate candidate assignments; keep those whose full visible state
+    satisfies every constraint and every hint."""
+
+    def __init__(self, relations, log, snap, evidence):
+        self.relations = relations
+        self.log, self.snap, self.ev = log, snap, evidence
+        self.unknowns = sorted(evidence.unknown)
+        if len(self.unknowns) > 22:
+            raise SystemExit("%d unresolved transactions: enumeration would "
+                             "not be practical" % len(self.unknowns))
+        self.checks = {r.name: [check_fn(c, r.colnames) for c in r.checks]
+                       for r in relations}
+        self.funnel = {}
+
+    def candidates(self):
+        ks = self.unknowns
+        for bits in itertools.product(("committed", "aborted"), repeat=len(ks)):
+            yield dict(zip(ks, bits))
+
+    def hint_ok(self, asg):
+        for x, want in self.ev.hints.items():
+            if x in asg and asg[x] != want:
+                return False
+        return True
+
+    def visible_state(self, asg):
+        out = {}
+        fn = outcome_fn(self.ev, asg)
+        for rel in self.relations:
+            vis = [t for t in rel.tuples
+                   if tuple_visible(t, self.snap, self.log, fn)]
+            out[rel.name] = vis
+        return out
+
+    def constraints_ok(self, state):
+        keysets = {}
+        for rel in self.relations:
+            keys = {}
+            for t in state[rel.name]:
+                k = rel.key_of(t)
+                if any(v is None for v in k):
+                    return False
+                if k in keys:
+                    return False              # PK / UNIQUE violated
+                keys[k] = t
+                for i, a in enumerate(rel.attrs):
+                    if not a.nullable and t.values[i] is None:
+                        return False          # NOT NULL violated
+                for c in self.checks[rel.name]:
+                    if not c(t.values):
+                        return False          # CHECK violated
+            keysets[rel.name] = keys
+        for rel in self.relations:
+            for fk in rel.fks:
+                src_idx = [rel.colnames.index(c) for c in fk["columns"]]
+                parent = keysets[fk["references"]]
+                for t in state[rel.name]:
+                    ref = tuple(t.values[i] for i in src_idx)
+                    if any(v is None for v in ref):
+                        continue
+                    if ref not in parent:
+                        return False          # FK violated
+        return True
+
+    def solve(self):
+        total = 2 ** len(self.unknowns)
+        after_hints = after_pk = after_all = 0
+        survivors = []
+        outputs = set()
+        for asg in self.candidates():
+            if not self.hint_ok(asg):
+                continue
+            after_hints += 1
+            state = self.visible_state(asg)
+            # staged funnel accounting: PK/UNIQUE+NOT NULL+CHECK first
+            keys_ok = True
+            for rel in self.relations:
+                seen = set()
+                for t in state[rel.name]:
+                    k = rel.key_of(t)
+                    if k in seen or any(v is None for v in k):
+                        keys_ok = False
+                        break
+                    seen.add(k)
+                if not keys_ok:
+                    break
+            if not keys_ok:
+                continue
+            after_pk += 1
+            if not self.constraints_ok(state):
+                continue
+            after_all += 1
+            survivors.append(asg)
+            out_rel = next(r for r in self.relations)
+            outputs.add(tuple(sorted(
+                tuple(t.values) for t in state[self.relations[0].name])))
+            if len(survivors) > 8:
+                break
+        self.funnel = {
+            "unresolved_xids": len(self.unknowns),
+            "total_assignments": total,
+            "after_hint_filter": after_hints,
+            "after_key_uniqueness": after_pk,
+            "after_all_constraints": after_all,
+            "distinct_outputs": len(outputs),
+        }
+        return survivors
+
+
 # ---------------------------------------------------------------- driver
-def load_schema(path: Path):
-    js = json.loads(path.read_text(encoding="utf-8"))
-    attrs = [Attr(c["name"], c["type"], c.get("nullable", True))
-             for c in js["columns"]]
-    snap = Snapshot(int(js["snapshot_xmin"]), int(js["snapshot_xmax"]),
-                    [int(x) for x in js["snapshot_xip"]])
-    block_size = int(js.get("block_size", 8192))
-    if block_size != 8192:
-        raise SystemExit("this recovery only implements 8192-byte blocks")
-    return js, attrs, snap
-
-
-def load_transaction_log(clog_dir: Path, subtrans_dir: Path,
-                         multixact_dir: Path = None) -> TransactionLog:
-    log = TransactionLog(clog_dir, subtrans_dir)
-    if multixact_dir is not None:
-        log.multi = MultiXactLog(Path(multixact_dir))
-    return log
-
-
-def _chain_depth(log: "TransactionLog", xid: int) -> int:
-    depth, cur = 0, xid
-    while True:
-        parent = log.parent(cur)
-        if parent == INVALID_XID or parent >= cur:
-            return depth
-        depth += 1
-        cur = parent
-
-
 def format_value(v) -> str:
     if v is None:
         return "\\N"
@@ -637,101 +617,75 @@ def format_value(v) -> str:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--heap", default="/app/heap_pages.bin")
-    ap.add_argument("--pg-xact", dest="pg_xact", default="/app/pg_xact")
-    ap.add_argument("--pg-subtrans", dest="pg_subtrans", default="/app/pg_subtrans")
-    ap.add_argument("--pg-multixact", dest="pg_multixact",
-                    default="/app/pg_multixact")
-    ap.add_argument("--schema", default="/app/table_schema.json")
+    ap.add_argument("--dir", default="/app")
+    ap.add_argument("--schema", default=None)
     ap.add_argument("--out", default="/app/recovered.csv")
     ap.add_argument("--report", action="store_true")
     args = ap.parse_args(argv)
 
-    js, attrs, snap = load_schema(Path(args.schema))
-    status = load_transaction_log(Path(args.pg_xact), Path(args.pg_subtrans),
-                                  Path(args.pg_multixact))
-    heap = Path(args.heap).read_bytes()
+    base = Path(args.dir)
+    schema_path = Path(args.schema) if args.schema else base / "table_schema.json"
+    js = json.loads(schema_path.read_text(encoding="utf-8"))
+    if int(js.get("block_size", BLCKSZ)) != BLCKSZ:
+        raise SystemExit("only 8192-byte blocks are implemented")
 
-    if len(heap) % 8192:
-        raise SystemExit("heap_pages.bin is %d bytes, not a multiple of 8192"
-                         % len(heap))
-    nblocks = len(heap) // 8192
+    relations = [Relation(meta, base) for meta in js["relations"]]
+    out_name = js["output_relation"]
+    relations.sort(key=lambda r: 0 if r.name == out_name else 1)
 
-    census = {"LP_UNUSED": 0, "LP_NORMAL": 0, "LP_REDIRECT": 0, "LP_DEAD": 0}
-    notes = {"frozen": 0, "hint_conflicts": 0, "lock_only": 0}
-    all_tuples = []
-    for blk in range(nblocks):
-        tuples, c, _hdr = parse_page(heap[blk * 8192:(blk + 1) * 8192], blk, attrs)
-        for k in census:
-            census[k] += c[k]
-        all_tuples.extend(tuples)
+    log = TransactionLog(base / "pg_xact", base / "pg_subtrans")
+    snap = Snapshot(int(js["snapshot_xmin"]), int(js["snapshot_xmax"]),
+                    [int(x) for x in js["snapshot_xip"]])
 
-    pk_names = js["primary_key"]
-    colnames = [a.name for a in attrs]
-    pk_idx = [colnames.index(n) for n in pk_names]
+    evidence = Evidence(relations, log, snap)
+    engine = Engine(relations, log, snap, evidence)
+    survivors = engine.solve()
 
+    if len(survivors) != 1:
+        raise SystemExit(
+            "the evidence admits %d consistent transaction-outcome "
+            "assignment(s); refusing to guess (funnel: %r)"
+            % (len(survivors), engine.funnel))
+
+    final = survivors[0]
+    fn = outcome_fn(evidence, final)
+    out_rel = relations[0]
     visible = {}
-    for t in all_tuples:
-        if not tuple_visible(t, snap, status, notes):
-            continue
-        key = tuple(t.values[i] for i in pk_idx)
-        if any(k is None for k in key):
-            raise SystemExit("a visible tuple has a NULL primary key component")
-        if key in visible:
-            raise SystemExit(
-                "two tuples are simultaneously visible for primary key %r "
-                "(blocks %d/%d) - the snapshot does not define a unique state"
-                % (key, visible[key].block, t.block))
-        visible[key] = t
+    for t in out_rel.tuples:
+        if tuple_visible(t, snap, log, fn):
+            k = out_rel.key_of(t)
+            if k in visible:
+                raise SystemExit("two visible versions of key %r" % (k,))
+            visible[k] = t
 
     out = Path(args.out)
     with out.open("w", encoding="utf-8", newline="") as fh:
         w = csv.writer(fh, lineterminator="\n")
-        w.writerow(colnames)
-        for key in sorted(visible):
-            w.writerow([format_value(v) for v in visible[key].values])
+        w.writerow(out_rel.colnames)
+        for k in sorted(visible):
+            w.writerow([format_value(v) for v in visible[k].values])
 
     if args.report:
-        versions = {}
-        for t in all_tuples:
-            versions.setdefault(tuple(t.values[i] for i in pk_idx), []).append(t)
-        multi = {k: len(v) for k, v in versions.items() if len(v) > 1}
-        newest_xmin_wrong = 0
-        for key, t in visible.items():
-            if t.xmin != max(x.xmin for x in versions[key]):
-                newest_xmin_wrong += 1
+        direct = sorted(x for x in engine.unknowns if x in evidence.hints)
+        indirect = sorted(x for x in engine.unknowns
+                          if x not in evidence.hints)
         print(json.dumps({
-            "blocks": nblocks,
-            "line_pointers": census,
-            "physical_tuples": len(all_tuples),
-            "distinct_primary_keys_on_disk": len(versions),
-            "keys_with_several_physical_versions": len(multi),
-            "visible_rows": len(visible),
+            "relations": {r.name: {"heap_bytes": r.heap_bytes,
+                                   "tuples": len(r.tuples),
+                                   "census": r.census} for r in relations},
             "snapshot": {"xmin": snap.xmin, "xmax": snap.xmax,
                          "xip": sorted(snap.xip)},
-            "transaction_states_used": len(status.consulted),
-            "commit_log_segments": sorted("%04X" % k for k in status.clog),
-            "subtransaction_map_segments": sorted("%04X" % k
-                                                  for k in status.subtrans),
-            "subtransaction_xids_resolved": len(status.resolved_subxids),
-            "subtransaction_parent_lookups": status.subtrans_lookups,
-            "multixact_offsets_segments": sorted(
-                "%04X" % k for k in status.multi.offsets),
-            "multixact_members_segments": sorted(
-                "%04X" % k for k in status.multi.member_segs),
-            "multixacts_resolved": sorted(status.multi.resolved),
-            "tuples_with_multixact_xmax": notes.get("multixact", 0),
-            "multixact_lock_only_tuples": notes.get("multi_lock_only", 0),
-            "multixact_updater_tuples": notes.get("multi_updater", 0),
-            "multixact_updater_saved_by_snapshot":
-                notes.get("multi_updater_snapshot", 0),
-            "frozen_tuples_seen_in_notes": notes.get("frozen", 0),
-            "deepest_subtransaction_chain": max(
-                [_chain_depth(status, x) for x in status.resolved_subxids] or [0]),
-            "keys_whose_visible_version_is_not_the_newest_xmin": newest_xmin_wrong,
-            "tuples_kept_despite_xmax_lock_only": notes["lock_only"],
-            "frozen_tuples_seen": notes["frozen"],
-            "hint_bit_conflicts_with_commit_log": notes["hint_conflicts"],
+            "recorded_outcomes": len(evidence.recorded),
+            "unresolved_xids": engine.unknowns,
+            "irrelevant_unrecorded_xids": sorted(evidence.irrelevant),
+            "direct_hint_xids": direct,
+            "indirect_xids": indirect,
+            "hint_facts": {str(x): {"outcome": o,
+                                    "sources": evidence.hint_sources.get(x, [])}
+                           for x, o in sorted(evidence.hints.items())},
+            "funnel": engine.funnel,
+            "final_assignment": {str(x): final[x] for x in sorted(final)},
+            "visible_rows": len(visible),
             "output": str(out),
         }, indent=2))
     return 0

@@ -1,0 +1,158 @@
+{
+  "relations": {
+    "accounts": {
+      "heap_bytes": 49152,
+      "tuples": 208,
+      "census": {
+        "LP_UNUSED": 0,
+        "LP_NORMAL": 208,
+        "LP_REDIRECT": 11,
+        "LP_DEAD": 2
+      }
+    },
+    "ledger_entries": {
+      "heap_bytes": 8192,
+      "tuples": 77,
+      "census": {
+        "LP_UNUSED": 0,
+        "LP_NORMAL": 77,
+        "LP_REDIRECT": 0,
+        "LP_DEAD": 0
+      }
+    },
+    "account_tags": {
+      "heap_bytes": 8192,
+      "tuples": 36,
+      "census": {
+        "LP_UNUSED": 0,
+        "LP_NORMAL": 36,
+        "LP_REDIRECT": 0,
+        "LP_DEAD": 0
+      }
+    }
+  },
+  "snapshot": {
+    "xmin": 32994,
+    "xmax": 32998,
+    "xip": [
+      32994,
+      32995,
+      32996
+    ]
+  },
+  "recorded_outcomes": 9,
+  "unresolved_xids": [
+    32971,
+    32972,
+    32973,
+    32975,
+    32977,
+    32978,
+    32979,
+    32981,
+    32983,
+    32984,
+    32986,
+    32988,
+    32990,
+    32992,
+    32993
+  ],
+  "irrelevant_unrecorded_xids": [
+    32994,
+    32995,
+    32996,
+    32998,
+    32999
+  ],
+  "direct_hint_xids": [
+    32971,
+    32972,
+    32977,
+    32979,
+    32988,
+    32992,
+    32993
+  ],
+  "indirect_xids": [
+    32973,
+    32975,
+    32978,
+    32981,
+    32983,
+    32984,
+    32986,
+    32990
+  ],
+  "hint_facts": {
+    "32971": {
+      "outcome": "committed",
+      "sources": [
+        "ledger_entries(0,67).xmin"
+      ]
+    },
+    "32972": {
+      "outcome": "aborted",
+      "sources": [
+        "accounts(0,30).xmax"
+      ]
+    },
+    "32977": {
+      "outcome": "committed",
+      "sources": [
+        "ledger_entries(0,70).xmin"
+      ]
+    },
+    "32979": {
+      "outcome": "committed",
+      "sources": [
+        "ledger_entries(0,71).xmin"
+      ]
+    },
+    "32988": {
+      "outcome": "committed",
+      "sources": [
+        "ledger_entries(0,74).xmin"
+      ]
+    },
+    "32992": {
+      "outcome": "committed",
+      "sources": [
+        "ledger_entries(0,1).xmax"
+      ]
+    },
+    "32993": {
+      "outcome": "committed",
+      "sources": [
+        "ledger_entries(0,76).xmin"
+      ]
+    }
+  },
+  "funnel": {
+    "unresolved_xids": 15,
+    "total_assignments": 32768,
+    "after_hint_filter": 256,
+    "after_key_uniqueness": 9,
+    "after_all_constraints": 1,
+    "distinct_outputs": 1
+  },
+  "final_assignment": {
+    "32971": "committed",
+    "32972": "aborted",
+    "32973": "committed",
+    "32975": "aborted",
+    "32977": "committed",
+    "32978": "committed",
+    "32979": "committed",
+    "32981": "aborted",
+    "32983": "aborted",
+    "32984": "committed",
+    "32986": "aborted",
+    "32988": "committed",
+    "32990": "aborted",
+    "32992": "committed",
+    "32993": "committed"
+  },
+  "visible_rows": 199,
+  "output": "C:\\Users\\anthony\\Documents\\terminal bench\\repo\\tasks\\postgres-mvcc-heap-recovery\\build\\_work\\oracle.csv"
+}

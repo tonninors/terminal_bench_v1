@@ -1,6 +1,62 @@
-# Version history — v1 through v4
+# Version history — v1 through v5
 
 Internal document. Not part of the solver-facing bundle.
+
+---
+
+## v5 — the lost clog tail: from decoding to global inference
+
+v4 was solved as well (all 429 rows). Every version so far was ultimately a
+*decoding* task: each added mechanism (raw SLRU files in v3, MultiXact and
+frozen tuples in v4) made the formats harder, but every fact a tuple needed
+was present somewhere, and a sufficiently careful local reader could resolve
+each tuple on its own. v5 changes the *kind* of problem instead of the amount
+of format.
+
+**The incident.** The cluster crashed and its WAL volume was lost. Because
+clog pages are written back lazily (checkpoint or SLRU eviction; crash
+recovery normally replays the WAL to close the gap), the surviving `pg_xact`
+genuinely lacks outcomes for 15 transactions whose heap effects are on disk
+and whose completion the snapshot itself proves. This state was produced by a
+real PostgreSQL 16 server under an incident configuration
+(`synchronous_commit=off`, tiny `shared_buffers`, delayed checkpoints,
+`fsync=on`) — never by editing files after capture. A Stage-0 authenticity
+gate (see `REALISM_AUDIT.md`) proved the state reachable before the design
+was implemented.
+
+**The new work.** Genuine hint bits pin 7 of the 15 unresolved transactions
+(five of the seven facts sit on a child relation). The other 8 have no direct
+evidence anywhere and are recoverable only by enumerating complete candidate
+states of all three relations and rejecting those that violate the declared
+constraints (PK/UNIQUE, FK, NOT NULL, CHECK) — with dependency chains up to
+depth 3. Exhaustive enumeration is part of generation: 32768 assignments →
+256 after hints → 9 after keys → exactly 1 after all constraints, one
+distinct output; generation aborts otherwise.
+
+**What was removed.** MultiXact (and its two SLRU areas) and frozen tuples
+are gone; the binary-format burden returns to the v3 level, deliberately —
+the difficulty budget moved from decoding to inference. `pg_multixact/` no
+longer ships; two child-relation heaps and the constraint declarations in
+`table_schema.json` are new. The output contract and verifier are unchanged.
+
+| | v4 | v5 |
+| --- | --- | --- |
+| solver inputs | 6 files (with `pg_multixact/`) | **6 files** (3 heaps + schema + `pg_xact/` + `pg_subtrans/`) |
+| relations | 1 | **3** (accounts + ledger_entries + account_tags, FK-linked) |
+| commit log | complete | **stale for 15 recent xids** (authentically) |
+| decisive mechanism | MultiXact member resolution | **global constraint reconciliation** |
+| chain depth | format chain (7 pieces of state) | **evidence chains ≥ 3 deep across relations** |
+| uniqueness | per-tuple determinism | **machine-proven: 1 assignment, 1 output of 32768** |
+| visible rows | 429 | 199 |
+| a v3/v4-quality solver scores | correct | **73 of 199 keys wrong** |
+
+The twelve v5 negatives (zero-fill, face-value bits, discard-unresolved,
+hints-only, per-tuple, per-relation, no-FK, no-PK, first-candidate, greedy
+one-hop, newest-xmin, v3/v4-parser) all fail; nine of them lose 69–73 keys.
+
+---
+
+# v1 through v4 (historical)
 
 V1 was solved by a frontier model, which recovered all 210 expected rows. V2
 keeps the solver-facing contract byte-for-byte identical — same three input

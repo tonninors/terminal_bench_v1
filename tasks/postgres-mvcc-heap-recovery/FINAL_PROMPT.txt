@@ -1,19 +1,25 @@
-Recover the exact logical rows visible under the MVCC snapshot defined in
-/app/table_schema.json from the PostgreSQL 16 heap pages in /app/heap_pages.bin,
-using the transaction state recorded in /app/pg_xact/, /app/pg_subtrans/ and
-/app/pg_multixact/. Write the result to /app/recovered.csv.
+A PostgreSQL 16 cluster crashed and its WAL volume was lost. The relation heap
+files and the surviving transaction metadata were recovered from the data
+volume. Because the crash interrupted normal write-back, the on-disk commit log
+does not record an outcome for every transaction the pages refer to. The
+supplied files jointly contain enough information to determine one correct
+result.
 
-/app/heap_pages.bin contains consecutive raw 8192-byte PostgreSQL 16 heap pages
-in block-number order. /app/pg_xact/, /app/pg_subtrans/ and /app/pg_multixact/
-are the commit log, the subtransaction map and the MultiXact metadata of the
-same PostgreSQL 16 cluster, copied verbatim as raw SLRU segment files under
-their original names. Together they carry the state of every transaction the
-pages refer to; /app/pg_multixact/ holds the metadata needed to resolve xmax
-values that name a set of transactions rather than a single one.
-/app/table_schema.json provides the column definitions, primary key, PostgreSQL
-version, block size, and the target snapshot_xmin, snapshot_xmax and
-snapshot_xip. All required tuple values are stored inline; no TOAST data is
-required.
+Recover the exact logical rows of the accounts table visible under the MVCC
+snapshot defined in /app/table_schema.json. Write the result to
+/app/recovered.csv.
+
+/app/heap_pages.bin, /app/ledger_entries_heap.bin and /app/account_tags_heap.bin
+contain the raw 8192-byte PostgreSQL 16 heap pages of the accounts,
+ledger_entries and account_tags tables, each in block-number order.
+/app/pg_xact/ and /app/pg_subtrans/ are the cluster's commit log and
+subtransaction map, copied verbatim from the recovered data volume as raw SLRU
+segment files under their original names. /app/table_schema.json provides the
+column definitions, primary keys, foreign keys, NOT NULL and CHECK constraints
+of all three tables as they were declared in the database, the PostgreSQL
+version, block size, the output table, and the target snapshot_xmin,
+snapshot_xmax and snapshot_xip. All required tuple values are stored inline; no
+TOAST data is required.
 
 /app/recovered.csv must be UTF-8, include a header with the schema columns in
 their defined order, contain exactly one row for each primary key visible under

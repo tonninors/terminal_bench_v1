@@ -6,54 +6,60 @@ Task root: `tasks/postgres-mvcc-heap-recovery/`
 
 | path | role |
 | --- | --- |
-| `artifacts/heap_pages.bin` | 9 raw 8192-byte PostgreSQL 16 heap blocks, block 0 first — task input |
-| `artifacts/pg_xact/0000` | the cluster's commit log, copied verbatim as a raw SLRU segment — task input |
+| `artifacts/heap_pages.bin` | 6 raw 8192-byte PostgreSQL 16 heap blocks of the `accounts` table, block 0 first — task input |
+| `artifacts/ledger_entries_heap.bin` | 1 raw heap block of the `ledger_entries` table — task input |
+| `artifacts/account_tags_heap.bin` | 1 raw heap block of the `account_tags` table — task input |
+| `artifacts/pg_xact/0000` | the cluster's commit log as it stood on disk after the crash, verbatim; its tail is genuinely stale — task input |
 | `artifacts/pg_subtrans/0000` | the cluster's subtransaction parent map, same form — task input |
-| `artifacts/pg_multixact/offsets/0000` | MultiXactId → first member index, verbatim — task input |
-| `artifacts/pg_multixact/members/0000` | MultiXact member xids and status flags, verbatim — task input |
-| `artifacts/table_schema.json` | columns, types, nullability, primary key, PostgreSQL version, block size and the target snapshot — task input |
-| `dist/postgres_mvcc_heap_inputs_v4.zip` | upload bundle; contains **only** those six files, with every SLRU directory keeping its real name |
+| `artifacts/table_schema.json` | three relations with columns, types, nullability, PKs, FKs, CHECKs, the output relation, the incident statement, PostgreSQL version, block size and the target snapshot — task input |
+| `dist/postgres_mvcc_heap_inputs_v5.zip` | upload bundle; contains **only** those six files, with both SLRU directories keeping their real names |
 | `FINAL_PROMPT.txt` | the prompt shown to the solver |
 | `FILE_DESCRIPTION.txt` | the Outlier "File Description" text for the bundle |
 | `task.yaml` (`instruction:` field) | the same prompt, in the Terminal Bench task definition |
 | `Dockerfile`, `docker-compose.yaml` | build the task container; copy every input to `/app/` |
 
 Inside the container the solver sees exactly `/app/heap_pages.bin`,
-`/app/table_schema.json`, `/app/pg_xact/`, `/app/pg_subtrans/` and
-`/app/pg_multixact/` - what the prompt names, with no duplicate copies and
-nothing else from this repository.
-There is no decoded transaction table and no decoded MultiXact member list:
-v2's `tx_status.csv` stays gone, and every transaction and multi resolves from
-the cluster's own SLRU segments. The tests, the oracle, the generator and the
-PostgreSQL reference answer are copied in only after the agent has finished, per
-the Terminal Bench execution model.
+`/app/ledger_entries_heap.bin`, `/app/account_tags_heap.bin`,
+`/app/table_schema.json`, `/app/pg_xact/` and `/app/pg_subtrans/` — what the
+prompt names, with no duplicate copies and nothing else from this repository.
+There is no decoded transaction table (`tx_status.csv` stays gone since v3) and
+no `pg_multixact/` (retired with v5, which removed the MultiXact mechanism).
+The tests, the oracle, the generator and the PostgreSQL reference answer are
+copied in only after the agent has finished, per the Terminal Bench execution
+model.
 
 ## Internal-only — must NOT reach the solver or the ZIP
 
 | path | role |
 | --- | --- |
-| `build/pg_fixture.py` | drives a live PostgreSQL 16 server through the transaction history and captures the relation file |
-| `build/generate_case.py` | host-side driver: starts `postgres:16`, runs the fixture builder, copies the results back, rebuilds everything downstream |
+| `build/pg_fixture.py` | drives a live PostgreSQL 16 server through the incident history and captures the crash-instant files |
+| `build/generate_case.py` | host-side driver: starts `postgres:16` under the incident configuration, runs the fixture builder, copies the results back, re-proves uniqueness, rebuilds everything downstream |
 | `build/make_expected_state.py` | derives the verifier fixture from the PostgreSQL reference answer |
 | `build/make_solution_sh.py` | regenerates the self-contained `solution.sh` from the oracle |
 | `build/make_zip.py` | deterministic builder + leak check for the solver ZIP |
-| `build/fixture_test.py` | asserts the fixture's properties (exclusions, HOT artefacts, snapshot boundary, trap strength) |
+| `build/fixture_test.py` | asserts the fixture's properties (stale clog tail, evidence split, uniqueness funnel, trap strength) |
 | `build/harness_test.py` | PASS/FAIL matrix over every candidate answer |
 | `build/run_all_validation.sh` | the whole local validation suite |
-| `build/negatives/*.py` | twenty-two intentionally wrong answers, plus format/key-damage variants and two alternate correct constructions |
+| `build/run_container_checks.sh` | container-level nop/oracle checks against the real task image |
+| `build/final_audit.py` | re-checks every claim the package makes |
+| `build/negatives/neg01..neg12*.py` | the twelve intentionally wrong recovery strategies |
+| `build/negatives/negative_[ghk]*.py` | key-damage, format and malformed-output candidates |
+| `build/negatives/alt_*.py` | two alternate correct constructions (independent implementation; PostgreSQL's own answer reshaped) |
 | `build/measure_negatives.py` | scores every wrong strategy against the correct answer |
 | `build/internal/negative_scores.json` | the measured divergence of each wrong strategy |
-| `VERSION_HISTORY.md` | what changed between fixture generations v1 through v4, and why |
 | `build/internal/golden.csv` | **the reference answer, produced by PostgreSQL itself**; used to build and validate the fixture, never by the oracle |
-| `build/internal/generation_report.json` | machine-readable record of the generated case, including every transaction id |
-| `build/internal/page_items.json` | `pageinspect` dump of the captured bytes, used to cross-check the parser |
+| `build/internal/generation_report.json` | machine-readable record of the generated case, including the designed truth for every transaction |
+| `build/internal/inference_report.json` | the oracle's evidence and uniqueness proof over the captured artifacts |
+| `build/internal/realism_observations.json` | live-server observations backing REALISM_AUDIT.md |
 | `build/_work/` | scratch directory, recreated on every generator run |
 | `solution/golden_recover.py` | oracle recovery |
 | `solution.sh` | oracle entry point (generated) |
 | `tests/test_outputs.py` | verifier |
 | `tests/expected_state.json` | verifier fixture (expected keys, rows, NULL cells, digest) |
 | `run-tests.sh` | verifier entry point |
-| `INTERNAL_NOTES.md` | how the case is built, the MultiXact/frozen mechanics, and which tuple cases remain excluded |
+| `REALISM_AUDIT.md` | evidence that the stale clog tail is authentic, with live-probe results |
+| `INTERNAL_NOTES.md` | how the case is built, the evidence chains, and which tuple cases remain excluded |
+| `VERSION_HISTORY.md` | what changed between fixture generations v1 through v5, and why |
 | `GOLDEN_SOLUTION.md`, `VERIFIER_SPEC.md`, `DIFFICULTY_EXPLANATION.md`, `MANIFEST.md` | review documentation |
 
 Nothing in the internal set is referenced by `FINAL_PROMPT.txt`, and nothing in
@@ -66,60 +72,71 @@ byte-reproducible.
 
 ```
 $ python3 build/make_zip.py
-dist/postgres_mvcc_heap_inputs_v4.zip
-  sha256 71b20bbaf086367da5fdb48f4a891da59d4185ef86cd97bbd5ccb5d5645907be
+dist/postgres_mvcc_heap_inputs_v5.zip
+  sha256 ebda830ea2d3ffa2d9d9881a46c32081bff02f16e9de8e6d7206513353a3e8c2
   6 member(s), no directory entries:
-         73728  heap_pages.bin             sha256 518ecbff305723dbfea0415696b9add17d9faf88fd6879a1cf693fff8b1083e2
-          8192  pg_multixact/members/0000  sha256 d563abd3f0d39abd287b3d016d8764e2cbf400b566f159f7b0a16a5894c83a75
-          8192  pg_multixact/offsets/0000  sha256 970b43db633a556cb405ec770fbca20452e1b3f2d1faf43f97914643bc9fa540
-          8192  pg_subtrans/0000           sha256 d163e332d1fca4518132a56d9d749a9982962e92f9a91ced39f95eeedd5768bd
-          8192  pg_xact/0000               sha256 b715a92f3e812b9c62b447a6a63ddd1966a4f8e8d5e65d4e24ec5af7251e9975
-          1175  table_schema.json          sha256 34484b19f5f94821d2f142fd253d7fa61cfe8dca3985a6ec7821f6a91399ea94
+          8192  account_tags_heap.bin  sha256 9c5a66cbef070cdf672f6535aeaf455556a92099ef471b2d42306b1a6a2224b3
+         49152  heap_pages.bin         sha256 39ae75a3313bcfa1ce5c54fc5f9675475a11d6f7bdf9cb318ddbf2ca19d23adf
+          8192  ledger_entries_heap.bin sha256 86db234659348dede8051c605bd3a99e16d9285c056a850390880b11ac81672e
+        139264  pg_subtrans/0000       sha256 822d6cc03760eab371a2985146dc7a2385bcbbcdb4ab0d67d2859888a65483d4
+         16384  pg_xact/0000           sha256 cef00fb243144aaeaf0770eae35ec934e5ecd15a612f6629895c89b863da4c9d
+          3356  table_schema.json      sha256 4eb70a06edf960e0751329ca48c99d72bc57009f71fca81cc41417ce87911bf1
 ```
 
 `make_zip.py` asserts on every build that the member list is exactly those six
-names, that the only nested paths are `pg_xact/`, `pg_subtrans/`,
-`pg_multixact/offsets/` and `pg_multixact/members/`, that no
+names, that the only nested paths are `pg_xact/` and `pg_subtrans/`, that no
 explicit directory entry exists, and that no member name matches the
-internal-artefact patterns (`golden`, `expected`, `solution`, `oracle`, `answer`,
-`internal`, `negative`, `test`, `readme`, `hint`).
-`build/run_all_validation.sh` step 11 additionally asserts that neither
-`golden.csv` nor `expected_state.json` appears anywhere inside the archive's
-bytes, and that `table_schema.json` carries no answer-shaped key.
+internal-artefact patterns (`golden`, `expected`, `solution`, `oracle`,
+`answer`, `internal`, `negative`, `test`, `readme`, `hint`, `inference`,
+`realism`, `evidence`). `build/run_all_validation.sh` step 11 additionally
+asserts that neither `golden.csv` nor `expected_state.json` appears anywhere
+inside the archive's bytes, and that `table_schema.json` carries no
+answer-shaped key.
 
 ## The solver inputs, in full
 
-`table_schema.json` (1139 bytes) describes `public.account_ledger`:
+`table_schema.json` (3356 bytes) describes three relations of the same
+database, states the incident, and names `accounts` as the output relation.
+
+`accounts` (`heap_pages.bin`, output):
 
 | # | column | type | nullable |
 | --- | --- | --- | --- |
 | 1 | `account_id` | `integer` | no (primary key) |
-| 2 | `region_code` | `character varying(12)` | no |
-| 3 | `balance_cents` | `integer` | no |
-| 4 | `is_active` | `boolean` | no |
-| 5 | `risk_tier` | `smallint` | yes |
-| 6 | `opened_on` | `date` | no |
-| 7 | `owner_note` | `text` | yes |
+| 2 | `holder_name` | `text` | no |
+| 3 | `region` | `character varying(12)` | no |
+| 4 | `balance_cents` | `integer` | no, `CHECK (balance_cents > -10000000)` |
+| 5 | `is_active` | `boolean` | no |
+| 6 | `risk_tier` | `smallint` | yes |
+| 7 | `opened_on` | `date` | no |
+| 8 | `note` | `text` | yes |
 
-plus `postgres_version` `16.15`, `block_size` 8192, `primary_key`
-`["account_id"]`, and the target snapshot `snapshot_xmin` 804, `snapshot_xmax`
-842, `snapshot_xip` `[804, 810, 814, 816, 818, 820, 821, 827, 829, 830, 831, 832, 833, 836, 838]`.
+`ledger_entries` (`ledger_entries_heap.bin`): `entry_id` (int, PK),
+`account_id` (int, NOT NULL, FK → accounts), `amount_cents` (int,
+`CHECK (amount_cents <> 0)`), `entered_on` (date), `memo` (text, nullable).
 
-`pg_xact/0000` (8192 bytes) is one SLRU segment of the cluster's commit log: two
-bits per transaction id. `pg_subtrans/0000` (8192 bytes) is one segment of the
-subtransaction map: a four-byte parent transaction id per entry.
-`pg_multixact/offsets/0000` and `pg_multixact/members/0000` (8192 bytes each)
-resolve the 12 MultiXactIds the pages reference to their member transactions and
-per-member lock/update status. Between them the four areas resolve all 87
-transactions the pages refer to (65 committed, 14 aborted, 8 still in
-progress), including 13 subtransaction xids with ancestry up to 3 hops deep.
+`account_tags` (`account_tags_heap.bin`): `account_id` (int) + `tag`
+(varchar(20)), composite PK, FK → accounts.
 
-`heap_pages.bin` (73728 bytes) is 9 blocks holding 891 line pointers — 855
-`LP_NORMAL`, 23 `LP_REDIRECT`, 13 `LP_DEAD` — of which 429 are visible under the
-target snapshot. 67 tuples carry a MultiXact xmax (18 locker-only, 49 with an
-update member, 23 with a subtransaction updater, 28 decided by the snapshot
-alone); 422 tuples are frozen and 411 of those carry an xmax; 57 tuples carry a
-single-xid lock-only xmax.
+The target snapshot is `snapshot_xmin` 32994, `snapshot_xmax` 32998,
+`snapshot_xip` `[32994, 32995, 32996]`.
+
+`pg_xact/0000` (16384 bytes, two SLRU pages) is the commit log as it stood on
+disk: two bits per transaction id. Its first page resolves the older
+transactions the pages reference; its second page is genuinely stale — 15
+transactions that the snapshot proves finished have zero (in-progress) bits
+there, because their clog page never reached disk before the crash.
+`pg_subtrans/0000` (139264 bytes) is the subtransaction map: a four-byte
+parent transaction id per entry.
+
+The three heaps hold 321 `LP_NORMAL` tuples (208 accounts + 77 ledger_entries
++ 36 account_tags), 11 `LP_REDIRECT` and 2 `LP_DEAD` line pointers, of which
+199 accounts rows are visible under the target snapshot. 38 accounts tuples
+carry a lock-only xmax. Genuine hint bits resolve 7 of the 15 unresolved
+transactions (five of those seven facts live on `ledger_entries`, not on the
+output relation); the remaining 8 are recoverable only through cross-relation
+constraint reconciliation, and exhaustive enumeration proves exactly one
+outcome assignment — and exactly one output — survives.
 
 ## Dependencies
 

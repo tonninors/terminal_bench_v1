@@ -1,44 +1,53 @@
-postgres_mvcc_heap_inputs_v4.zip contains the input files for the task. Unzip it
-into /app so the files appear as /app/heap_pages.bin, /app/table_schema.json,
-/app/pg_xact/0000, /app/pg_subtrans/0000, /app/pg_multixact/offsets/0000 and
-/app/pg_multixact/members/0000.
+postgres_mvcc_heap_inputs_v5.zip contains the input files for the task. Unzip it
+into /app so the files appear as /app/heap_pages.bin,
+/app/ledger_entries_heap.bin, /app/account_tags_heap.bin,
+/app/table_schema.json, /app/pg_xact/0000 and /app/pg_subtrans/0000.
 
 heap_pages.bin
-    The raw main fork of a single PostgreSQL 16 table, copied byte for byte from
-    the server's data directory: 9 consecutive 8192-byte heap blocks in
-    block-number order, starting at block 0. Each block is an unmodified
-    PostgreSQL page - page header, line pointer array, and the heap tuples
-    themselves with their original headers, flags and payloads. Several
+    The raw main fork of the accounts table of a PostgreSQL 16 cluster, copied
+    byte for byte from the recovered data volume: 6 consecutive 8192-byte heap
+    blocks in block-number order, starting at block 0. Each block is an
+    unmodified PostgreSQL page - page header, line pointer array, and the heap
+    tuples themselves with their original headers, flags and payloads. Several
     transactions wrote to and locked rows in this relation, so a single primary
     key may have more than one physical version present, and some line pointers
     no longer address a tuple of their own. Nothing has been decoded, annotated
     or reformatted.
 
+ledger_entries_heap.bin
+    The raw main fork of the ledger_entries table of the same cluster, in the
+    same form: one 8192-byte heap block. Rows in this table reference accounts
+    through a foreign key.
+
+account_tags_heap.bin
+    The raw main fork of the account_tags table of the same cluster, in the
+    same form: one 8192-byte heap block. Rows in this table also reference
+    accounts through a foreign key.
+
 pg_xact/
-    The commit log of the same PostgreSQL 16 cluster, copied verbatim. It holds
-    one SLRU segment file, named with the segment number in hexadecimal exactly
-    as PostgreSQL names it. This is the authoritative record of how each
-    transaction ended.
+    The commit log of the same cluster as it stood on disk after the crash,
+    copied verbatim. It holds one SLRU segment file, named with the segment
+    number in hexadecimal exactly as PostgreSQL names it. Because the crash
+    interrupted normal write-back, this file does not record an outcome for
+    every transaction the heap pages reference.
 
 pg_subtrans/
     The subtransaction map of the same cluster, copied verbatim, in the same
     segment-file form. It records, for each transaction id that belongs to a
     subtransaction, the transaction that contains it.
 
-pg_multixact/offsets/ and pg_multixact/members/
-    The MultiXact metadata of the same cluster, copied verbatim as raw SLRU
-    segment files. Some rows were locked or modified by more than one
-    transaction at once; for those tuples the xmax field does not hold a single
-    transaction id, and these two directories hold the metadata needed to
-    resolve such values to the transactions involved.
-
 table_schema.json
-    A UTF-8 JSON document describing the table and the point in time to
-    reconstruct. It gives the PostgreSQL version, the block size, the table name,
-    the columns in their defined physical order with each column's PostgreSQL
-    type and nullability, the primary key, and the target MVCC snapshot as
-    snapshot_xmin, snapshot_xmax and snapshot_xip.
+    A UTF-8 JSON document describing the three tables and the point in time to
+    reconstruct. It gives the PostgreSQL version, the block size, a short
+    statement of the incident, for each table its heap file, its columns in
+    their defined physical order with each column's PostgreSQL type and
+    nullability, its primary key, foreign keys, and CHECK constraints as they
+    were declared in the database, the name of the output table (accounts),
+    and the target MVCC snapshot as snapshot_xmin, snapshot_xmax and
+    snapshot_xip.
 
-All inputs are synthetic and were created for this task. Every value needed is
-stored inline in the heap pages; no TOAST data is required. No database server
-is needed to complete the task, and no network access is required.
+The supplied files jointly contain enough information to determine one correct
+result. All inputs are synthetic and were created for this task. Every value
+needed is stored inline in the heap pages; no TOAST data is required. No
+database server is needed to complete the task, and no network access is
+required.

@@ -19,17 +19,16 @@ TASK = Path(__file__).resolve().parent.parent
 # Solver-facing members.  pg_xact/ and pg_subtrans/ keep the real SLRU directory
 # names and segment file names, so the bundle unzips into the layout the prompt
 # describes.
-FILE_MEMBERS = ["heap_pages.bin", "table_schema.json"]
-DIR_MEMBERS = ["pg_xact", "pg_subtrans", "pg_multixact/offsets",
-               "pg_multixact/members"]
+FILE_MEMBERS = ["heap_pages.bin", "ledger_entries_heap.bin",
+                "account_tags_heap.bin", "table_schema.json"]
+DIR_MEMBERS = ["pg_xact", "pg_subtrans"]
 
 FIXED_TIME = (2026, 8, 20, 0, 0, 0)
-OUT = TASK / "dist" / "postgres_mvcc_heap_inputs_v4.zip"
+OUT = TASK / "dist" / "postgres_mvcc_heap_inputs_v5.zip"
 # earlier bundles carried older fixtures; shipping one now would hand out inputs
 # that no longer match artifacts/ or the verifier fixture
-STALE = [TASK / "dist" / "postgres_mvcc_heap_inputs.zip",
-         TASK / "dist" / "postgres_mvcc_heap_inputs_v2.zip",
-         TASK / "dist" / "postgres_mvcc_heap_inputs_v3.zip"]
+STALE = [TASK / "dist" / ("postgres_mvcc_heap_inputs%s.zip" % v)
+         for v in ("", "_v2", "_v3", "_v4")]
 
 FORBIDDEN_NAMES = {
     "golden.csv", "golden_recover.py", "expected_state.json", "test_outputs.py",
@@ -37,7 +36,8 @@ FORBIDDEN_NAMES = {
     "page_items.json", "solution.sh", "run-tests.sh", "internal_notes.md",
     "golden_solution.md", "verifier_spec.md", "manifest.md", "readme.md",
     "final_prompt.txt", "difficulty_explanation.md", "make_zip.py",
-    "tx_status.csv", "negative_scores.json",
+    "tx_status.csv", "negative_scores.json", "inference_report.json",
+    "realism_audit.md", "evidence_graph.json",
 }
 FORBIDDEN_SUBSTRINGS = ("golden", "expected", "solution", "oracle", "answer",
                         "internal", "negative", "readme", "hint", "tx_status")

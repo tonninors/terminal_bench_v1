@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Full local validation for the postgres-mvcc-heap-recovery task.
+# Full local validation for the postgres-mvcc-heap-recovery task (fixture v5).
 #
 #   build/run_all_validation.sh            validate the committed fixture
 #   build/run_all_validation.sh --regen    regenerate it from PostgreSQL 16 first
@@ -29,42 +29,59 @@ if [ "$REGEN" -eq 1 ]; then
 else
   ok "using the committed artifacts (pass --regen to rebuild from PostgreSQL)"
 fi
-for f in artifacts/heap_pages.bin artifacts/table_schema.json; do
+for f in artifacts/heap_pages.bin artifacts/ledger_entries_heap.bin \
+         artifacts/account_tags_heap.bin artifacts/table_schema.json; do
   [ -f "$f" ] || bad "missing $f"
 done
-for d in artifacts/pg_xact artifacts/pg_subtrans \
-         artifacts/pg_multixact/offsets artifacts/pg_multixact/members; do
+for d in artifacts/pg_xact artifacts/pg_subtrans; do
   [ -d "$d" ] || bad "missing $d/"
 done
-[ -f artifacts/tx_status.csv ] && bad "tx_status.csv is still solver-visible"
-sha256sum artifacts/heap_pages.bin artifacts/table_schema.json \
+[ -e artifacts/tx_status.csv ] && bad "tx_status.csv is still solver-visible"
+[ -e artifacts/pg_multixact ] && bad "pg_multixact/ is still present (dropped in v5)"
+sha256sum artifacts/heap_pages.bin artifacts/ledger_entries_heap.bin \
+          artifacts/account_tags_heap.bin artifacts/table_schema.json \
           artifacts/pg_xact/* artifacts/pg_subtrans/* \
-          artifacts/pg_multixact/offsets/* artifacts/pg_multixact/members/* \
           build/internal/golden.csv tests/expected_state.json | sed 's/^/  /'
 
 step "2. the pages really are PostgreSQL 16 heap blocks"
 $PY - <<'PYEOF' || bad "page sanity"
 import struct, pathlib
-h = pathlib.Path("artifacts/heap_pages.bin").read_bytes()
-assert len(h) % 8192 == 0, "not a whole number of blocks"
-for b in range(len(h)//8192):
-    lo, up, sp, pv = struct.unpack_from("<HHHH", h, b*8192 + 12)
-    assert pv & 0xFF00 == 8192 and pv & 0xFF == 4, (b, pv)
-    assert 24 <= lo <= up <= sp <= 8192, (b, lo, up, sp)
-print("  %d blocks, all 8192 bytes, page layout version 4" % (len(h)//8192))
+for name in ("heap_pages.bin", "ledger_entries_heap.bin",
+             "account_tags_heap.bin"):
+    h = pathlib.Path("artifacts", name).read_bytes()
+    assert len(h) % 8192 == 0, name + ": not a whole number of blocks"
+    for b in range(len(h)//8192):
+        lo, up, sp, pv = struct.unpack_from("<HHHH", h, b*8192 + 12)
+        if lo == 0 and up == 0:
+            continue
+        assert pv & 0xFF00 == 8192 and pv & 0xFF == 4, (name, b, pv)
+        assert 24 <= lo <= up <= sp <= 8192, (name, b, lo, up, sp)
+    print("  %-24s %2d block(s), 8192 bytes each, page layout version 4"
+          % (name, len(h)//8192))
 PYEOF
 ok "block size, count and page headers verified"
 
-step "3. fixture properties (exclusions, HOT, snapshot boundary, traps)"
+step "3. fixture properties (stale clog, evidence split, uniqueness, traps)"
 $PYTEST -q -p no:cacheprovider build/fixture_test.py \
   && ok "fixture assertions hold" || bad "fixture assertions failed"
 
 step "4. oracle, from the solver-visible inputs only"
-$PY solution/golden_recover.py --heap artifacts/heap_pages.bin \
-    --pg-xact artifacts/pg_xact --pg-subtrans artifacts/pg_subtrans \
-    --pg-multixact artifacts/pg_multixact \
-    --schema artifacts/table_schema.json \
-    --out "$TMP/recovered.csv" --report | sed 's/^/  /' || bad "oracle failed"
+$PY solution/golden_recover.py --dir artifacts \
+    --out "$TMP/recovered.csv" --report > "$TMP/report.json" \
+  || bad "oracle failed"
+$PY - "$TMP/report.json" <<'PYEOF' || bad "the uniqueness funnel is broken"
+import json, sys
+raw = open(sys.argv[1], encoding="utf-8").read()
+rep = json.loads(raw[raw.index("{"):])
+f = rep["funnel"]
+print("  funnel:", json.dumps(f))
+assert f["after_all_constraints"] == 1, "assignment is not unique"
+assert f["distinct_outputs"] == 1, "output is not unique"
+assert f["after_hint_filter"] > 1, "hints alone already pin the assignment"
+stored = json.load(open("build/internal/inference_report.json"))
+assert f == stored["funnel"], "funnel drifted from the recorded proof"
+PYEOF
+ok "exhaustive enumeration proves exactly one assignment and one output"
 
 step "5. oracle output equals the hidden PostgreSQL reference"
 $PY - "$TMP/recovered.csv" build/internal/golden.csv <<'PYEOF' || bad "oracle differs from the reference"
@@ -95,15 +112,18 @@ else bad "verifier verdict varied"; fi
 
 step "7b. how far off each wrong strategy lands"
 $PY build/measure_negatives.py | sed 's/^/  /' || bad "negative measurement failed"
-$PY - <<'PYEOF' || bad "a wrong strategy is too close to correct"
+$PY - <<'PYEOF' || bad "the negative suite is too weak"
 import json
 d = json.load(open("build/internal/negative_scores.json"))
-weak = {k: v["keys_wrong_in_total"] for k, v in d["strategies"].items()
-        if v["keys_wrong_in_total"] < 10}
-assert not weak, "strategies wrong on fewer than 10 keys: %r" % weak
-print("  every wrong strategy misses at least 10 independent primary keys")
+scores = {k: v["keys_wrong_in_total"] for k, v in d["strategies"].items()}
+assert len(scores) == 12, "expected 12 measured strategies"
+exact = [k for k, n in scores.items() if n == 0]
+assert not exact, "strategies that produce the CORRECT answer: %r" % exact
+systemic = [k for k, n in scores.items() if n >= 10]
+assert len(systemic) >= 8, "only %d strategies lose 10+ keys" % len(systemic)
+print("  all 12 wrong; %d/12 are wrong on 10+ independent keys" % len(systemic))
 PYEOF
-ok "each naive strategy is wrong on many keys"
+ok "every naive strategy fails, most of them systemically"
 
 step "8. full PASS/FAIL matrix (negatives, alternates, malformed, missing)"
 $PYTEST -q -p no:cacheprovider build/harness_test.py \
@@ -111,10 +131,8 @@ $PYTEST -q -p no:cacheprovider build/harness_test.py \
 
 step "9. solution.sh is in sync and self-contained"
 $PY build/make_solution_sh.py >/dev/null
-HEAP_PAGES="$TASK/artifacts/heap_pages.bin" PG_XACT="$TASK/artifacts/pg_xact" \
-  PG_SUBTRANS="$TASK/artifacts/pg_subtrans" \
-  PG_MULTIXACT="$TASK/artifacts/pg_multixact" \
-  TABLE_SCHEMA="$TASK/artifacts/table_schema.json" RECOVERED_CSV="$TMP/via_sh.csv" \
+APP_DIR="$TASK/artifacts" TABLE_SCHEMA="$TASK/artifacts/table_schema.json" \
+  RECOVERED_CSV="$TMP/via_sh.csv" \
   bash solution.sh >/dev/null 2>&1 || bad "solution.sh failed"
 TB_RECOVERED_CSV="$TMP/via_sh.csv" $PYTEST -q -p no:cacheprovider tests/test_outputs.py \
   >/dev/null 2>&1 && ok "solution.sh output PASSES the verifier" \
@@ -122,9 +140,9 @@ TB_RECOVERED_CSV="$TMP/via_sh.csv" $PYTEST -q -p no:cacheprovider tests/test_out
 
 step "10. rebuild and inspect the solver ZIP"
 $PY build/make_zip.py | sed 's/^/  /' || bad "ZIP build/inspection failed"
-sha_a=$(sha256sum dist/postgres_mvcc_heap_inputs_v4.zip | cut -d" " -f1)
+sha_a=$(sha256sum dist/postgres_mvcc_heap_inputs_v5.zip | cut -d" " -f1)
 $PY build/make_zip.py >/dev/null
-sha_b=$(sha256sum dist/postgres_mvcc_heap_inputs_v4.zip | cut -d" " -f1)
+sha_b=$(sha256sum dist/postgres_mvcc_heap_inputs_v5.zip | cut -d" " -f1)
 [ "$sha_a" = "$sha_b" ] && ok "ZIP is byte-reproducible" || bad "ZIP is not byte-reproducible"
 
 step "11. the ZIP leaks nothing"
@@ -132,22 +150,25 @@ $PY - <<'PYEOF' || bad "ZIP leak check failed"
 import zipfile, json, pathlib
 for old in ("dist/postgres_mvcc_heap_inputs.zip",
             "dist/postgres_mvcc_heap_inputs_v2.zip",
-            "dist/postgres_mvcc_heap_inputs_v3.zip"):
+            "dist/postgres_mvcc_heap_inputs_v3.zip",
+            "dist/postgres_mvcc_heap_inputs_v4.zip"):
     assert not pathlib.Path(old).exists(), "stale bundle still present: " + old
-z = zipfile.ZipFile("dist/postgres_mvcc_heap_inputs_v4.zip")
+z = zipfile.ZipFile("dist/postgres_mvcc_heap_inputs_v5.zip")
 names = sorted(z.namelist())
 assert "tx_status.csv" not in names, "the decoded transaction table is in the ZIP"
-assert "heap_pages.bin" in names and "table_schema.json" in names, names
+for f in ("heap_pages.bin", "ledger_entries_heap.bin",
+          "account_tags_heap.bin", "table_schema.json"):
+    assert f in names, names
 assert any(n.startswith("pg_xact/") for n in names), names
 assert any(n.startswith("pg_subtrans/") for n in names), names
-assert any(n.startswith("pg_multixact/offsets/") for n in names), names
-assert any(n.startswith("pg_multixact/members/") for n in names), names
+assert not any(n.startswith("pg_multixact") for n in names), names
 golden = pathlib.Path("build/internal/golden.csv").read_bytes()
 expected = pathlib.Path("tests/expected_state.json").read_bytes()
 blob = b"".join(z.read(n) for n in names)
 assert golden not in blob and expected not in blob
 schema = json.loads(z.read("table_schema.json"))
-for forbidden in ("rows", "visible", "answer", "sha256", "expected"):
+for forbidden in ("rows", "visible", "answer", "sha256", "expected",
+                  "outcomes", "assignment", "hints"):
     assert forbidden not in schema, forbidden
 print("  no reference answer, digest or oracle artefact inside the bundle")
 PYEOF
@@ -172,7 +193,7 @@ step "12b. final audit (package claims, prompt/verifier coverage, ZIP)"
 $PY build/final_audit.py | sed 's/^/  /' && ok "final audit passed" || bad "final audit failed"
 
 step "13. the verifier reads nothing but the candidate CSV"
-if grep -nE "heap_pages|pg_xact|pg_subtrans|pg_multixact|golden\.csv|internal/|subprocess|os\.system" \
+if grep -nE "heap_pages|ledger_entries_heap|account_tags_heap|pg_xact|pg_subtrans|golden\.csv|internal/|subprocess|os\.system" \
      tests/test_outputs.py >/dev/null 2>&1; then
   bad "the verifier references something other than its fixture and the output"
 else
