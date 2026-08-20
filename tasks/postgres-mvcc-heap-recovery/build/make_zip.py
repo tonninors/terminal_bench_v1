@@ -20,14 +20,16 @@ TASK = Path(__file__).resolve().parent.parent
 # names and segment file names, so the bundle unzips into the layout the prompt
 # describes.
 FILE_MEMBERS = ["heap_pages.bin", "table_schema.json"]
-DIR_MEMBERS = ["pg_xact", "pg_subtrans"]
+DIR_MEMBERS = ["pg_xact", "pg_subtrans", "pg_multixact/offsets",
+               "pg_multixact/members"]
 
 FIXED_TIME = (2026, 8, 20, 0, 0, 0)
-OUT = TASK / "dist" / "postgres_mvcc_heap_inputs_v3.zip"
+OUT = TASK / "dist" / "postgres_mvcc_heap_inputs_v4.zip"
 # earlier bundles carried older fixtures; shipping one now would hand out inputs
 # that no longer match artifacts/ or the verifier fixture
 STALE = [TASK / "dist" / "postgres_mvcc_heap_inputs.zip",
-         TASK / "dist" / "postgres_mvcc_heap_inputs_v2.zip"]
+         TASK / "dist" / "postgres_mvcc_heap_inputs_v2.zip",
+         TASK / "dist" / "postgres_mvcc_heap_inputs_v3.zip"]
 
 FORBIDDEN_NAMES = {
     "golden.csv", "golden_recover.py", "expected_state.json", "test_outputs.py",

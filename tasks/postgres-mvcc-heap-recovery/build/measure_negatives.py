@@ -25,6 +25,7 @@ ORACLE = TASK / "solution" / "golden_recover.py"
 STD = ["--heap", str(ART / "heap_pages.bin"),
        "--pg-xact", str(ART / "pg_xact"),
        "--pg-subtrans", str(ART / "pg_subtrans"),
+       "--pg-multixact", str(ART / "pg_multixact"),
        "--schema", str(ART / "table_schema.json")]
 
 # label -> (script, needs the correct answer as --src)
@@ -43,6 +44,16 @@ STRATEGIES = [
     ("10. newest committed, no header state", "negative_m_newest_committed.py", False),
     ("11. pg_subtrans ignored", "negative_p_ignore_subtrans.py", False),
     ("12. subxact inherits parent status", "negative_q_subxact_inherits_parent.py", False),
+    ("13. multi xmax read as a plain xid", "negative_r_multi_as_xid.py", False),
+    ("14. every multi is just a lock", "negative_s_multi_always_lock.py", False),
+    ("15. any committed member kills", "negative_t_any_member_kills.py", False),
+    ("16. highest member assumed updater", "negative_t2_highest_member_updates.py", False),
+    ("17. multi updater without pg_subtrans", "negative_u_updater_no_subtrans.py", False),
+    ("18. multi updater ignores the snapshot", "negative_v_updater_ignore_snapshot.py", False),
+    ("19. reserved member offset 0 mishandled", "negative_w_offset_off_by_one.py", False),
+    ("20. member range read until a zero xid", "negative_x_range_until_zero.py", False),
+    ("21. XMIN_INVALID tested before FROZEN", "negative_y_invalid_before_frozen.py", False),
+    ("22. frozen means visible, xmax skipped", "negative_z_frozen_always_visible.py", False),
 ]
 
 

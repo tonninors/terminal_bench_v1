@@ -4,8 +4,8 @@ Reference implementation: [`solution/golden_recover.py`](solution/golden_recover
 wrapped for the container by [`solution.sh`](solution.sh) (generated — edit the
 Python and rerun `build/make_solution_sh.py`).
 
-It reads **only** `/app/heap_pages.bin`, `/app/pg_xact/`, `/app/pg_subtrans/`
-and `/app/table_schema.json`. It never opens the hidden reference CSV, never
+It reads **only** `/app/heap_pages.bin`, `/app/pg_xact/`, `/app/pg_subtrans/`,
+`/app/pg_multixact/` and `/app/table_schema.json`. It never opens the hidden reference CSV, never
 hard-codes a row, never contacts a database, and contains no lookup table.
 
 ```
@@ -13,6 +13,7 @@ python3 solution/golden_recover.py \
     --heap        artifacts/heap_pages.bin \
     --pg-xact     artifacts/pg_xact \
     --pg-subtrans artifacts/pg_subtrans \
+    --pg-multixact artifacts/pg_multixact \
     --schema      artifacts/table_schema.json \
     --out         /app/recovered.csv --report
 ```
@@ -167,6 +168,24 @@ Start the cursor at `t_hoff` and, for each column in schema order:
        `word & 0x03 == 0x02` would mean compressed (also absent here).
      Advance by the total size.
 
+## Step 7b — decode the MultiXact metadata
+
+`pg_multixact` is two more SLRU areas with a **third distinct geometry**:
+
+* `offsets`: one 32-bit member index per MultiXactId, 2048 per page. Member
+  index 0 is **reserved** (so a zero entry can mean "never written"): the first
+  multi's list starts at index 1. The member list of multi M spans
+  `[offsets[M], offsets[M+1])` — the *next* multi's entry is the bound, which is
+  why the cluster contains one trailing multi created after the last one the
+  pages reference.
+* `members`: groups of four — 4 status-flag bytes followed by 4 xids, 20 bytes
+  per group, 409 groups (1636 members) per page.
+
+The status flag per member is a `MultiXactStatus`: 0 ForKeyShare, 1 ForShare,
+2 ForNoKeyUpdate, 3 ForUpdate are **lockers**; 4 NoKeyUpdate, 5 Update are
+**updaters** (`ISUPDATE_from_mxstatus`: status ≥ 4). A multi has at most one
+update member.
+
 ## Step 8 — decide visibility (`HeapTupleSatisfiesMVCC`)
 
 First, the snapshot predicate — `XidInMVCCSnapshot`, i.e. "was this transaction
@@ -212,13 +231,32 @@ if not inserted_ok:
 # --- the deleting transaction ---
 if infomask & HEAP_XMAX_INVALID:   return True   # 0x0800 hint: xmax is void
 if xmax == 0:                      return True
+if infomask & HEAP_XMAX_IS_MULTI:                # 0x1000: xmax is a MultiXactId
+    if infomask & HEAP_XMAX_LOCK_ONLY:
+        return True                              # every member is a locker
+    u = multixact_updater(xmax)                  # offsets -> members -> flags
+    if u is None:                    return True
+    if not did_commit(u):            return True # updater aborted / running
+    return not in_progress(u, snap, log)         # snapshot decides, via subtrans
 if infomask & HEAP_XMAX_LOCK_ONLY: return True   # 0x0080: a row lock, not a delete
-if infomask & HEAP_XMAX_IS_MULTI:  ...           # 0x1000; absent here by design
 if not did_commit(xmax):           return True   # deleter aborted or still running
 return not in_progress(xmax, snap, log)          # deleted after the snapshot? visible
 ```
 
-Five details carry real weight here:
+The `IS_MULTI` branch comes **before** any commit-log lookup of `t_xmax`: an
+mxid is not a transaction id, and in this cluster the mxids 3–14 collide with
+committed bootstrap xids, so a missing branch produces confident wrong answers
+rather than errors. The update member is an ordinary xid afterwards — its own
+clog bits (a rolled-back savepoint updater is ABORTED under a COMMITTED
+parent), its own `pg_subtrans` ancestry, and the snapshot all apply.
+
+Six details carry real weight here:
+
+* **The mxid/xid collision is silent.** Misreading a multi as an xid loses 56
+  keys with no error; treating every multi as a lock duplicates 11; letting any
+  committed member kill loses 52; skipping `pg_subtrans` for the update member
+  loses 30; skipping the snapshot for it loses 28; shifting the reserved
+  offset-0 base scrambles member windows for 22.
 
 * **A subtransaction is one transaction for the commit log and another for the
   snapshot.** `pg_xact` decides, per xid, whether that particular savepoint's
@@ -253,8 +291,8 @@ Five details carry real weight here:
 
 Collect the visible tuples, key them by the primary key columns, and assert that
 no key appears twice. MVCC guarantees at most one visible version per key; two
-would mean a parsing or visibility bug, not an ambiguous snapshot. Here 725
-physical tuples over 393 distinct keys reduce to exactly 353 visible rows.
+would mean a parsing or visibility bug, not an ambiguous snapshot. Here 855
+physical tuples over 482 distinct keys reduce to exactly 429 visible rows.
 
 40 keys have three or more physical versions still on the page and the deepest
 chain is seven tuples long, so this reduction is not "take the last one": for 12
@@ -273,20 +311,20 @@ oracle sorts by primary key for determinism.
 ## What the oracle reports on this fixture
 
 ```
-blocks                                            8
-line pointers      LP_NORMAL 725, LP_REDIRECT 15, LP_DEAD 13, LP_UNUSED 0
-physical tuples                                 725
-distinct primary keys on disk                   393
-keys with several physical versions             230
-visible rows                                    353
-snapshot                                        789:811:789,791,793,795,796,802,804,805,806,807,808
-commit log segments                             pg_xact/0000
-subtransaction map segments                     pg_subtrans/0000
-subtransaction xids resolved via pg_subtrans    10
-deepest subtransaction chain                    3
-keys whose visible version is NOT the newest xmin 133
-tuples kept despite a non-zero lock-only xmax     53
-frozen tuples seen                                0
+blocks                                            9
+line pointers      LP_NORMAL 855, LP_REDIRECT 23, LP_DEAD 13
+physical tuples                                 855
+visible rows                                    429
+snapshot                                        804:842:804,810,814,816,818,820,821,827,829,830,831,832,833,836,838
+multixacts resolved                             12 (ids 3-14)
+tuples with a MultiXact xmax                    67
+  locker-only / with updater                    18 / 49
+  updater is a subtransaction                   23
+  updater decided by the snapshot alone         28
+frozen tuples / frozen with xmax                422 / 411
+subtransaction xids on the pages                13 (chains up to 3 hops)
+keys whose visible version is NOT the newest xmin 179
+single-xid lock-only tuples kept                  57
 hint-bit conflicts with the commit log            0
 ```
 
@@ -295,9 +333,9 @@ hint-bit conflicts with the commit log            0
 `build/internal/golden.csv` was produced by the PostgreSQL server itself, by
 running `SELECT * FROM account_ledger ORDER BY account_id` inside the very
 `REPEATABLE READ` transaction that owns the target snapshot. The oracle's output
-is **byte-identical** to it, on all 353 rows, (`build/run_all_validation.sh` step 5,
+is **byte-identical** to it, on all 429 rows, (`build/run_all_validation.sh` step 5,
 `build/fixture_test.py::test_the_page_level_answer_equals_the_postgresql_reference`).
-The page-level recovery and the database engine agree on all 353 rows.
+The page-level recovery and the database engine agree on all 429 rows.
 
 `build/negatives/alt_independent_parser.py` is a second recovery written from
 scratch — different parser structure, different formulation of the visibility

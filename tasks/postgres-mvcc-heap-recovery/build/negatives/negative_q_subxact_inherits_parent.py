@@ -32,9 +32,9 @@ def main() -> int:
             continue
         if snap.in_progress(t.xmin, log):
             continue
-        if not (t.infomask & 0x0800) and t.xmax \
-                and not C.G.xmax_is_locked_only(t.infomask):
-            if state(t.xmax) == "committed" and not snap.in_progress(t.xmax, log):
+        u = C.deleting_xid(t, log)
+        if u is not None:
+            if state(u) == "committed" and not snap.in_progress(u, log):
                 continue
         rows.append(t.values)
     pk = C.pk_positions(js, attrs)

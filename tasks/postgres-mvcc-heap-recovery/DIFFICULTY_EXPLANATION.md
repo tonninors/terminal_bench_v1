@@ -5,9 +5,10 @@ this benchmark.**
 
 `heap_pages.bin` is the unmodified main fork of a relation taken from a real
 PostgreSQL 16 server (16.15, x86-64 Linux), captured after `CHECKPOINT` and
-copied byte for byte in block-number order. `pg_xact/` and `pg_subtrans/` are
-that same cluster's commit log and subtransaction map, copied the same way, as
-raw SLRU segments under their original names. Every physical state on those pages
+copied byte for byte in block-number order. `pg_xact/`, `pg_subtrans/` and
+`pg_multixact/` are that same cluster's commit log, subtransaction map and
+MultiXact metadata, copied the same way, as raw SLRU segments under their
+original names. Every physical state on those pages
 — the HOT chains, the pruned redirects, the aborted versions, the row locks, the
 uncommitted writes — was produced by ordinary SQL against that server; no byte
 was hand-edited. The server was driven through a
@@ -53,7 +54,30 @@ keys. The opposite error is worse: 102 of the 353 visible rows live in a
 `HEAP_ONLY_TUPLE`, so a solver that dismisses heap-only versions as internal HOT
 bookkeeping simply loses them.
 
-**b. Decoding the cluster's own transaction metadata.** There is no decoded
+**b. A field whose meaning is conditional.**  V4's central mechanism is
+MultiXact. When several transactions lock one row, or a locker coexists with an
+updater, `t_xmax` stops holding a transaction id and holds a **MultiXactId**,
+flagged by `HEAP_XMAX_IS_MULTI`. Nothing else in the tuple changes. In this
+fresh cluster the mxids are the integers 3-14, colliding numerically with
+committed bootstrap transaction ids - so a solver that never tests that one bit
+looks each mxid up in the commit log, finds "committed, far below the
+snapshot", and silently deletes 67 live tuples (56 keys). There is no crash to
+debug; the output is a plausible, well-formed, wrong CSV.
+
+Resolving the field correctly takes a chain of new evidence:
+`pg_multixact/offsets` (one 32-bit member index per mxid, where **index 0 is
+reserved** and the *next* multi's entry bounds the list) and
+`pg_multixact/members` (groups of four status-flag bytes plus four xids - a
+third distinct SLRU geometry). The flags separate the up-to-three lockers from
+the at-most-one updater, and only the updater can kill the tuple - subject to
+its own commit-log state, its own `pg_subtrans` ancestry, and the snapshot.
+This fixture carries 67 multi-stamped tuples across 12 multis: 18 locker-only,
+49 with an updater, 23 whose updater is a **subtransaction**, and 28 whose
+verdict flips on the snapshot alone. Every partial reading - "a multi is just a
+lock", "any committed member kills", "the updater's commit bit is final",
+"flags don't matter" - is measurably wrong on 11 to 56 keys.
+
+**c. Decoding the cluster's own transaction metadata.** There is no decoded
 table of transaction states. `pg_xact` is a bitmap: two bits per transaction id,
 32768 ids per 8192-byte page, 32 pages per segment, with the four states
 `IN_PROGRESS`, `COMMITTED`, `ABORTED` and `SUB_COMMITTED`. `pg_subtrans` is a
@@ -68,7 +92,16 @@ correctly, and then know what the two files *mean* — which is the harder half:
 * those are different questions about the same xid, and answering either with
   the other's result is wrong in a way that still produces a plausible CSV.
 
-**c. Reproducing PostgreSQL's MVCC visibility rule.** Getting the right rows out
+**d. Frozen tuples make the hint bits treacherous.**  The base population was
+frozen with `VACUUM (FREEZE)` before the interesting history ran, so 422 tuples
+carry `HEAP_XMIN_FROZEN` - which is the *combination* of `HEAP_XMIN_COMMITTED`
+and `HEAP_XMIN_INVALID`, with the raw xmin preserved. A solver that tests the
+INVALID bit before the combined mask reads every frozen tuple as "inserter
+aborted" and loses 279 keys. The opposite shortcut fails too: 411 frozen tuples
+were later updated, deleted or locked, so "frozen means visible, stop" skips
+the xmax check and resurrects 143 keys' worth of dead versions.
+
+**e. Reproducing PostgreSQL's MVCC visibility rule.** Getting the right rows out
 requires `HeapTupleSatisfiesMVCC` — the actual rule, not an approximation:
 
 * the inserting transaction must have committed **and** must not be in the
@@ -90,7 +123,7 @@ requires `HeapTupleSatisfiesMVCC` — the actual rule, not an approximation:
   the 75 tuples written by an aborted transaction carry no `HEAP_XMIN_INVALID`.
   Trusting the hint bits as the commit state gets 179 keys wrong.
 
-**d. The snapshot is the crux, and it is deliberately at odds with the commit
+**f. The snapshot is the crux, and it is deliberately at odds with the commit
 log.** `pg_xact` reports how each transaction *ended*; the snapshot describes
 what was running *then*. Both are needed and neither is sufficient:
 
@@ -212,5 +245,10 @@ Every byte the solver receives is self-created for this benchmark:
   the run.
 
 The challenge comes from PostgreSQL storage formats and MVCC visibility
-semantics, not from volume: the whole input is 8 blocks of heap (64 KiB), two
-8 KiB SLRU segments, 725 physical tuples and 61 transaction ids.
+semantics, not from volume: the whole input is 9 blocks of heap (72 KiB), four
+8 KiB SLRU segments, 855 physical tuples, 87 transaction ids and 12 MultiXacts.
+The deepest single decision chains seven pieces of state: a frozen or committed
+predecessor, a HOT chain behind an `LP_REDIRECT`, a surviving heap-only tuple
+whose `IS_MULTI` xmax resolves through offsets and members, whose update member
+is a savepoint's subxid, whose `pg_subtrans` ancestry ends at a top-level xid,
+whose presence in `snapshot_xip` finally decides the row.

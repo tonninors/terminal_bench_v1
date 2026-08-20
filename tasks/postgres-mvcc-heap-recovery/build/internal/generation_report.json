@@ -2,25 +2,29 @@
   "fixture_version": 2,
   "postgres_version_full": "PostgreSQL 16.15 (Debian 16.15-1.pgdg13+2) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
   "block_size": 8192,
-  "blocks": 8,
-  "heap_bytes": 65536,
-  "heap_sha256": "91a3205b8b5562542e67fa903ff3ab0739a73e011a05cc4fe408b628ca93413a",
+  "blocks": 9,
+  "heap_bytes": 73728,
+  "heap_sha256": "518ecbff305723dbfea0415696b9add17d9faf88fd6879a1cf693fff8b1083e2",
   "relation_path": "base/16384/16430",
-  "snapshot_text": "789:811:789,791,793,795,796,802,804,805,806,807,808",
-  "snapshot_xmin": 789,
-  "snapshot_xmax": 811,
+  "snapshot_text": "804:842:804,810,814,816,818,820,821,827,829,830,831,832,833,836,838",
+  "snapshot_xmin": 804,
+  "snapshot_xmax": 842,
   "snapshot_xip": [
-    789,
-    791,
-    793,
-    795,
-    796,
-    802,
     804,
-    805,
-    806,
-    807,
-    808
+    810,
+    814,
+    816,
+    818,
+    820,
+    821,
+    827,
+    829,
+    830,
+    831,
+    832,
+    833,
+    836,
+    838
   ],
   "transaction_xids": {
     "A_base_insert": 736,
@@ -81,52 +85,99 @@
       "del_rolled": 786,
       "del_kept": 788
     },
-    "C_writer_w1_upd_commits_later": 789,
-    "C_gap_upd_1": 790,
-    "C_writer_w2_del_commits_later": 791,
-    "C_gap_del": 792,
-    "C_writer_w3_ins_commits_later": 793,
-    "C_gap_upd_2": 794,
-    "C_writer_w4_lock_commits_later": 795,
-    "C_writer_w10_nested_subxacts_commit_later": 796,
-    "C_w10_subxids": {
-      "top": 796,
-      "l1": 797,
-      "l2": 798,
-      "l3": 799
-    },
-    "C_gap_subxact": 800,
-    "C_gap_subxids": {
-      "top": 800,
-      "g1": 801
-    },
-    "C_writer_w5_upd_aborts_later": 802,
-    "C_gap_upd_3": 803,
-    "C_writer_w6_upd_never_finishes": 804,
-    "C_writer_w7_del_never_finishes": 805,
-    "C_writer_w8_ins_never_finishes": 806,
-    "C_writer_w9_lock_never_finishes": 807,
-    "C_writer_w11_subxact_never_finishes": 808,
-    "C_w11_subxids": {
-      "top": 808,
-      "k1": 809
-    },
-    "C_gap_upd_4": 810,
-    "D_post_update": 811,
-    "D_post_insert": 812,
-    "D_post_delete": 813,
-    "D_post_chain": [
-      814,
-      815,
-      816
+    "B_frozen_delete": 789,
+    "B_frozen_delete_aborted": 790,
+    "B_frozen_lock": 791,
+    "M_lockonly_share_share": [
+      797,
+      798
     ],
-    "D_post_update_aborted": 817,
-    "D_post_delete_aborted": 818,
-    "D_post_lock": 819,
-    "D_post_subxact": 820,
+    "M_lockonly_keysh_share": [
+      799,
+      800
+    ],
+    "M_lockonly_keysh_nku": [
+      801,
+      802
+    ],
+    "M_lockonly_in_progress": [
+      803,
+      804
+    ],
+    "C_writer_mx_locker_never_finishes": 804,
+    "M_upd_committed": {
+      "locker": 805,
+      "updater": 806
+    },
+    "M_upd_aborted": {
+      "locker": 807,
+      "updater": 808
+    },
+    "M_upd_in_progress": {
+      "locker": 809,
+      "updater": 810
+    },
+    "C_writer_mx_updater_never_finishes": 810,
+    "M_upd_sub_committed": {
+      "updater_subxid": 813,
+      "parent": 812
+    },
+    "C_writer_w1_upd_commits_later": 814,
+    "C_gap_upd_1": 815,
+    "C_writer_w2_del_commits_later": 816,
+    "C_gap_del": 817,
+    "C_writer_w3_ins_commits_later": 818,
+    "C_gap_upd_2": 819,
+    "C_writer_w4_lock_commits_later": 820,
+    "C_writer_w10_nested_subxacts_commit_later": 821,
+    "C_w10_subxids": {
+      "top": 821,
+      "l1": 822,
+      "l2": 823,
+      "l3": 824
+    },
+    "C_gap_subxact": 825,
+    "C_gap_subxids": {
+      "top": 825,
+      "g1": 826
+    },
+    "C_writer_w5_upd_aborts_later": 827,
+    "C_gap_upd_3": 828,
+    "C_writer_w6_upd_never_finishes": 829,
+    "C_writer_w7_del_never_finishes": 830,
+    "C_writer_w8_ins_never_finishes": 831,
+    "C_writer_w9_lock_never_finishes": 832,
+    "C_writer_w11_subxact_never_finishes": 833,
+    "C_w11_subxids": {
+      "top": 833,
+      "k1": 834
+    },
+    "C_writer_w12_multi_updater_commits_later": 836,
+    "C_writer_w13_subxip_multi_updater": 838,
+    "C_w13_subxids": {
+      "top": 838,
+      "mx1": 839,
+      "mx2": 840
+    },
+    "C_gap_upd_4": 841,
+    "D_post_update": 842,
+    "D_post_insert": 843,
+    "D_post_delete": 844,
+    "D_post_chain": [
+      845,
+      846,
+      847
+    ],
+    "D_post_update_aborted": 848,
+    "D_post_delete_aborted": 849,
+    "D_post_lock": 850,
+    "M_post_snapshot": {
+      "updater": 852
+    },
+    "D_post_subxact": 853,
     "D_post_subxids": {
-      "top": 820,
-      "f1": 821
+      "top": 853,
+      "f1": 854
     }
   },
   "id_groups": {
@@ -146,300 +197,539 @@
       23,
       28
     ],
-    "B_upd_commit": [
+    "A_cascade": [
       29,
       36
     ],
-    "B_multi3": [
+    "B_upd_commit": [
       37,
       44
     ],
-    "B_del_commit": [
+    "B_multi3": [
       45,
-      50
+      52
     ],
-    "B_upd_abort": [
-      51,
+    "B_del_commit": [
+      53,
       58
     ],
-    "B_del_abort": [
+    "B_upd_abort": [
       59,
-      64
+      66
+    ],
+    "B_del_abort": [
+      67,
+      72
     ],
     "B_abort_then_commit": [
-      65,
-      70
+      73,
+      78
     ],
     "B_commit_abort_lock": [
-      71,
-      76
+      79,
+      84
     ],
     "B_presnap_chain": [
-      77,
-      82
+      85,
+      90
     ],
     "C_xip_upd_c": [
-      83,
-      88
+      91,
+      96
     ],
     "C_gap_upd_1": [
-      89,
-      94
+      97,
+      102
     ],
     "C_xip_del_c": [
-      95,
-      100
+      103,
+      108
     ],
     "C_gap_del": [
-      101,
-      106
+      109,
+      114
     ],
     "C_gap_upd_2": [
-      107,
-      112
+      115,
+      120
     ],
     "C_xip_lock_c": [
-      113,
-      117
+      121,
+      125
     ],
     "C_xip_upd_a": [
-      118,
-      123
+      126,
+      131
     ],
     "C_gap_upd_3": [
-      124,
-      129
+      132,
+      137
     ],
     "C_ip_upd": [
-      130,
-      135
+      138,
+      143
     ],
     "C_ip_del": [
-      136,
-      141
+      144,
+      149
     ],
     "C_ip_lock": [
-      142,
-      146
+      150,
+      154
     ],
     "C_gap_upd_4": [
-      147,
-      152
-    ],
-    "D_post_upd": [
-      153,
+      155,
       160
     ],
-    "D_post_del": [
+    "D_post_upd": [
       161,
-      166
+      168
     ],
-    "D_hot_chain": [
-      167,
+    "D_post_del": [
+      169,
       174
     ],
-    "D_post_upd_abort": [
+    "D_hot_chain": [
       175,
-      180
+      182
+    ],
+    "D_post_upd_abort": [
+      183,
+      188
     ],
     "D_post_del_abort": [
-      181,
-      186
+      189,
+      194
     ],
     "D_post_lock": [
-      187,
-      191
+      195,
+      199
     ],
-    "B_sub_rolled": [
-      192,
-      207
+    "M_lockonly_share_share": [
+      200,
+      204
     ],
-    "B_sub_kept": [
-      208,
-      215
+    "M_lockonly_keysh_share": [
+      205,
+      209
     ],
-    "B_sub_del_rolled": [
-      216,
-      221
+    "M_lockonly_keysh_nku": [
+      210,
+      213
     ],
-    "B_sub_del_kept": [
-      222,
-      227
+    "M_lockonly_in_progress": [
+      214,
+      217
     ],
-    "B_sub_top": [
-      228,
+    "M_upd_committed": [
+      218,
+      223
+    ],
+    "M_upd_aborted": [
+      224,
+      228
+    ],
+    "M_upd_in_progress": [
+      229,
       233
     ],
-    "C_subxip_top": [
+    "M_upd_sub_committed": [
       234,
-      239
+      238
+    ],
+    "M_upd_xip": [
+      239,
+      244
+    ],
+    "M_upd_subxip": [
+      245,
+      254
+    ],
+    "M_post_snapshot": [
+      255,
+      258
+    ],
+    "M_sentinel": [
+      259,
+      259
+    ],
+    "F_frozen_deleted": [
+      260,
+      264
+    ],
+    "F_frozen_del_aborted": [
+      265,
+      268
+    ],
+    "F_frozen_locked": [
+      269,
+      272
+    ],
+    "B_sub_rolled": [
+      273,
+      288
+    ],
+    "B_sub_kept": [
+      289,
+      296
+    ],
+    "B_sub_del_rolled": [
+      297,
+      302
+    ],
+    "B_sub_del_kept": [
+      303,
+      308
+    ],
+    "B_sub_top": [
+      309,
+      314
+    ],
+    "C_subxip_top": [
+      315,
+      320
     ],
     "C_subxip_l1": [
-      240,
-      245
+      321,
+      326
     ],
     "C_subxip_l2": [
-      246,
-      251
+      327,
+      332
     ],
     "C_gap_sub_top": [
-      252,
-      256
+      333,
+      337
     ],
     "C_gap_sub": [
-      257,
-      262
+      338,
+      343
     ],
     "C_subip_top": [
-      263,
-      267
+      344,
+      348
     ],
     "C_subip_del": [
-      268,
-      273
+      349,
+      354
     ],
     "D_sub_post_rolled": [
-      274,
-      279
+      355,
+      360
     ],
     "D_sub_post_kept": [
-      280,
-      285
-    ],
-    "filler": [
-      286,
-      345
-    ],
-    "A_lock_for_update": [
-      346,
-      351
-    ],
-    "A_lock_for_no_key_update": [
-      352,
-      356
-    ],
-    "A_lock_for_share": [
-      357,
-      361
-    ],
-    "A_lock_for_key_share": [
-      362,
+      361,
       366
     ],
-    "A_lock_aborted": [
+    "filler": [
       367,
-      371
+      426
+    ],
+    "A_lock_for_update": [
+      427,
+      432
+    ],
+    "A_lock_for_no_key_update": [
+      433,
+      437
+    ],
+    "A_lock_for_share": [
+      438,
+      442
+    ],
+    "A_lock_for_key_share": [
+      443,
+      447
+    ],
+    "A_lock_aborted": [
+      448,
+      452
     ],
     "A_upd_then_lock": [
-      372,
-      377
+      453,
+      458
     ]
   },
   "transaction_state_counts": {
-    "aborted": 12,
-    "committed": 43,
-    "in progress": 6
+    "aborted": 14,
+    "committed": 65,
+    "in progress": 8
   },
-  "xids_referenced_by_the_pages": 61,
+  "xids_referenced_by_the_pages": 87,
   "slru_segments": {
     "pg_xact": [
       "0000"
     ],
     "pg_subtrans": [
       "0000"
+    ],
+    "pg_multixact/offsets": [
+      "0000"
+    ],
+    "pg_multixact/members": [
+      "0000"
     ]
   },
   "slru_bytes": {
     "pg_xact": 8192,
-    "pg_subtrans": 8192
+    "pg_subtrans": 8192,
+    "pg_multixact/offsets": 8192,
+    "pg_multixact/members": 8192
   },
   "subtransaction_xids_on_pages": [
     783,
     785,
     786,
     788,
-    797,
-    798,
-    799,
-    801,
-    809,
-    821
+    813,
+    822,
+    823,
+    824,
+    826,
+    834,
+    839,
+    840,
+    854
   ],
-  "subtransaction_parent_entries": 10,
+  "multixact_ids_on_pages": [
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14
+  ],
+  "multixact_members": {
+    "3": [
+      [
+        797,
+        "sh"
+      ],
+      [
+        798,
+        "sh"
+      ]
+    ],
+    "4": [
+      [
+        799,
+        "keysh"
+      ],
+      [
+        800,
+        "sh"
+      ]
+    ],
+    "5": [
+      [
+        801,
+        "keysh"
+      ],
+      [
+        802,
+        "fornokeyupd"
+      ]
+    ],
+    "6": [
+      [
+        803,
+        "sh"
+      ],
+      [
+        804,
+        "sh"
+      ]
+    ],
+    "7": [
+      [
+        805,
+        "keysh"
+      ],
+      [
+        806,
+        "nokeyupd"
+      ]
+    ],
+    "8": [
+      [
+        807,
+        "keysh"
+      ],
+      [
+        808,
+        "nokeyupd"
+      ]
+    ],
+    "9": [
+      [
+        809,
+        "keysh"
+      ],
+      [
+        810,
+        "nokeyupd"
+      ]
+    ],
+    "10": [
+      [
+        811,
+        "keysh"
+      ],
+      [
+        813,
+        "nokeyupd"
+      ]
+    ],
+    "11": [
+      [
+        835,
+        "keysh"
+      ],
+      [
+        836,
+        "nokeyupd"
+      ]
+    ],
+    "12": [
+      [
+        837,
+        "keysh"
+      ],
+      [
+        839,
+        "nokeyupd"
+      ]
+    ],
+    "13": [
+      [
+        837,
+        "keysh"
+      ],
+      [
+        840,
+        "nokeyupd"
+      ]
+    ],
+    "14": [
+      [
+        851,
+        "keysh"
+      ],
+      [
+        852,
+        "nokeyupd"
+      ]
+    ]
+  },
+  "tuples_with_multixact_xmax": 67,
+  "lockonly_multixact_tuples": 18,
+  "updater_multixact_tuples": 49,
+  "subxid_updater_multixact_tuples": 23,
+  "snapshot_dependent_updater_tuples": 28,
+  "multixact_member_flags_seen": [
+    0,
+    1,
+    2,
+    4
+  ],
+  "frozen_tuples": 422,
+  "frozen_tuples_with_xmax": 411,
+  "subtransaction_parent_entries": 13,
   "deepest_subtransaction_chain": 3,
-  "tuple_stamps_requiring_pg_subtrans": 24,
+  "tuple_stamps_requiring_pg_subtrans": 42,
   "visible_subtransactions": [
     785,
     788,
-    801
+    813,
+    826
   ],
   "aborted_children_of_committed_parents": [
     783,
     786,
-    821
+    854
   ],
-  "committed_visible_to_snapshot": 30,
+  "committed_visible_to_snapshot": 49,
   "committed_after_snapshot": [
-    811,
-    812,
-    813,
-    814,
-    815,
-    816,
-    819,
-    820
+    842,
+    843,
+    844,
+    845,
+    846,
+    847,
+    850,
+    851,
+    852,
+    853
   ],
   "committed_but_listed_in_xip": [
-    789,
-    791,
-    793,
-    795,
-    796
+    814,
+    816,
+    818,
+    820,
+    821,
+    836
   ],
   "aborted_listed_in_xip": [
-    802
+    827
   ],
   "committed_inside_xid_range_but_not_in_xip": [
-    790,
-    792,
-    794,
-    797,
-    798,
-    799,
-    800,
-    801,
-    803,
-    810
-  ],
-  "still_in_progress": [
-    804,
     805,
     806,
     807,
-    808,
-    809
+    809,
+    811,
+    813,
+    815,
+    817,
+    819,
+    822,
+    823,
+    824,
+    825,
+    826,
+    828,
+    835,
+    837,
+    839,
+    840,
+    841
+  ],
+  "still_in_progress": [
+    804,
+    810,
+    829,
+    830,
+    831,
+    832,
+    833,
+    834
   ],
   "line_pointer_counts": {
     "LP_UNUSED": 0,
-    "LP_NORMAL": 725,
-    "LP_REDIRECT": 15,
+    "LP_NORMAL": 855,
+    "LP_REDIRECT": 23,
     "LP_DEAD": 13
   },
-  "physical_tuples": 725,
-  "tuples_with_nulls": 173,
-  "hot_updated_tuples": 192,
-  "heap_only_tuples": 219,
-  "lock_only_tuples": 53,
-  "lock_only_tuples_requiring_infomask": 33,
-  "tuples_without_xmin_committed_hint": 128,
-  "tuples_with_aborted_xmin": 75,
-  "tuples_with_aborted_xmin_and_invalid_hint": 63,
+  "physical_tuples": 855,
+  "tuples_with_nulls": 204,
+  "hot_updated_tuples": 231,
+  "heap_only_tuples": 266,
+  "lock_only_tuples": 124,
+  "lock_only_tuples_requiring_infomask": 82,
+  "tuples_without_xmin_committed_hint": 162,
+  "tuples_with_aborted_xmin": 80,
+  "tuples_with_aborted_xmin_and_invalid_hint": 68,
   "toast_chunks": 0,
-  "golden_rows": 353,
+  "golden_rows": 429,
   "excluded_cases_present": {
-    "multixact": 0,
-    "frozen": 0,
     "combocid": 0,
-    "toast_external": 0
+    "toast_external": 0,
+    "frozen_xid_rewritten": 0
   }
 }

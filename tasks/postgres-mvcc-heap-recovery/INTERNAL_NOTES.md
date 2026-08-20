@@ -36,7 +36,7 @@ step through 1-, 2- and 4-byte alignment in a row; and the nullable `text`
 `region_code` is what makes updates that change that column *non*-HOT, so the
 fixture contains both kinds.
 
-## Transaction history (v3)
+## Transaction history (v4)
 
 The generator runs four phases. What separates v2 from v1 is a **horizon
 holder**: a read-only `REPEATABLE READ` session opened at the end of phase A and
@@ -48,7 +48,9 @@ survives into the captured file.
 | # | phase | effect |
 | --- | --- | --- |
 | A1 | base insert, committed | every base id, in id order, so allocation order is physical order |
+| A1b | `VACUUM (FREEZE)` | every base tuple gets `HEAP_XMIN_FROZEN` (both hint bits) with its raw xmin preserved; every row a later phase touches becomes a frozen-xmin-plus-live-xmax case |
 | A2 | 22 rounds of HOT churn on `A_churn` / `A_churn_long`, with a scan between rounds | pruning runs while the horizon is still current, leaving the `LP_REDIRECT` roots |
+| A2b | a plain `VACUUM` after the churn | reclaims the dead churn versions while the horizon is still current; the redirects survive |
 | A3 | a committed non-HOT update and a committed delete, then four scans | dead **root** line pointers, which pruning retires as `LP_DEAD` (not `LP_UNUSED`, because index entries still point at them) |
 | — | **the horizon holder opens** | nothing is pruned from here on |
 | B1 | row locks: `FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE`, `FOR KEY SHARE`, one aborted `FOR UPDATE`, and a committed update followed by a committed lock of the new version | 53 lock-only `xmax` tuples, **none** stamped `HEAP_XMAX_INVALID` |
@@ -56,12 +58,60 @@ survives into the captured file.
 | B3 | aborted insert, aborted update, aborted delete | dead versions that keep the greatest `xmin` on their keys |
 | B4 | abort-then-commit, and commit-abort-lock | keys where three mechanisms interact at once |
 | B5 | a committed transaction with four savepoints: two released, two rolled back | an ABORTED child under a COMMITTED parent, in both the update and the delete direction |
+| B6 | frozen roots explicitly deleted, almost-deleted and locked | frozen xmin + committed / aborted / lock-only xmax |
+| B7 | **the MultiXact groups** (after two burn multis on the uncaptured probe table) | locker-only multis in three mode mixes, one with a member that never finishes; locker+updater multis whose updater commits, aborts, stays open, or ran inside a released savepoint |
 | C | eleven writers opened **interleaved** with six transactions that commit between them | a sparse `snapshot_xip` inside `[xmin, xmax)` |
 | C1 | one of those writers holds **three nested savepoints** and commits after the snapshot | subxids that read COMMITTED and match no xip entry |
+| C2 | a locker commits pre-snapshot while writer w12 updates the same rows | a multi whose **updater is in `snapshot_xip`** |
+| C3 | a locker + writer w13 updating from **two nested savepoints** | multis whose updater is a **subxid of an xip writer** - the deepest chain in the fixture - including on the churned cascade keys |
 | — | **the target snapshot is taken** by a read-only `REPEATABLE READ` observer | `789:811:789,791,793,795,796,802,804,805,806,807,808` |
 | D | after the snapshot: committed update, insert, delete, three more HOT rounds, a committed lock, an aborted update and an aborted delete | committed-but-invisible work, and chains whose visible member is in the middle |
-| — | writers 1-4 commit, writer 5 aborts, writers 6-9 stay open | four `committed` xids inside `xip`, one `aborted` inside `xip`, four `in_progress` |
+| D2 | a whole locker+updater multi after the snapshot | both members commit at/above `snapshot_xmax`; the old version stays visible |
+| — | writers 1-4, 10, 12, 13 commit; writer 5 aborts; 6-9, 11 and the two multi holdouts stay open | committed, aborted and in-progress xids inside `xip` |
+| — | **the trailing sentinel multi** on the probe table | bounds the last referenced multi's member list |
 | — | `CHECKPOINT`, then the relation's main fork **and the `pg_xact` / `pg_subtrans` directories** are copied byte for byte | `heap_pages.bin`, `pg_xact/0000`, `pg_subtrans/0000` |
+
+### The MultiXact mechanics, and their two sharp edges
+
+A multi is created by ordinary SQL the moment a second transaction locks a row
+whose xmax already names a live locker, or an updater modifies a row a
+compatible locker still holds (`FOR KEY SHARE` + a non-key `UPDATE` ->
+`{keysh, nokeyupd}`). All modes used here are mutually compatible, so the
+strictly sequenced sessions never block and generation stays deterministic;
+mxids allocate 1, 2, 3... exactly like xids.
+
+Two on-disk edges are handled explicitly and asserted at generation time:
+
+1. **Member offset 0 is reserved.** `offsets[first_multi] = 1`, so a zero entry
+   can mean "never written". A solver that treats the array as plainly 0-based
+   reads every member window shifted by one.
+2. **`offsets[M+1]` bounds multi M's member list**, and for the newest multi on
+   disk that entry exists only in `pg_control` (not shipped). The generator
+   therefore creates one trailing sentinel multi - on the *uncaptured* probe
+   table, so the sentinel itself never reaches the pages - and asserts
+   `offsets[max_used + 1] != 0`.
+
+Two further generation details matter:
+
+* **The first two mxids are burned** on the probe table. Read as plain xids,
+  mxid 1 is `BootstrapTransactionId` and mxid 2 is `FrozenTransactionId`, which
+  PostgreSQL special-cases rather than recording in clog - so a solver that
+  misreads them would accidentally survive. Burning them makes every on-page
+  mxid >= 3, and the generator asserts each one decodes as COMMITTED when
+  misread, keeping the IS_MULTI trap armed on every multi tuple.
+* **The generator cross-checks every multi against the server**: the raw
+  offsets/members decode must equal `pg_get_multixact_members()` member for
+  member, flag for flag, before anything is written out.
+
+### Why freezing runs before the horizon holder
+
+`VACUUM (FREEZE)` prunes, so it must run while pruning is still allowed - and
+it must run *before* the churn, so the churned keys' chains grow on top of
+already-frozen roots. Everything modified after the horizon holder opens keeps
+both its frozen root and its new xmax on the page. Freezing preserves the raw
+xmin (verified: no tuple carries xid 1 or 2), so `pg_xact` remains sufficient
+for every xid - the frozen bits are a *correctness* trap (bit ordering, and
+"frozen means visible" skipping the xmax), not a data dependency.
 
 ### Why the horizon holder is the whole trick
 
@@ -174,8 +224,9 @@ appears. `build/fixture_test.py` re-asserts all four from the solver-facing byte
 | case | why it is excluded | how it is kept out | assertion |
 | --- | --- | --- | --- |
 | **Combo CIDs** (`HEAP_COMBOCID`, `0x0020`) | resolving `t_cid` into a `cmin`/`cmax` pair needs the writing backend's in-memory combo array, which no on-disk artefact can supply | no transaction both creates and removes the same tuple; and an external snapshot never consults a command id in the first place | `test_no_combo_command_ids` |
-| **Frozen tuples** (`t_infomask & 0x0300 == 0x0300`, or `xmin` 1/2) | correct handling means treating `xmin` as older than every snapshot and bypassing the commit log | no `VACUUM`/`VACUUM FREEZE` runs, `autovacuum` is off, and the cluster is fresh so no xid is near the freeze horizon | `test_no_frozen_tuples` |
-| **MultiXact `xmax`** (`HEAP_XMAX_IS_MULTI`, `0x1000`) | visibility would depend on `pg_multixact` membership, which is not shipped | no foreign keys (so no share locks), a single locker per row-lock transaction, and no second writer or locker on an already-locked row - including from a subtransaction of the same parent | `test_no_multixact_xmax` |
+
+| ~~MultiXact `xmax`~~ | **included since v4**: `pg_multixact/offsets` + `members` are shipped, the oracle resolves members and flags, and eight negatives cover the failure modes | created deliberately with compatible lock modes; burned mxids 1-2; sentinel multi | `test_multixact_*` (9 tests) |
+| ~~Frozen tuples~~ | **included since v4**: `VACUUM (FREEZE)` runs before the history; both hint bits set, raw xmin preserved | frozen-then-modified rows are deliberate | `test_frozen_*` (3 tests) |
 | **Out-of-line TOAST** (`HEAP_HASEXTERNAL`, `0x0004`; 1-byte header `0x01`) | the TOAST relation is not shipped | every text value is far below the 2 KiB threshold; the generator also asserts the TOAST relation is empty | `test_no_out_of_line_toast_datum` |
 
 The oracle nevertheless *handles* frozen tuples correctly and raises a clear
@@ -211,9 +262,10 @@ of using a real server, so exact input reproducibility is not a requirement here
 In practice the procedure is stronger than required. Two consecutive
 `build/generate_case.py` runs against fresh containers produced
 **byte-identical** `heap_pages.bin`, `table_schema.json`, `pg_xact/0000`,
-`pg_subtrans/0000`, `golden.csv` and `expected_state.json` (verified during
-authoring, for v3 as for v2). The canonical digest of the expected state is
-`c9bd582a5f5ff33fafecf7b931af467a75f63501bf69c3b661672677ff5a4720`.
+`pg_subtrans/0000`, `pg_multixact/offsets/0000`, `pg_multixact/members/0000`,
+`golden.csv` and `expected_state.json` (verified during authoring, for v4 as for
+v2 and v3; MultiXactIds allocate as deterministically as xids do). The canonical digest of the expected state is
+`73587226df39aea84327e50a8f0c1fc3ec4325c47b74496fda47aa36eebc073e`.
 
 The SLRU segments reproduce for the same reason the heap does: a fresh `initdb`
 starts the xid counter at the same value and the generator drives the same

@@ -22,8 +22,9 @@ def main() -> int:
             continue
         if snap.in_progress(t.xmin, status) and status(t.xmin) == "committed":
             continue
-        if t.xmax and status(t.xmax) != "aborted":
-            if not (snap.in_progress(t.xmax, status) and status(t.xmax) == "committed"):
+        u = C.deleting_xid(t, status)
+        if u is not None and status(u) != "aborted":
+            if not (snap.in_progress(u, status) and status(u) == "committed"):
                 continue
         rows.append(t.values)
     pk = C.pk_positions(js, attrs)

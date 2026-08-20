@@ -157,6 +157,8 @@ def main() -> int:
     ap.add_argument("--pg-xact", dest="pg_xact", default=str(here / "pg_xact"))
     ap.add_argument("--pg-subtrans", dest="pg_subtrans",
                     default=str(here / "pg_subtrans"))
+    ap.add_argument("--pg-multixact", dest="pg_multixact",
+                    default=str(here / "pg_multixact"))
     ap.add_argument("--schema", default=str(here / "table_schema.json"))
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
@@ -170,6 +172,31 @@ def main() -> int:
 
     clog = Slru(a.pg_xact, CLOG_PER_PAGE)
     subtrans = Slru(a.pg_subtrans, SUB_PER_PAGE)
+    mx_root = Path(a.pg_multixact)
+    mx_offsets = Slru(mx_root / "offsets", BLOCK // 4)          # 2048 per page
+    mx_members_raw = Slru(mx_root / "members", (BLOCK // 20) * 4)  # 1636 per page
+
+    def mx_members(mxid):
+        """[(xid, status)]: groups of 4 flag bytes then 4 xids, 20 bytes each.
+        Member slot 0 is reserved; offsets[mxid+1] bounds the list."""
+        lo, lo_base, lo_i = mx_offsets.offset(mxid)
+        hi, hi_base, hi_i = mx_offsets.offset(mxid + 1)
+        start = struct.unpack_from("<I", lo, lo_base + lo_i * 4)[0]
+        end = struct.unpack_from("<I", hi, hi_base + hi_i * 4)[0]
+        if start == 0 or end < start:
+            raise SystemExit("member range of multi %d is unbounded" % mxid)
+        out = []
+        for i in range(start, end):
+            blob, base, within = mx_members_raw.offset(i)
+            group, idx = divmod(within, 4)
+            gb = base + group * 20
+            out.append((struct.unpack_from("<I", blob, gb + 4 + idx * 4)[0],
+                        blob[gb + idx]))
+        return out
+
+    def mx_update_member(mxid):
+        ups = [x for x, f in mx_members(mxid) if f in (4, 5)]
+        return ups[0] if ups else None
 
     def top_of(x):
         """Climb pg_subtrans to the enclosing top-level transaction."""
@@ -224,8 +251,6 @@ def main() -> int:
 
     visible = {}
     for xmin, xmax, mask, values in live_tuples(Path(a.heap).read_bytes(), cols):
-        if mask & 0x1000:
-            raise SystemExit("MultiXact xmax is out of scope for this fixture")
         if (mask & 0x0300) == 0x0300:
             inserted_ok = True                      # frozen
         elif mask & 0x0200:
@@ -237,6 +262,10 @@ def main() -> int:
 
         if mask & 0x0800 or xmax == 0 or mask & 0x0080:
             deleted = False                         # invalid / absent / lock-only
+        elif mask & 0x1000:
+            # a MultiXactId: only the (at most one) update member can delete
+            u = mx_update_member(xmax)
+            deleted = u is not None and committed_by_snapshot(u)
         else:
             deleted = committed_by_snapshot(xmax)
         if deleted:

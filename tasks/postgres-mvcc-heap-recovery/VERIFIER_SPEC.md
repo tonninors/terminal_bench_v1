@@ -12,7 +12,8 @@ local runs via `TB_RECOVERED_CSV`).
 It does **not** look at, and has no code path that could look at, the solver's
 scripts, commands, shell history, logs, intermediate files, timings, or the
 method used to produce the answer. It does not read `heap_pages.bin`,
-`table_schema.json`, `pg_xact/` or `pg_subtrans/`, does not start a database, does not use
+`table_schema.json`, `pg_xact/`, `pg_subtrans/` or `pg_multixact/`, does not
+start a database, does not use
 the network, and does not shell out. Every check is a pure function of the bytes
 of the candidate file and the static fixture, so repeated runs on the same file
 always return the same verdict.
@@ -112,31 +113,42 @@ independent primary keys each one gets wrong.
 
 ### Must FAIL
 
-Counts are against the 353-row correct answer, measured by
+Counts are against the 429-row correct answer, measured by
 `build/measure_negatives.py`. "keys off" counts primary keys that are missing,
-extra, duplicated or carrying wrong values.
+extra, duplicated or carrying wrong values. Strategies 13-22 are new in v4.
 
 | # | strategy | rows | dup PK | missing | extra | wrong values | keys off |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | greatest `xmin` per key | 401 | 0 | 0 | 48 | 141 | **189** |
-| 2 | ignore `xmax` entirely | 508 | 137 | 0 | 18 | 109 | **127** |
-| 3 | a committed `xmax` means deleted | 225 | 0 | 128 | 0 | 0 | **128** |
-| 4a | HOT redirects walked as tuples | 368 | 15 | 0 | 0 | 0 | **15** |
-| 4b | heap-only versions skipped | 251 | 0 | 102 | 0 | 0 | **102** |
-| 5 | aborted treated as committed | 321 | 6 | 44 | 6 | 51 | **101** |
-| 6 | in-progress treated as committed | 309 | 0 | 50 | 6 | 11 | **67** |
-| 7a | `snapshot_xip` ignored | 315 | 0 | 50 | 12 | 18 | **80** |
-| 7b | every recent xid is in progress | 326 | 0 | 33 | 6 | 35 | **74** |
-| 8 | hint bits used as the commit log | 229 | 0 | 130 | 6 | 43 | **179** |
-| 9 | every physical tuple | 725 | 324 | 0 | 48 | 238 | **286** |
-| 10 | newest committed, no header state | 389 | 0 | 0 | 36 | 67 | **103** |
-| 11 | **`pg_subtrans` never opened** | 353 | 0 | 6 | 6 | 6 | **18** |
-| 12 | **subxact inherits its parent's status** | 369 | 16 | 0 | 0 | 16 | **16** |
+| 1 | greatest `xmin` per key | 482 | 0 | 0 | 53 | 179 | **232** |
+| 2 | ignore `xmax` entirely | 600 | 148 | 0 | 23 | 120 | **143** |
+| 3 | a committed `xmax` means deleted | 230 | 0 | 199 | 0 | 0 | **199** |
+| 4a | HOT redirects walked as tuples | 452 | 23 | 0 | 0 | 0 | **23** |
+| 4b | heap-only versions skipped | 322 | 0 | 107 | 0 | 0 | **107** |
+| 5 | aborted treated as committed | 486 | 51 | 0 | 6 | 56 | **62** |
+| 6 | in-progress treated as committed | 423 | 0 | 12 | 6 | 16 | **34** |
+| 7a | `snapshot_xip` ignored | 429 | 0 | 12 | 12 | 42 | **66** |
+| 7b | every recent xid is in progress | 435 | 0 | 0 | 6 | 46 | **52** |
+| 8 | hint bits used as the commit log | 234 | 0 | 201 | 6 | 43 | **250** |
+| 9 | every physical tuple | 855 | 373 | 0 | 53 | 287 | **340** |
+| 10 | newest committed, no header state | 470 | 0 | 0 | 41 | 95 | **136** |
+| 11 | `pg_subtrans` never opened | 429 | 0 | 6 | 6 | 24 | **36** |
+| 12 | subxact inherits its parent's status | 445 | 16 | 0 | 0 | 16 | **16** |
+| 13 | **multi xmax read as a plain xid** | 373 | 0 | 56 | 0 | 0 | **56** |
+| 14 | **every multi is just a lock** | 440 | 11 | 0 | 0 | 11 | **11** |
+| 15 | **any committed member kills** | 377 | 0 | 52 | 0 | 0 | **52** |
+| 16 | **highest member assumed updater** | 415 | 0 | 14 | 0 | 0 | **14** |
+| 17 | **multi updater without `pg_subtrans`** | 399 | 0 | 30 | 0 | 0 | **30** |
+| 18 | **multi updater ignores the snapshot** | 401 | 0 | 28 | 0 | 0 | **28** |
+| 19 | **reserved member offset 0 mishandled** | 429 | 11 | 11 | 0 | 11 | **22** |
+| 20 | **member range read until a zero xid** | 411 | 0 | 18 | 0 | 0 | **18** |
+| 21 | **`XMIN_INVALID` tested before FROZEN** | 150 | 0 | 279 | 0 | 0 | **279** |
+| 22 | **frozen means visible, `xmax` skipped** | 572 | 120 | 0 | 23 | 120 | **143** |
 
-Strategies 11 and 12 are the two halves of getting subtransactions wrong.
-11 reads a subtransaction id at face value against `snapshot_xip`, which lists
-top-level xids only; 12 resolves the parent but then also borrows its commit
-status, resurrecting savepoints that were rolled back.
+Strategies 13-20 are the eight ways of getting MultiXact wrong - never testing
+the bit, never opening the files, ignoring the member flags, guessing the
+updater, dropping the subtransaction resolution or the snapshot test on the
+update member, and the two member-addressing bugs (reserved offset 0, the
+`offsets[M+1]` bound). 21 and 22 are the two frozen-bit misreadings.
 
 Additional candidates that must also fail:
 
@@ -159,11 +171,11 @@ primary keys, so no wrong strategy can slip through as a near miss.
 
 ## Reward hacking
 
-There is nothing to hack: the answer is a 353-row table whose every field is
+There is nothing to hack: the answer is a 429-row table whose every field is
 checked and whose digest is fixed. The inputs are in the container but the
 expected answer is not, and it cannot be derived from them without performing the
 recovery. A partially correct decode fails on values; a correct decode with the
 wrong visibility rule fails on the key set; a correct visibility rule that
-ignores `HEAP_XMAX_LOCK_ONLY` loses 128 keys; a solver that never opens
-`pg_subtrans` is wrong on 18; and a naive line-pointer walk fails on duplicate
-keys.
+ignores `HEAP_XMAX_LOCK_ONLY` loses 199 keys; a solver that misreads a
+MultiXactId as a transaction id loses 56; one that never opens `pg_subtrans` is
+wrong on 36; and a naive line-pointer walk fails on duplicate keys.

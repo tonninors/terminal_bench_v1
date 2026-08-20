@@ -24,9 +24,10 @@ def main() -> int:
             continue
         if snap.in_progress(t.xmin, status):
             continue
-        if t.xmax:
-            st_max = status(t.xmax)
-            if st_max != "in_progress" and not snap.in_progress(t.xmax, status):
+        u = C.deleting_xid(t, status)
+        if u is not None:
+            st_max = status(u)
+            if st_max != "in_progress" and not snap.in_progress(u, status):
                 continue
         rows.append(t.values)
     pk = C.pk_positions(js, attrs)

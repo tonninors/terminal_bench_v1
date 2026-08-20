@@ -26,7 +26,8 @@ def main() -> int:
     for t in tuples:
         if status(t.xmin) != "committed" or running(t.xmin):
             continue
-        if t.xmax and status(t.xmax) == "committed" and not running(t.xmax):
+        u = C.deleting_xid(t, status)
+        if u is not None and status(u) == "committed" and not running(u):
             continue
         rows.append(t.values)
     pk = C.pk_positions(js, attrs)

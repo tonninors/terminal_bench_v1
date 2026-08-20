@@ -8,6 +8,7 @@ supplied snapshot.
 
     golden_recover.py [--heap /app/heap_pages.bin] [--pg-xact /app/pg_xact]
                       [--pg-subtrans /app/pg_subtrans]
+                      [--pg-multixact /app/pg_multixact]
                       [--schema /app/table_schema.json] [--out /app/recovered.csv]
                       [--report]
 
@@ -18,6 +19,14 @@ xids in its xip list, so a tuple written by a subtransaction of a transaction
 that was still running carries a subxid that reads COMMITTED in the commit log
 and is absent from snapshot_xip; only the subtransaction map shows that its
 topmost parent was in flight.
+
+When several transactions lock one row, or a locker coexists with an updater,
+t_xmax holds a MultiXactId instead of a transaction id, flagged by
+HEAP_XMAX_IS_MULTI.  The mxid resolves through pg_multixact/offsets (start of
+its member list; the next multi's entry bounds it) and pg_multixact/members
+(member xids plus a status flag each).  Locker members never delete the tuple;
+the at-most-one update member deletes it exactly when that transaction committed
+and is outside the snapshot - resolved through pg_subtrans like any other xid.
 
 No hidden expected answer is consulted and no row is hard-coded anywhere in this
 file.  Structure references: src/include/storage/bufpage.h (PageHeaderData,
@@ -77,6 +86,16 @@ CLOG_XACTS_PER_BYTE = 4
 CLOG_XACTS_PER_PAGE = BLCKSZ * CLOG_XACTS_PER_BYTE          # 32768
 CLOG_XACT_BITMASK = (1 << CLOG_BITS_PER_XACT) - 1
 SUBTRANS_XACTS_PER_PAGE = BLCKSZ // 4                       # 2048
+
+# pg_multixact geometry (src/backend/access/transam/multixact.c)
+MULTIXACT_OFFSETS_PER_PAGE = BLCKSZ // 4                    # 2048
+MULTIXACT_MEMBERS_PER_GROUP = 4
+MULTIXACT_MEMBERGROUP_SIZE = 4 + 4 * 4                      # 4 flag bytes + 4 xids
+MULTIXACT_GROUPS_PER_PAGE = BLCKSZ // MULTIXACT_MEMBERGROUP_SIZE   # 409
+MULTIXACT_MEMBERS_PER_PAGE = MULTIXACT_GROUPS_PER_PAGE * MULTIXACT_MEMBERS_PER_GROUP
+# MultiXactStatus: 0 ForKeyShare, 1 ForShare, 2 ForNoKeyUpdate, 3 ForUpdate are
+# LOCKERS; 4 NoKeyUpdate, 5 Update are UPDATERS (ISUPDATE_from_mxstatus)
+MXS_IS_UPDATE = (4, 5)
 
 XACT_IN_PROGRESS = 0x00
 XACT_COMMITTED = 0x01
@@ -274,6 +293,72 @@ def parse_page(page: bytes, block: int, attrs: list[Attr]):
     return tuples, census, header
 
 
+class MultiXactLog:
+    """pg_multixact/offsets and pg_multixact/members, read from the raw SLRU
+    segment files.
+
+    offsets holds one 32-bit member index per MultiXactId (2048 per page); the
+    member list of multi M spans [offsets[M], offsets[M+1]).  Member index 0 is
+    reserved so that a zero entry can mean 'never written', which is also why
+    the list of the newest multi on disk can only be bounded if one more multi
+    was created after it.  members packs groups of four: four status-flag bytes
+    followed by four 32-bit xids (20 bytes per group, 409 groups per page)."""
+
+    def __init__(self, root: Path):
+        self.offsets = TransactionLog._load(root / "offsets",
+                                            "pg_multixact/offsets")
+        self.member_segs = TransactionLog._load(root / "members",
+                                                "pg_multixact/members")
+        self.resolved = {}
+
+    def _offset(self, mxid: int) -> int:
+        pageno = mxid // MULTIXACT_OFFSETS_PER_PAGE
+        segno, page = divmod(pageno, SLRU_PAGES_PER_SEGMENT)
+        blob = self.offsets.get(segno)
+        if blob is None:
+            raise SystemExit("pg_multixact/offsets has no segment %04X, needed "
+                             "for multi %d" % (segno, mxid))
+        off = page * BLCKSZ + (mxid % MULTIXACT_OFFSETS_PER_PAGE) * 4
+        return struct.unpack_from("<I", blob, off)[0]
+
+    def members(self, mxid: int):
+        """[(xid, status)] for one multi."""
+        if mxid in self.resolved:
+            return self.resolved[mxid]
+        start, end = self._offset(mxid), self._offset(mxid + 1)
+        if start == 0:
+            raise SystemExit("multi %d was never created (offsets entry is 0)"
+                             % mxid)
+        if end == 0 or end < start or end - start > 64:
+            raise SystemExit("cannot bound the member list of multi %d "
+                             "(offsets[%d]=%d, offsets[%d]=%d)"
+                             % (mxid, mxid, start, mxid + 1, end))
+        out = []
+        for i in range(start, end):
+            pageno, within = divmod(i, MULTIXACT_MEMBERS_PER_PAGE)
+            segno, page = divmod(pageno, SLRU_PAGES_PER_SEGMENT)
+            blob = self.member_segs.get(segno)
+            if blob is None:
+                raise SystemExit("pg_multixact/members has no segment %04X"
+                                 % segno)
+            group, idx = divmod(within, MULTIXACT_MEMBERS_PER_GROUP)
+            base = page * BLCKSZ + group * MULTIXACT_MEMBERGROUP_SIZE
+            flag = blob[base + idx]
+            xid = struct.unpack_from("<I", blob, base + 4 + idx * 4)[0]
+            if xid == INVALID_XID:
+                raise SystemExit("multi %d member %d decodes to xid 0" % (mxid, i))
+            out.append((xid, flag))
+        self.resolved[mxid] = out
+        return out
+
+    def updater(self, mxid: int):
+        """The xid of the at-most-one update member, or None (pure lock)."""
+        ups = [x for x, f in self.members(mxid) if f in MXS_IS_UPDATE]
+        if len(ups) > 1:
+            raise SystemExit("multi %d has %d update members" % (mxid, len(ups)))
+        return ups[0] if ups else None
+
+
 # ---------------------------------------------------------------- visibility
 class Snapshot:
     def __init__(self, xmin: int, xmax: int, xip):
@@ -322,6 +407,7 @@ class TransactionLog:
     def __init__(self, clog_dir: Path, subtrans_dir: Path):
         self.clog = self._load(clog_dir, "pg_xact")
         self.subtrans = self._load(subtrans_dir, "pg_subtrans")
+        self.multi = None              # MultiXactLog, attached by the loader
         self.consulted = set()
         self.subtrans_lookups = 0
         self.resolved_subxids = {}
@@ -448,8 +534,6 @@ def xmin_committed(t: Tuple, status, notes: dict) -> bool:
 
 def tuple_visible(t: Tuple, snap: Snapshot, status, notes: dict) -> bool:
     """HeapTupleSatisfiesMVCC, minus the cases this fixture excludes."""
-    if t.infomask & HEAP_XMAX_IS_MULTI:
-        raise SystemExit("block %d lp %d has a MultiXact xmax" % (t.block, t.lp))
     if t.infomask & HEAP_COMBOCID:
         raise SystemExit("block %d lp %d carries a combo command id"
                          % (t.block, t.lp))
@@ -461,15 +545,39 @@ def tuple_visible(t: Tuple, snap: Snapshot, status, notes: dict) -> bool:
         if snap.in_progress(t.xmin, status):
             return False                  # inserted after this snapshot was taken
 
-    if t.xmax != INVALID_XID and xmax_is_locked_only(t.infomask):
-        notes["lock_only"] += 1           # a row lock, not a deletion
-
     # Same order as HeapTupleSatisfiesMVCC.
     if t.infomask & HEAP_XMAX_INVALID:
         return True                       # hint bit: xmax is aborted or unset
     if t.xmax == INVALID_XID:
         return True
+
+    if t.infomask & HEAP_XMAX_IS_MULTI:
+        # xmax is a MultiXactId, NOT a transaction id.  In a fresh cluster the
+        # mxids are small integers that collide with committed bootstrap xids,
+        # so misreading this field silently deletes live rows.
+        notes["multixact"] = notes.get("multixact", 0) + 1
+        if t.infomask & HEAP_XMAX_LOCK_ONLY:
+            notes["multi_lock_only"] = notes.get("multi_lock_only", 0) + 1
+            return True                   # every member is a locker
+        if status.multi is None:
+            raise SystemExit(
+                "block %d lp %d has a MultiXact xmax but no pg_multixact "
+                "evidence was supplied" % (t.block, t.lp))
+        u = status.multi.updater(t.xmax)
+        if u is None:
+            notes["multi_lock_only"] = notes.get("multi_lock_only", 0) + 1
+            return True                   # defensive: no update member after all
+        notes["multi_updater"] = notes.get("multi_updater", 0) + 1
+        if status(u) != "committed":
+            return True                   # the updater aborted or is running
+        if snap.in_progress(u, status):
+            notes["multi_updater_snapshot"] = \
+                notes.get("multi_updater_snapshot", 0) + 1
+            return True                   # updater finished after the snapshot
+        return False
+
     if xmax_is_locked_only(t.infomask):
+        notes["lock_only"] += 1           # a row lock, not a deletion
         # SELECT ... FOR UPDATE / FOR SHARE / FOR KEY SHARE puts the locker's
         # xid in xmax.  The row is still live no matter what the commit log
         # says about that transaction, and PostgreSQL only stamps
@@ -499,8 +607,12 @@ def load_schema(path: Path):
     return js, attrs, snap
 
 
-def load_transaction_log(clog_dir: Path, subtrans_dir: Path) -> TransactionLog:
-    return TransactionLog(clog_dir, subtrans_dir)
+def load_transaction_log(clog_dir: Path, subtrans_dir: Path,
+                         multixact_dir: Path = None) -> TransactionLog:
+    log = TransactionLog(clog_dir, subtrans_dir)
+    if multixact_dir is not None:
+        log.multi = MultiXactLog(Path(multixact_dir))
+    return log
 
 
 def _chain_depth(log: "TransactionLog", xid: int) -> int:
@@ -528,13 +640,16 @@ def main(argv=None) -> int:
     ap.add_argument("--heap", default="/app/heap_pages.bin")
     ap.add_argument("--pg-xact", dest="pg_xact", default="/app/pg_xact")
     ap.add_argument("--pg-subtrans", dest="pg_subtrans", default="/app/pg_subtrans")
+    ap.add_argument("--pg-multixact", dest="pg_multixact",
+                    default="/app/pg_multixact")
     ap.add_argument("--schema", default="/app/table_schema.json")
     ap.add_argument("--out", default="/app/recovered.csv")
     ap.add_argument("--report", action="store_true")
     args = ap.parse_args(argv)
 
     js, attrs, snap = load_schema(Path(args.schema))
-    status = load_transaction_log(Path(args.pg_xact), Path(args.pg_subtrans))
+    status = load_transaction_log(Path(args.pg_xact), Path(args.pg_subtrans),
+                                  Path(args.pg_multixact))
     heap = Path(args.heap).read_bytes()
 
     if len(heap) % 8192:
@@ -600,6 +715,17 @@ def main(argv=None) -> int:
                                                   for k in status.subtrans),
             "subtransaction_xids_resolved": len(status.resolved_subxids),
             "subtransaction_parent_lookups": status.subtrans_lookups,
+            "multixact_offsets_segments": sorted(
+                "%04X" % k for k in status.multi.offsets),
+            "multixact_members_segments": sorted(
+                "%04X" % k for k in status.multi.member_segs),
+            "multixacts_resolved": sorted(status.multi.resolved),
+            "tuples_with_multixact_xmax": notes.get("multixact", 0),
+            "multixact_lock_only_tuples": notes.get("multi_lock_only", 0),
+            "multixact_updater_tuples": notes.get("multi_updater", 0),
+            "multixact_updater_saved_by_snapshot":
+                notes.get("multi_updater_snapshot", 0),
+            "frozen_tuples_seen_in_notes": notes.get("frozen", 0),
             "deepest_subtransaction_chain": max(
                 [_chain_depth(status, x) for x in status.resolved_subxids] or [0]),
             "keys_whose_visible_version_is_not_the_newest_xmin": newest_xmin_wrong,

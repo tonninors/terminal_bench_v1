@@ -16,6 +16,7 @@ COPY artifacts/table_schema.json /app/table_schema.json
 # under their real directory names.
 COPY artifacts/pg_xact/          /app/pg_xact/
 COPY artifacts/pg_subtrans/      /app/pg_subtrans/
+COPY artifacts/pg_multixact/     /app/pg_multixact/
 
 # /app holds exactly what the prompt names - nothing else, and no duplicate
 # copies, so what the solver sees matches the prompt one for one.

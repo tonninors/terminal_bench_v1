@@ -1,4 +1,4 @@
-# Version history — v1, v2, v3
+# Version history — v1 through v4
 
 Internal document. Not part of the solver-facing bundle.
 
@@ -11,6 +11,56 @@ semantics has to be integrated before the answer comes out right.
 **The task did not get bigger in any way that matters.** The relation grew from
 4 blocks to 6 (32 KiB → 48 KiB) and from 210 to 265 visible rows. That is a
 1.3× change in size against the difficulty changes tabulated below.
+
+---
+
+## v4 — MultiXact and frozen tuples
+
+v3 was solved as well. v4 adds the two mechanisms every earlier version
+conditionally excluded, both now fully implemented and tested, and both chosen
+because they break the *shape* of a v3-style solver rather than its parameters.
+
+**MultiXact** is the centrepiece. `HEAP_XMAX_IS_MULTI` flips the meaning of the
+`t_xmax` field: it holds a MultiXactId that resolves through two more raw SLRU
+areas (`pg_multixact/offsets`, `pg_multixact/members` — a third distinct
+geometry), whose members carry per-member lock/update status; only the
+at-most-one updater can kill the tuple, and its fate re-enters `pg_xact`,
+`pg_subtrans` and the snapshot. The on-page mxids are 3–14 and collide
+numerically with committed bootstrap xids (mxids 1–2 are deliberately burned on
+an uncaptured table, because misread as xids those are special-cased rather
+than committed), so a solver that never tests the bit silently deletes 56 keys.
+
+**Frozen tuples**: the base population is frozen with `VACUUM (FREEZE)` before
+the history runs — `HEAP_XMIN_FROZEN` is both hint bits with the raw xmin
+preserved. Testing `XMIN_INVALID` before the combined mask loses 279 keys;
+"frozen means visible, stop" skips the xmax and resurrects 143.
+
+| | v3 | v4 |
+| --- | --- | --- |
+| solver inputs | 4 files | **6 files** (+ `pg_multixact/offsets/0000`, `members/0000`) |
+| visible rows | 353 | **429** |
+| blocks / physical tuples | 8 / 725 | **9 / 855** |
+| tuples with MultiXact xmax | 0 | **67** (12 multis, flags keysh/sh/fornokeyupd/nokeyupd) |
+| — locker-only / with updater | – | **18 / 49** |
+| — updater is a subtransaction | – | **23** |
+| — updater decided by the snapshot | – | **28** |
+| frozen / frozen-then-modified tuples | 0 | **422 / 411** |
+| wrong strategies measured | 14 | **24**, all ≥ 11 keys off |
+
+The deepest cascade keys chain seven pieces of state: churned `LP_REDIRECT`
+root → heap-only survivor → `IS_MULTI` xmax → offsets → members → flags →
+subxid updater → `pg_subtrans` topmost → `snapshot_xip`.
+
+New wrong strategies, measured (keys off): multi-as-xid **56**, multi-always-
+lock **11**, any-committed-member-kills **52**, highest-member-as-updater
+**14**, updater-without-subtrans **30**, updater-ignores-snapshot **28**,
+offset-0 shift **22**, range-until-zero **18**, INVALID-before-FROZEN **279**,
+frozen-always-visible **143**.
+
+`FINAL_PROMPT.txt` changed only in the sentences naming the transaction-state
+inputs (adding `/app/pg_multixact/` and one line saying it resolves xmax values
+that name a set of transactions). Goal, output and CSV contract are unchanged;
+"no TOAST data is required" still holds verbatim.
 
 ---
 

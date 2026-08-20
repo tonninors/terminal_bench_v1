@@ -24,6 +24,7 @@ VERIFIER = TASK / "tests" / "test_outputs.py"
 STD = ["--heap", str(ART / "heap_pages.bin"),
        "--pg-xact", str(ART / "pg_xact"),
        "--pg-subtrans", str(ART / "pg_subtrans"),
+       "--pg-multixact", str(ART / "pg_multixact"),
        "--schema", str(ART / "table_schema.json")]
 
 
@@ -112,6 +113,7 @@ def test_solution_sh_matches_the_oracle_and_passes(tmp_path):
                            "HEAP_PAGES": str(ART / "heap_pages.bin"),
                            "PG_XACT": str(ART / "pg_xact"),
                            "PG_SUBTRANS": str(ART / "pg_subtrans"),
+                           "PG_MULTIXACT": str(ART / "pg_multixact"),
                            "TABLE_SCHEMA": str(ART / "table_schema.json"),
                            "RECOVERED_CSV": str(out)}))
     assert r.returncode == 0, r.stdout + r.stderr
@@ -167,6 +169,27 @@ NEGATIVES = [
      {"test_content_digest", "test_no_missing_primary_key",
       "test_no_unexpected_primary_key"}),
     ("12-subxact-inherits-parent", "negative_q_subxact_inherits_parent.py", STD,
+     {"test_no_duplicate_primary_keys", "test_content_digest"}),
+    ("13-multi-xmax-as-plain-xid", "negative_r_multi_as_xid.py", STD,
+     {"test_no_missing_primary_key", "test_content_digest"}),
+    ("14-multi-always-lock-only", "negative_s_multi_always_lock.py", STD,
+     {"test_no_duplicate_primary_keys", "test_content_digest"}),
+    ("15-any-committed-member-kills", "negative_t_any_member_kills.py", STD,
+     {"test_no_missing_primary_key", "test_content_digest"}),
+    ("16-highest-member-as-updater", "negative_t2_highest_member_updates.py", STD,
+     {"test_no_missing_primary_key", "test_content_digest"}),
+    ("17-multi-updater-no-subtrans", "negative_u_updater_no_subtrans.py", STD,
+     {"test_no_missing_primary_key", "test_content_digest"}),
+    ("18-multi-updater-no-snapshot", "negative_v_updater_ignore_snapshot.py", STD,
+     {"test_no_missing_primary_key", "test_content_digest"}),
+    ("19-member-offset-off-by-one", "negative_w_offset_off_by_one.py", STD,
+     {"test_no_missing_primary_key", "test_no_duplicate_primary_keys",
+      "test_content_digest"}),
+    ("20-member-range-until-zero", "negative_x_range_until_zero.py", STD,
+     {"test_no_missing_primary_key", "test_content_digest"}),
+    ("21-invalid-before-frozen", "negative_y_invalid_before_frozen.py", STD,
+     {"test_no_missing_primary_key", "test_content_digest"}),
+    ("22-frozen-always-visible", "negative_z_frozen_always_visible.py", STD,
      {"test_no_duplicate_primary_keys", "test_content_digest"}),
 ]
 

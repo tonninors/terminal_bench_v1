@@ -16,7 +16,8 @@ TEMPLATE = """#!/bin/bash
 # Oracle solution for the postgres-mvcc-heap-recovery task.
 #
 # Reconstructs the MVCC-visible rows using only the solver-visible inputs: the
-# raw heap blocks, the cluster's pg_xact and pg_subtrans segments, and the
+# raw heap blocks, the cluster's pg_xact, pg_subtrans and pg_multixact
+# segments, and the
 # schema/snapshot file.
 # No hidden expected answer is consulted and no recovered row is hard-coded.
 #
@@ -27,6 +28,7 @@ set -euo pipefail
 HEAP_PAGES=${HEAP_PAGES:-/app/heap_pages.bin}
 PG_XACT=${PG_XACT:-/app/pg_xact}
 PG_SUBTRANS=${PG_SUBTRANS:-/app/pg_subtrans}
+PG_MULTIXACT=${PG_MULTIXACT:-/app/pg_multixact}
 TABLE_SCHEMA=${TABLE_SCHEMA:-/app/table_schema.json}
 RECOVERED_CSV=${RECOVERED_CSV:-/app/recovered.csv}
 
@@ -38,8 +40,8 @@ cat > "$PROG" <<'@MARKER@'
 @MARKER@
 
 python3 "$PROG" --heap "$HEAP_PAGES" --pg-xact "$PG_XACT" \\
-                --pg-subtrans "$PG_SUBTRANS" --schema "$TABLE_SCHEMA" \\
-                --out "$RECOVERED_CSV" --report
+                --pg-subtrans "$PG_SUBTRANS" --pg-multixact "$PG_MULTIXACT" \\
+                --schema "$TABLE_SCHEMA" --out "$RECOVERED_CSV" --report
 """
 
 

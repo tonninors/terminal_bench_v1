@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the PostgreSQL 16 MVCC heap fixture (v3).
+"""Build the PostgreSQL 16 MVCC heap fixture (v4).
 
 Runs INSIDE a postgres:16 container, as the `postgres` OS user, and drives a
 real server through a scripted history of committed, aborted and still-running
@@ -36,10 +36,31 @@ transaction carries a subxid that is marked COMMITTED in pg_xact and is absent
 from snapshot_xip, and only pg_subtrans reveals that its topmost parent was in
 flight when the snapshot was taken.
 
+v4 adds the two mechanisms the earlier versions conditionally excluded, both
+now fully implemented and tested:
+
+  * **MultiXact xmax.**  When several transactions lock one row, or a locker and
+    an updater coexist, t_xmax stops holding a transaction id and holds a
+    MultiXactId (HEAP_XMAX_IS_MULTI).  The mxid resolves through two more SLRU
+    areas - pg_multixact/offsets and pg_multixact/members - whose members carry
+    per-member lock/update status; only an updater member can kill the tuple,
+    and its fate re-enters pg_xact, pg_subtrans and the snapshot.  In a fresh
+    cluster the mxids are tiny integers that collide numerically with committed
+    bootstrap xids, so a solver that never checks the IS_MULTI bit silently
+    deletes live rows.
+  * **Frozen tuples.**  The base population is frozen with VACUUM (FREEZE)
+    before any of the interesting history runs, so HEAP_XMIN_FROZEN (both hint
+    bits) is set on every original row while the raw xmin is preserved.  Rows
+    modified later carry a frozen xmin *and* a live xmax, so neither
+    "XMIN_INVALID means aborted" (tested before the frozen mask) nor "frozen
+    means visible, stop" survives.
+
 Outputs (into --outdir):
     heap_pages.bin              solver input  - raw 8192-byte blocks, in order
     pg_xact/NNNN                solver input  - the cluster's commit log, verbatim
     pg_subtrans/NNNN            solver input  - the subtransaction parent map
+    pg_multixact/offsets/NNNN   solver input  - MultiXact id -> first member index
+    pg_multixact/members/NNNN   solver input  - member xids + lock/update flags
     table_schema.json           solver input  - columns, PK, target snapshot
     internal/golden.csv         hidden reference, produced by PostgreSQL
     internal/generation_report.json
@@ -92,6 +113,17 @@ SUBTRANS_XACTS_PER_PAGE = BLCKSZ // 4                       # 2048
 XACT_IN_PROGRESS, XACT_COMMITTED, XACT_ABORTED, XACT_SUB_COMMITTED = 0, 1, 2, 3
 CLOG_NAMES = {0: "in progress", 1: "committed", 2: "aborted",
               3: "sub committed"}
+
+# MultiXact SLRU geometry (src/backend/access/transam/multixact.c, PG 16)
+MULTIXACT_OFFSETS_PER_PAGE = BLCKSZ // 4                    # 2048
+MULTIXACT_MEMBERS_PER_GROUP = 4
+MULTIXACT_MEMBERGROUP_SIZE = 4 + 4 * 4                      # 4 flag bytes + 4 xids
+MULTIXACT_GROUPS_PER_PAGE = BLCKSZ // MULTIXACT_MEMBERGROUP_SIZE   # 409
+MULTIXACT_MEMBERS_PER_PAGE = MULTIXACT_GROUPS_PER_PAGE * MULTIXACT_MEMBERS_PER_GROUP
+# member status values (MultiXactStatus): 0-3 are lockers, 4-5 are updaters
+MXS_NAMES = {0: "keysh", 1: "sh", 2: "fornokeyupd", 3: "forupd",
+             4: "nokeyupd", 5: "upd"}
+MXS_IS_UPDATE = (4, 5)
 
 COLUMNS = [
     ("account_id", "integer", False),
@@ -158,6 +190,12 @@ A_CHURN_LONG = IDS.take("A_churn_long", 6)     # churn, then extended after the 
 # so pruning retires them as LP_DEAD rather than LP_UNUSED
 A_NONHOT_PRUNED = IDS.take("A_nonhot_pruned", 8)
 A_DEL_PRUNED = IDS.take("A_del_pruned", 6)
+# churned pre-horizon like A_CHURN, then hit by a MultiXact whose updater is a
+# subtransaction of an xip-listed writer: the cascade keys.  Their visible
+# version sits behind an LP_REDIRECT, is heap-only, and carries an IS_MULTI xmax
+# whose verdict routes through offsets -> members -> flags -> pg_subtrans ->
+# snapshot_xip.
+A_CASCADE = IDS.take("A_cascade", 8)
 
 # --- phase B: committed work, still before any writer opens ------------------
 B_UPD_COMMIT = IDS.take("B_upd_commit", 8)     # one committed non-HOT update
@@ -190,6 +228,28 @@ D_HOT_CHAIN = IDS.take("D_hot_chain", 8)       # three post-snapshot HOT rounds
 D_POST_UPD_ABORT = IDS.take("D_post_upd_abort", 6)
 D_POST_DEL_ABORT = IDS.take("D_post_del_abort", 6)
 D_POST_LOCK = IDS.take("D_post_lock", 5)
+
+# --- MultiXact groups.  All locking runs after the horizon holder opens, so no
+# --- later prune stamps HEAP_XMAX_INVALID over a resolved multi.
+M_LOCKONLY_SH = IDS.take("M_lockonly_share_share", 5)     # two SHARE lockers
+M_LOCKONLY_MIX = IDS.take("M_lockonly_keysh_share", 5)    # KEY SHARE + SHARE
+M_LOCKONLY_NKU = IDS.take("M_lockonly_keysh_nku", 4)      # KEY SHARE + FOR NO KEY UPDATE
+M_LOCKONLY_IP = IDS.take("M_lockonly_in_progress", 4)     # one member never finishes
+M_UPD_COMMIT = IDS.take("M_upd_committed", 6)     # updater commits pre-snapshot -> dead
+M_UPD_ABORT = IDS.take("M_upd_aborted", 5)        # updater rolls back -> alive
+M_UPD_IP = IDS.take("M_upd_in_progress", 5)       # updater never finishes -> alive
+M_UPD_SUBC = IDS.take("M_upd_sub_committed", 5)   # updater is a released savepoint
+M_UPD_XIP = IDS.take("M_upd_xip", 6)              # updater commits after the snapshot
+M_UPD_SUBXIP = IDS.take("M_upd_subxip", 10)       # updater = savepoint of an xip writer
+M_POST = IDS.take("M_post_snapshot", 4)           # whole multi after the snapshot
+M_SENTINEL = IDS.take("M_sentinel", 1)            # trailing multi; bounds the last range
+
+# --- frozen-then-modified groups (the base population is frozen wholesale, so
+# --- every later update already yields frozen-xmin + xmax; these make the
+# --- deliberate cases explicit and countable)
+F_FRZ_DEL = IDS.take("F_frozen_deleted", 5)       # frozen root, committed delete
+F_FRZ_DEL_ABORT = IDS.take("F_frozen_del_aborted", 4)
+F_FRZ_LOCK = IDS.take("F_frozen_locked", 4)       # frozen root, single-xid row lock
 
 # --- subtransactions -------------------------------------------------------
 # committed parent, one savepoint rolled back and one released.  The rolled-back
@@ -304,6 +364,48 @@ def subtrans_parent(segments, xid):
     return int.from_bytes(data[off:off + 4], "little")
 
 
+def multixact_offset(segments, mxid):
+    pageno = mxid // MULTIXACT_OFFSETS_PER_PAGE
+    name, page = "%04X" % (pageno // SLRU_PAGES_PER_SEGMENT), \
+        pageno % SLRU_PAGES_PER_SEGMENT
+    data = segments.get(name)
+    if data is None:
+        raise SystemExit("pg_multixact/offsets segment %s missing for mxid %d"
+                         % (name, mxid))
+    off = page * BLCKSZ + (mxid % MULTIXACT_OFFSETS_PER_PAGE) * 4
+    return int.from_bytes(data[off:off + 4], "little")
+
+
+def multixact_members(off_segments, mem_segments, mxid):
+    """[(xid, status)] for one multi, from the raw segment bytes.
+
+    Member offset 0 is reserved so that a zero entry can mean 'not written';
+    the end of mxid's member list is the next multi's start, which is why the
+    generator creates a trailing sentinel multi."""
+    start = multixact_offset(off_segments, mxid)
+    end = multixact_offset(off_segments, mxid + 1)
+    if start == 0:
+        raise SystemExit("offsets[%d] is zero; not a created multi" % mxid)
+    if end == 0 or end < start:
+        raise SystemExit("offsets[%d]=%d cannot bound the members of multi %d; "
+                         "the sentinel multi is missing" % (mxid + 1, end, mxid))
+    out = []
+    for i in range(start, end):
+        pageno, within = divmod(i, MULTIXACT_MEMBERS_PER_PAGE)
+        name = "%04X" % (pageno // SLRU_PAGES_PER_SEGMENT)
+        page = pageno % SLRU_PAGES_PER_SEGMENT
+        data = mem_segments.get(name)
+        if data is None:
+            raise SystemExit("pg_multixact/members segment %s missing" % name)
+        group, idx = divmod(within, MULTIXACT_MEMBERS_PER_GROUP)
+        base = page * BLCKSZ + group * MULTIXACT_MEMBERGROUP_SIZE
+        flag = data[base + idx]
+        xid = int.from_bytes(data[base + 4 + idx * 4:base + 8 + idx * 4],
+                             "little")
+        out.append((xid, flag))
+    return out
+
+
 def subtrans_topmost(segments, xid):
     seen = set()
     while True:
@@ -374,6 +476,9 @@ def one_shot(label, body, commit):
 # ---------------------------------------------------------------- the history
 def build(outdir):
     xids = {}
+    # sessions that must stay open across the snapshot / capture; phase B's
+    # multi groups and phase C's writers both register here
+    writers = {}
     # subxid -> the top-level transaction it belongs to.  Used only to verify the
     # captured pg_subtrans segment; never shipped.  The *immediate* parent is
     # PostgreSQL's business: ROLLBACK TO SAVEPOINT re-enters a fresh
@@ -407,13 +512,19 @@ def build(outdir):
             s.run(ins, base_row(i))
     xids["A_base_insert"] = one_shot("base-insert", _base, True)
 
+    # Freeze the whole base population.  VACUUM (FREEZE) sets HEAP_XMIN_FROZEN
+    # (both hint bits) on every tuple while PRESERVING the raw xmin, so from
+    # here on every original row is a frozen tuple, and every row a later phase
+    # updates or deletes becomes a frozen-xmin-plus-live-xmax case.
+    acur.execute("VACUUM (FREEZE) " + QUALIFIED)
+
     # HOT churn with a scan between rounds, so pruning really runs and leaves
     # LP_REDIRECT roots and LP_DEAD slots behind.  Nothing holds the horizon
     # back yet, which is exactly why these chains collapse.
     churn = []
     for rnd in range(22):
         def _hot(s, rnd=rnd):
-            for i in A_CHURN + A_CHURN_LONG:
+            for i in A_CHURN + A_CHURN_LONG + A_CASCADE:
                 s.run(upd + "balance_cents = balance_cents + %s, owner_note = %s "
                       "WHERE account_id = %s", (rnd + 1, "churn " + str(rnd), i))
         churn.append(one_shot("churn-" + str(rnd), _hot, True))
@@ -421,13 +532,20 @@ def build(outdir):
     xids["A_churn_rounds"] = churn
 
     def _churn_final(s):
-        for i in A_CHURN + A_CHURN_LONG:
+        for i in A_CHURN + A_CHURN_LONG + A_CASCADE:
             s.run(upd + "balance_cents = %s, owner_note = %s, risk_tier = %s "
                   "WHERE account_id = %s",
                   (250000 + i, None if i % 2 else "settled " + str(i),
                    (i % 4) + 1, i))
     xids["A_churn_final"] = one_shot("churn-final", _churn_final, True)
     acur.execute("SELECT count(*) FROM " + QUALIFIED)
+
+    # A plain VACUUM while the horizon is still current: the dead intermediate
+    # churn versions and their LP_DEAD slots are reclaimed to LP_UNUSED, while
+    # the live chains keep their LP_REDIRECT roots.  The A_NONHOT_PRUNED /
+    # A_DEL_PRUNED work below then recreates LP_DEAD, so all four line-pointer
+    # states appear in the captured file.
+    acur.execute("VACUUM " + QUALIFIED)
 
     # A non-HOT update (it changes the indexed column) and a delete, both
     # committed while the horizon is still current.  Their old versions are root
@@ -628,8 +746,125 @@ def build(outdir):
     xids["B_subxact_parent"] = one_shot("b-subxact", _sub_mixed, True)
     xids["B_subxact_children"] = b_sub
 
+    # ---- frozen roots explicitly deleted / almost-deleted / locked ----------
+    def _frz_del(s):
+        s.run(dele, (F_FRZ_DEL,))
+    xids["B_frozen_delete"] = one_shot("b-frz-del", _frz_del, True)
+
+    def _frz_del_abort(s):
+        s.run(dele, (F_FRZ_DEL_ABORT,))
+    xids["B_frozen_delete_aborted"] = one_shot("b-frz-del-abort", _frz_del_abort,
+                                               False)
+
+    def _frz_lock(s):
+        do_lock(s, F_FRZ_LOCK, "FOR UPDATE")
+    xids["B_frozen_lock"] = one_shot("b-frz-lock", _frz_lock, True)
+
+    # ================= MultiXact phase (pre-snapshot groups) =================
+    # Burn the first two MultiXactIds on the (uncaptured) probe table, so every
+    # multi the captured pages reference is numerically >= 3.  Misread as plain
+    # transaction ids those decode as committed bootstrap xids in the shipped
+    # commit log - which is what arms the IS_MULTI trap.  Xids 1 and 2
+    # (Bootstrap/Frozen) are special-cased by PostgreSQL and read as
+    # "in progress" from the raw bits, so multis 1 and 2 must not reach the
+    # heap pages.
+    def _probe_multi():
+        ba, bb = Session("mx-burn-a"), Session("mx-burn-b")
+        for b in (ba, bb):
+            b.run("SELECT marker FROM public.subxid_probe "
+                  "WHERE marker = 999 FOR SHARE")
+            b.cur.fetchall()
+        ba.commit(); ba.close()
+        bb.commit(); bb.close()
+
+    def _probe_row(s):
+        s.run("INSERT INTO public.subxid_probe VALUES (999)")
+    one_shot("mx-burn-row", _probe_row, True)
+    _probe_multi()
+    _probe_multi()
+
+    # Every case uses compatible lock modes, so the strictly sequenced sessions
+    # never block and generation stays deterministic.  A multi is created the
+    # moment a second transaction locks (or a locker's row is updated by) a row
+    # whose xmax already names a live locker.
+    def multi_lockers(ids, mode_a, mode_b, commit_a=True, commit_b=True):
+        """Two lockers on the same rows -> a locker-only multi."""
+        la, lb = Session("mx-lock-a"), Session("mx-lock-b")
+        do_lock(la, ids, mode_a)
+        do_lock(lb, ids, mode_b)
+        xa, xb = la.xid(), lb.xid()
+        if commit_a:
+            la.commit(); la.close()
+        if commit_b:
+            lb.commit(); lb.close()
+        return (xa, la if not commit_a else None), (xb, lb if not commit_b else None)
+
+    (x, _), (y, _) = multi_lockers(M_LOCKONLY_SH, "FOR SHARE", "FOR SHARE")
+    xids["M_lockonly_share_share"] = [x, y]
+
+    (x, _), (y, _) = multi_lockers(M_LOCKONLY_MIX, "FOR KEY SHARE", "FOR SHARE")
+    xids["M_lockonly_keysh_share"] = [x, y]
+
+    (x, _), (y, _) = multi_lockers(M_LOCKONLY_NKU, "FOR KEY SHARE",
+                                   "FOR NO KEY UPDATE")
+    xids["M_lockonly_keysh_nku"] = [x, y]
+
+    # one member never finishes: its xid stays IN_PROGRESS in pg_xact
+    (x, _), (y, open_locker) = multi_lockers(M_LOCKONLY_IP, "FOR SHARE",
+                                             "FOR SHARE", commit_b=False)
+    xids["M_lockonly_in_progress"] = [x, y]
+    writers["mx_locker_never_finishes"] = open_locker
+    xids["C_writer_mx_locker_never_finishes"] = y
+
+    def multi_with_updater(ids, values, fate):
+        """KEY SHARE locker + a non-key updater -> multi {keysh, nokeyupd}.
+
+        fate: 'commit' | 'abort' | 'hold' (leave the updater session open).
+        Returns (locker_xid, updater_xid, updater_session_or_None)."""
+        lk, up = Session("mx-locker"), Session("mx-updater")
+        do_lock(lk, ids, "FOR KEY SHARE")
+        up.run(upd + "balance_cents = %s, owner_note = %s "
+               "WHERE account_id = ANY(%s)", (values[0], values[1], ids))
+        ux = up.xid()
+        if fate == "commit":
+            up.commit(); up.close(); up = None
+        elif fate == "abort":
+            up.rollback(); up.close(); up = None
+        lx = lk.commit()
+        lk.close()
+        return lx, ux, up
+
+    lx, ux, _ = multi_with_updater(M_UPD_COMMIT, (700100, "multi updater kept"),
+                                   "commit")
+    xids["M_upd_committed"] = {"locker": lx, "updater": ux}
+
+    lx, ux, _ = multi_with_updater(M_UPD_ABORT, (-604, "multi updater dropped"),
+                                   "abort")
+    xids["M_upd_aborted"] = {"locker": lx, "updater": ux}
+
+    lx, ux, up = multi_with_updater(M_UPD_IP, (-605, "multi updater in flight"),
+                                    "hold")
+    xids["M_upd_in_progress"] = {"locker": lx, "updater": ux}
+    writers["mx_updater_never_finishes"] = up
+    xids["C_writer_mx_updater_never_finishes"] = ux
+
+    # updater inside a released savepoint that commits pre-snapshot: the update
+    # member is a subxid whose own clog entry is COMMITTED
+    lk = Session("mx-locker-subc")
+    do_lock(lk, M_UPD_SUBC, "FOR KEY SHARE")
+    up = Session("mx-updater-subc")
+    up.run("SAVEPOINT m1")
+    up.run(upd + "balance_cents = %s, owner_note = %s WHERE account_id = ANY(%s)",
+           (700200, "savepoint updater kept", M_UPD_SUBC))
+    subc_upd = up.subxid()
+    sub_tops[subc_upd] = up.xid()
+    up.run("RELEASE SAVEPOINT m1")
+    up_top = up.commit()
+    up.close()
+    lk.commit(); lk.close()
+    xids["M_upd_sub_committed"] = {"updater_subxid": subc_upd, "parent": up_top}
+
     # ================= phase C: writers interleaved with committed work ======
-    writers = {}
 
     def open_writer(name, body):
         s = Session(name)
@@ -770,6 +1005,46 @@ def build(outdir):
     open_writer("w11_subxact_never_finishes", _w11)
     xids["C_w11_subxids"] = w11
 
+    # ---- multi whose updater commits AFTER the snapshot ---------------------
+    # The locker commits pre-snapshot; the updater stays open across it and is
+    # therefore listed in snapshot_xip.  Its clog entry will read COMMITTED at
+    # capture, so only the snapshot keeps these rows alive.
+    lk = Session("mx-locker-xip")
+    do_lock(lk, M_UPD_XIP, "FOR KEY SHARE")
+
+    def _w12(s):
+        s.run(upd + "balance_cents = %s, owner_note = %s "
+              "WHERE account_id = ANY(%s)", (-701, "xip multi updater", M_UPD_XIP))
+    open_writer("w12_multi_updater_commits_later", _w12)
+    lk.commit(); lk.close()
+
+    # ---- multi whose updater is a SAVEPOINT of an xip writer ----------------
+    # The deepest chain in the fixture: IS_MULTI -> offsets -> members -> the
+    # nokeyupd member is a subxid -> pg_subtrans -> topmost parent -> xip.
+    # The same writer also updates the churned cascade keys from a second,
+    # nested savepoint, so the cascade rows add HOT/LP_REDIRECT on top.
+    lk = Session("mx-locker-subxip")
+    do_lock(lk, list(M_UPD_SUBXIP) + list(A_CASCADE), "FOR KEY SHARE")
+    w13 = {}
+
+    def _w13(s):
+        w13["top"] = s.subxid()          # assigns the top-level xid
+        s.run("SAVEPOINT mx1")
+        s.run(upd + "balance_cents = %s, owner_note = %s "
+              "WHERE account_id = ANY(%s)",
+              (-702, "subxip multi updater", M_UPD_SUBXIP))
+        w13["mx1"] = s.subxid()
+        sub_tops[w13["mx1"]] = w13["top"]
+        s.run("SAVEPOINT mx2")
+        s.run(upd + "balance_cents = %s, owner_note = %s "
+              "WHERE account_id = ANY(%s)",
+              (-703, "cascade multi updater", A_CASCADE))
+        w13["mx2"] = s.subxid()
+        sub_tops[w13["mx2"]] = w13["top"]
+    open_writer("w13_subxip_multi_updater", _w13)
+    xids["C_w13_subxids"] = w13
+    lk.commit(); lk.close()
+
     # the last completed transaction before the snapshot: this is what lifts
     # snapshot_xmax above every running writer, so all of them land in xip
     committed_between("upd_4", lambda s: s.run(
@@ -830,6 +1105,19 @@ def build(outdir):
         do_lock(s, D_POST_LOCK, "FOR UPDATE")
     xids["D_post_lock"] = one_shot("d-post-lock", _post_lock, True)
 
+    # a whole locker+updater multi created and committed AFTER the snapshot:
+    # both members commit, but the updater sits at/above snapshot_xmax, so the
+    # old version stays visible
+    lk = Session("mx-locker-post")
+    do_lock(lk, M_POST, "FOR KEY SHARE")
+    up = Session("mx-updater-post")
+    up.run(upd + "balance_cents = %s, owner_note = %s WHERE account_id = ANY(%s)",
+           (990000, "post-snapshot multi updater", M_POST))
+    post_upd_xid = up.commit()
+    up.close()
+    lk.commit(); lk.close()
+    xids["M_post_snapshot"] = {"updater": post_upd_xid}
+
     # a savepoint rolled back inside a transaction that commits after the
     # snapshot: an ABORTED child under a COMMITTED-but-invisible parent
     d_sub = {}
@@ -853,13 +1141,23 @@ def build(outdir):
     # ================= writers finish, after the snapshot ====================
     for name in ("w1_upd_commits_later", "w2_del_commits_later",
                  "w3_ins_commits_later", "w4_lock_commits_later",
-                 "w10_nested_subxacts_commit_later"):
+                 "w10_nested_subxacts_commit_later",
+                 "w12_multi_updater_commits_later",
+                 "w13_subxip_multi_updater"):
         writers[name].commit()
         writers[name].close()
         del writers[name]
     writers["w5_upd_aborts_later"].rollback()
     writers["w5_upd_aborts_later"].close()
     del writers["w5_upd_aborts_later"]
+
+    # ================= the trailing sentinel multi ===========================
+    # pg_multixact/offsets bounds multi M's member list with offsets[M+1], and
+    # the very last multi's end lives only in pg_control (which is not shipped).
+    # One final locker-only multi on the uncaptured probe table guarantees that
+    # offsets[M+1] is on disk for every multi the pages reference, without
+    # putting the sentinel itself onto the pages.
+    _probe_multi()
 
     # ================= flush and capture the relation file verbatim ==========
     acur.execute("CHECKPOINT")
@@ -901,12 +1199,8 @@ def build(outdir):
     problems = []
     for it in normals:
         m, m2 = it["t_infomask"], it["t_infomask2"]
-        if m & HEAP_XMAX_IS_MULTI:
-            problems.append(("multixact", it))
-        if (m & HEAP_XMIN_FROZEN) == HEAP_XMIN_FROZEN:
-            problems.append(("frozen", it))
         if it["t_xmin"] == FROZEN_XID:
-            problems.append(("frozen-xid", it))
+            problems.append(("frozen-xid-rewritten", it))
         if m & HEAP_COMBOCID:
             problems.append(("combocid", it))
         if m & HEAP_HASEXTERNAL:
@@ -942,7 +1236,8 @@ def build(outdir):
     # already flushed both (CheckPointCLOG / CheckPointSUBTRANS), so what is on
     # disk is what the server would read back.
     slru = {}
-    for area in ("pg_xact", "pg_subtrans"):
+    for area in ("pg_xact", "pg_subtrans", "pg_multixact/offsets",
+                 "pg_multixact/members"):
         srcdir = Path(datadir, area)
         slru[area] = {}
         for f in sorted(srcdir.iterdir()):
@@ -955,9 +1250,53 @@ def build(outdir):
                 raise SystemExit("%s/%s is %d bytes, not a multiple of %d"
                                  % (area, name, len(blob), BLCKSZ))
 
+    # ================= resolve the MultiXacts the pages reference ============
+    multi_tuples = [it for it in normals
+                    if it["t_xmax"] and it["t_infomask"] & HEAP_XMAX_IS_MULTI]
+    multis_used = sorted({it["t_xmax"] for it in multi_tuples})
+    if len(multi_tuples) < 40:
+        raise SystemExit("only %d tuple(s) carry a MultiXact xmax"
+                         % len(multi_tuples))
+
+    multi_members = {}
+    for m in multis_used:
+        multi_members[m] = multixact_members(slru["pg_multixact/offsets"],
+                                             slru["pg_multixact/members"], m)
+        ups = [x for x, f in multi_members[m] if f in MXS_IS_UPDATE]
+        if len(ups) > 1:
+            raise SystemExit("multi %d has %d update members" % (m, len(ups)))
+
+    # the raw decode must agree with the server, member for member
+    for m in multis_used:
+        acur.execute("SELECT xid::text, mode "
+                     "FROM pg_get_multixact_members(%s::text::xid)", (str(m),))
+        server = sorted((int(x), mode) for x, mode in acur.fetchall())
+        mine = sorted((x, MXS_NAMES[f]) for x, f in multi_members[m])
+        if server != mine:
+            raise SystemExit("multi %d: raw decode %r != server %r"
+                             % (m, mine, server))
+
+    # the trailing sentinel must bound the last referenced multi's member list
+    if multixact_offset(slru["pg_multixact/offsets"], max(multis_used) + 1) == 0:
+        raise SystemExit("offsets[%d] is zero: the sentinel multi is missing"
+                         % (max(multis_used) + 1))
+
+    # the misread trap must be armed: every mxid on the pages, read as a plain
+    # transaction id, must decode as COMMITTED in the shipped commit log, so a
+    # solver that ignores HEAP_XMAX_IS_MULTI silently deletes live rows instead
+    # of crashing
+    for m in multis_used:
+        if clog_status(slru["pg_xact"], m) != XACT_COMMITTED:
+            raise SystemExit("mxid %d misread as an xid would not decode as "
+                             "committed; the IS_MULTI trap is unarmed" % m)
+
     # ================= transaction states ====================================
+    member_xids = {x for mm in multi_members.values() for x, _f in mm}
     needed = sorted({it["t_xmin"] for it in normals if it["t_xmin"]} |
-                    {it["t_xmax"] for it in normals if it["t_xmax"]})
+                    {it["t_xmax"] for it in normals
+                     if it["t_xmax"]
+                     and not it["t_infomask"] & HEAP_XMAX_IS_MULTI} |
+                    member_xids)
     if any(x >= 2 ** 32 for x in needed):
         raise SystemExit("32-bit xid space overflow")
     status = {}
@@ -1080,6 +1419,8 @@ def build(outdir):
             x = it[role]
             if not x:
                 continue
+            if role == "t_xmax" and it["t_infomask"] & HEAP_XMAX_IS_MULTI:
+                continue
             top = subtrans_topmost(slru["pg_subtrans"], x)
             if (top != x and status.get(x) == "committed"
                     and x not in snap_xip and in_snapshot(top)):
@@ -1112,6 +1453,60 @@ def build(outdir):
         if name.startswith("C_writer_") and x not in snap_xip:
             raise SystemExit("writer %s (xid %d) is not in snapshot_xip %r"
                              % (name, x, snap_xip))
+
+    # --- frozen-tuple trap strength -----------------------------------------
+    frozen_tuples = [it for it in normals
+                     if (it["t_infomask"] & HEAP_XMIN_FROZEN) == HEAP_XMIN_FROZEN]
+    frozen_with_xmax = [it for it in frozen_tuples if it["t_xmax"]]
+    if len(frozen_tuples) < 30:
+        raise SystemExit("only %d frozen tuple(s)" % len(frozen_tuples))
+    if len(frozen_with_xmax) < 10:
+        raise SystemExit("only %d frozen tuple(s) carry an xmax; the "
+                         "'frozen means visible, stop' trap is unarmed"
+                         % len(frozen_with_xmax))
+
+    # --- MultiXact trap strength --------------------------------------------
+    def multi_updater_of(m):
+        ups = [x for x, f in multi_members[m] if f in MXS_IS_UPDATE]
+        return ups[0] if ups else None
+
+    lockonly_multi_tuples = [it for it in multi_tuples
+                             if multi_updater_of(it["t_xmax"]) is None]
+    updater_multi_tuples = [it for it in multi_tuples
+                            if multi_updater_of(it["t_xmax"]) is not None]
+    subxid_updater_tuples = [
+        it for it in updater_multi_tuples
+        if subtrans_parent(slru["pg_subtrans"], multi_updater_of(it["t_xmax"]))]
+    snapdep_updater_tuples = [
+        it for it in updater_multi_tuples
+        if status.get(multi_updater_of(it["t_xmax"])) == "committed"
+        and in_snapshot(subtrans_topmost(slru["pg_subtrans"],
+                                         multi_updater_of(it["t_xmax"])))]
+    member_flags_seen = sorted({f for mm in multi_members.values()
+                                for _x, f in mm})
+    member_states_seen = sorted({status.get(x, "?")
+                                 for mm in multi_members.values()
+                                 for x, _f in mm})
+    if len(lockonly_multi_tuples) < 12:
+        raise SystemExit("only %d locker-only multi tuple(s)"
+                         % len(lockonly_multi_tuples))
+    if len(updater_multi_tuples) < 25:
+        raise SystemExit("only %d multi tuple(s) with an update member"
+                         % len(updater_multi_tuples))
+    if len(subxid_updater_tuples) < 15:
+        raise SystemExit("only %d multi tuple(s) whose updater is a "
+                         "subtransaction" % len(subxid_updater_tuples))
+    if len(snapdep_updater_tuples) < 18:
+        raise SystemExit("only %d multi tuple(s) whose updater is committed "
+                         "yet invisible to the snapshot; ignoring the snapshot "
+                         "for update members would barely be punished"
+                         % len(snapdep_updater_tuples))
+    if len(member_flags_seen) < 3:
+        raise SystemExit("only member flags %r appear" % member_flags_seen)
+    if not {"committed", "aborted", "in_progress"} <= {
+            st.replace(" ", "_") for st in member_states_seen}:
+        raise SystemExit("member states %r do not cover committed/aborted/"
+                         "in-progress" % member_states_seen)
 
     # --- the load-bearing lock-only assertion -------------------------------
     # tuples whose xmax names a transaction that both committed AND is visible
@@ -1148,11 +1543,11 @@ def build(outdir):
 
     (outdir / "heap_pages.bin").write_bytes(heap)
 
-    # the two SLRU areas, byte for byte, under their real segment names
-    for area in ("pg_xact", "pg_subtrans"):
+    # the SLRU areas, byte for byte, under their real directory and segment names
+    for area, segments in sorted(slru.items()):
         d = outdir / area
         d.mkdir(parents=True, exist_ok=True)
-        for name, blob in sorted(slru[area].items()):
+        for name, blob in sorted(segments.items()):
             (d / name).write_bytes(blob)
 
     schema = {
@@ -1208,6 +1603,17 @@ def build(outdir):
         "slru_bytes": {area: sum(len(b) for b in slru[area].values())
                        for area in slru},
         "subtransaction_xids_on_pages": subxids_on_pages,
+        "multixact_ids_on_pages": multis_used,
+        "multixact_members": {str(m): [[x, MXS_NAMES[f]] for x, f in mm]
+                              for m, mm in sorted(multi_members.items())},
+        "tuples_with_multixact_xmax": len(multi_tuples),
+        "lockonly_multixact_tuples": len(lockonly_multi_tuples),
+        "updater_multixact_tuples": len(updater_multi_tuples),
+        "subxid_updater_multixact_tuples": len(subxid_updater_tuples),
+        "snapshot_dependent_updater_tuples": len(snapdep_updater_tuples),
+        "multixact_member_flags_seen": member_flags_seen,
+        "frozen_tuples": len(frozen_tuples),
+        "frozen_tuples_with_xmax": len(frozen_with_xmax),
         "subtransaction_parent_entries": len(sub_tops),
         "deepest_subtransaction_chain": max_depth,
         "tuple_stamps_requiring_pg_subtrans": len(decisive),
@@ -1239,8 +1645,8 @@ def build(outdir):
             and it["t_infomask"] & HEAP_XMIN_INVALID),
         "toast_chunks": toast_rows,
         "golden_rows": len(golden),
-        "excluded_cases_present": {"multixact": 0, "frozen": 0, "combocid": 0,
-                                   "toast_external": 0},
+        "excluded_cases_present": {"combocid": 0, "toast_external": 0,
+                                   "frozen_xid_rewritten": 0},
     }
     (internal / "generation_report.json").write_text(
         json.dumps(report, indent=2) + "\n", encoding="utf-8")

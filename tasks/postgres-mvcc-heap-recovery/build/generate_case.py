@@ -30,7 +30,7 @@ INTERNAL = BUILD / "internal"
 CONTAINER = "tb-pg-mvcc-fixture"
 
 SOLVER_FILES = ["heap_pages.bin", "table_schema.json"]
-SOLVER_DIRS = ["pg_xact", "pg_subtrans"]
+SOLVER_DIRS = ["pg_xact", "pg_subtrans", "pg_multixact"]
 INTERNAL_FILES = ["golden.csv", "generation_report.json", "page_items.json"]
 
 
@@ -109,11 +109,12 @@ def main() -> int:
         stale.unlink()
         print("removed the v2 tx_status.csv; the commit log replaces it")
     for name in SOLVER_DIRS:
-        segs = sorted((ART / name).iterdir())
+        segs = sorted(q for q in (ART / name).rglob("*") if q.is_file())
         if not segs:
             raise SystemExit(f"{name}/ came back empty")
-        print(f"  {name}/: " + ", ".join(f"{p.name} ({p.stat().st_size} bytes)"
-                                         for p in segs))
+        print(f"  {name}/: " + ", ".join(
+            f"{q.relative_to(ART / name).as_posix()} ({q.stat().st_size} bytes)"
+            for q in segs))
 
     print("rebuilding the verifier fixture, solution.sh and the ZIP")
     sh([sys.executable, str(BUILD / "make_expected_state.py")])

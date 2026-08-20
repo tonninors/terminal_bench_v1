@@ -2,8 +2,8 @@
 
 These re-derive, from the solver-facing bytes alone, every property the task
 claims: that the pages really are PostgreSQL 16 heap blocks, that the excluded
-tuple cases (MultiXact, frozen, combo CID, out-of-line TOAST) are genuinely
-absent, that the snapshot separates committed transactions on both sides of the
+tuple cases (combo CID, out-of-line TOAST) are genuinely absent, that the
+required MultiXact and frozen-tuple machinery is present and load-bearing, that the snapshot separates committed transactions on both sides of the
 visibility boundary, that the HOT and row-lock artefacts the task depends on are
 present, and that every naive strategy the prompt must defeat really does give a
 materially different answer.
@@ -26,6 +26,7 @@ ART = TASK / "artifacts"
 HEAP = ART / "heap_pages.bin"
 PG_XACT = ART / "pg_xact"
 PG_SUBTRANS = ART / "pg_subtrans"
+PG_MULTIXACT = ART / "pg_multixact"
 SCHEMA = ART / "table_schema.json"
 GOLDEN = TASK / "build" / "internal" / "golden.csv"
 
@@ -46,7 +47,7 @@ FRESH_NOTES = {"frozen": 0, "hint_conflicts": 0, "lock_only": 0}
 @pytest.fixture(scope="module")
 def fixture():
     js, attrs, snap = G.load_schema(SCHEMA)
-    status = G.load_transaction_log(PG_XACT, PG_SUBTRANS)
+    status = G.load_transaction_log(PG_XACT, PG_SUBTRANS, PG_MULTIXACT)
     heap = HEAP.read_bytes()
     tuples, census = [], {"LP_UNUSED": 0, "LP_NORMAL": 0,
                           "LP_REDIRECT": 0, "LP_DEAD": 0}
@@ -55,12 +56,17 @@ def fixture():
         tuples.extend(t)
         for k in census:
             census[k] += c[k]
+    multis = sorted({t.xmax for t in tuples
+                     if t.xmax and t.infomask & HEAP_XMAX_IS_MULTI})
+    member_xids = {x for m in multis for x, _f in status.multi.members(m)}
     referenced = sorted({t.xmin for t in tuples if t.xmin} |
-                        {t.xmax for t in tuples if t.xmax})
+                        {t.xmax for t in tuples
+                         if t.xmax and not t.infomask & HEAP_XMAX_IS_MULTI} |
+                        member_xids)
     states = {x: status.state(x) for x in referenced}
     return dict(js=js, attrs=attrs, snap=snap, status=status, heap=heap,
                 tuples=tuples, census=census, referenced=referenced,
-                states=states)
+                states=states, multis=multis)
 
 
 def pk_index(fixture):
@@ -119,17 +125,10 @@ def test_schema_declares_postgresql_16(fixture):
 
 
 # ------------------------------------------ deliberately excluded tuple cases
-def test_no_multixact_xmax(fixture):
-    bad = [(t.block, t.lp) for t in fixture["tuples"]
-           if t.infomask & HEAP_XMAX_IS_MULTI]
-    assert not bad, f"MultiXact xmax present on {bad[:5]}"
-
-
-def test_no_frozen_tuples(fixture):
-    bad = [(t.block, t.lp) for t in fixture["tuples"]
-           if (t.infomask & HEAP_XMIN_FROZEN) == HEAP_XMIN_FROZEN
-           or t.xmin in (1, 2)]
-    assert not bad, f"frozen tuples present on {bad[:5]}"
+def test_no_frozen_xid_rewrites(fixture):
+    """Freezing keeps the raw xmin; no tuple may carry xid 1 or 2."""
+    bad = [(t.block, t.lp) for t in fixture["tuples"] if t.xmin in (1, 2)]
+    assert not bad, f"bootstrap/frozen xid literals present on {bad[:5]}"
 
 
 def test_no_combo_command_ids(fixture):
@@ -365,6 +364,136 @@ def test_hint_bits_alone_are_insufficient(fixture):
         "HEAP_XMIN_INVALID, so the hints would nearly give the commit log away")
 
 
+# ------------------------------------------------------------- MultiXact
+def multi_tuples_of(fixture):
+    return [t for t in fixture["tuples"]
+            if t.xmax and t.infomask & HEAP_XMAX_IS_MULTI]
+
+
+def test_multixact_xmax_tuples_exist(fixture):
+    mt = multi_tuples_of(fixture)
+    assert len(mt) >= 40, f"only {len(mt)} tuple(s) carry a MultiXact xmax"
+    assert len(fixture["multis"]) >= 8, (
+        f"only {len(fixture['multis'])} distinct MultiXactId(s)")
+
+
+def test_every_multi_resolves_from_the_supplied_segments(fixture):
+    log = fixture["status"]
+    for m in fixture["multis"]:
+        members = log.multi.members(m)
+        assert members, f"multi {m} has no members"
+        ups = [x for x, f in members if f in G.MXS_IS_UPDATE]
+        assert len(ups) <= 1, f"multi {m} has {len(ups)} update members"
+        for x, f in members:
+            assert 0 < x < 2 ** 32, f"multi {m} member xid {x} is implausible"
+            assert 0 <= f <= 5, f"multi {m} member flag {f} is not a status"
+
+
+def test_multi_member_flags_are_diverse(fixture):
+    log = fixture["status"]
+    flags = {f for m in fixture["multis"] for _x, f in log.multi.members(m)}
+    assert len(flags) >= 3, f"only member flags {sorted(flags)} appear"
+    assert flags & set(G.MXS_IS_UPDATE), "no update member exists"
+    assert flags - set(G.MXS_IS_UPDATE), "no locker member exists"
+
+
+def test_multi_misread_as_xid_is_a_trap(fixture):
+    """Every on-page mxid, read as a plain xid, decodes as COMMITTED in the
+    shipped commit log - so skipping the IS_MULTI bit silently deletes rows
+    instead of crashing."""
+    log = fixture["status"]
+    for m in fixture["multis"]:
+        assert log.raw_status(m) == G.XACT_COMMITTED, (
+            f"mxid {m} misread as an xid does not decode as committed")
+
+
+def test_lockonly_and_updater_multis_both_exist(fixture):
+    log = fixture["status"]
+    mt = multi_tuples_of(fixture)
+    lockonly = [t for t in mt if log.multi.updater(t.xmax) is None]
+    updater = [t for t in mt if log.multi.updater(t.xmax) is not None]
+    assert len(lockonly) >= 12, f"only {len(lockonly)} locker-only multi tuple(s)"
+    assert len(updater) >= 25, f"only {len(updater)} updater multi tuple(s)"
+
+
+def test_multi_updaters_cover_every_fate(fixture):
+    log, snap = fixture["status"], fixture["snap"]
+    fates = set()
+    for t in multi_tuples_of(fixture):
+        u = log.multi.updater(t.xmax)
+        if u is None:
+            continue
+        st = log.state(u)
+        if st != "committed":
+            fates.add(st)
+        elif snap.in_progress(u, log):
+            fates.add("committed_after_snapshot")
+        else:
+            fates.add("committed_before_snapshot")
+    assert fates >= {"committed_before_snapshot", "committed_after_snapshot",
+                     "aborted", "in_progress"}, f"updater fates seen: {fates}"
+
+
+def test_multi_updater_subtransactions_exist(fixture):
+    log = fixture["status"]
+    sub = [t for t in multi_tuples_of(fixture)
+           if log.multi.updater(t.xmax) is not None
+           and log.parent(log.multi.updater(t.xmax))]
+    assert len(sub) >= 15, (
+        f"only {len(sub)} multi tuple(s) have a subtransaction updater")
+
+
+def test_snapshot_decides_many_multi_updaters(fixture):
+    log, snap = fixture["status"], fixture["snap"]
+    dep = [t for t in multi_tuples_of(fixture)
+           if log.multi.updater(t.xmax) is not None
+           and log.state(log.multi.updater(t.xmax)) == "committed"
+           and snap.in_progress(log.multi.updater(t.xmax), log)]
+    assert len(dep) >= 18, (
+        f"the snapshot decides only {len(dep)} multi updater(s)")
+
+
+def test_sentinel_bounds_the_last_referenced_multi(fixture):
+    log = fixture["status"]
+    last = max(fixture["multis"])
+    assert log.multi._offset(last + 1) != 0, (
+        f"offsets[{last + 1}] is zero; the sentinel multi is missing")
+
+
+def test_reserved_offset_zero(fixture):
+    """Member index 0 is reserved: the first multi's list starts at 1."""
+    log = fixture["status"]
+    starts = [log.multi._offset(m) for m in fixture["multis"]]
+    assert all(x >= 1 for x in starts), starts
+
+
+# --------------------------------------------------------------- frozen
+def frozen_tuples_of(fixture):
+    return [t for t in fixture["tuples"]
+            if (t.infomask & HEAP_XMIN_FROZEN) == HEAP_XMIN_FROZEN]
+
+
+def test_frozen_tuples_exist_with_raw_xmin(fixture):
+    fr = frozen_tuples_of(fixture)
+    assert len(fr) >= 30, f"only {len(fr)} frozen tuple(s)"
+    assert all(t.xmin > 2 for t in fr), "a frozen tuple lost its raw xmin"
+
+
+def test_frozen_then_modified_tuples_exist(fixture):
+    fr = [t for t in frozen_tuples_of(fixture) if t.xmax]
+    assert len(fr) >= 10, (
+        f"only {len(fr)} frozen tuple(s) carry an xmax; the 'frozen means "
+        "visible, stop' trap is unarmed")
+
+
+def test_invalid_before_frozen_ordering_is_punished(fixture):
+    """Reading XMIN_INVALID on its own must lose many visible rows."""
+    lost = [k for k, t in visible_by_key(fixture).items()
+            if (t.infomask & HEAP_XMIN_FROZEN) == HEAP_XMIN_FROZEN]
+    assert len(lost) >= 30, (
+        f"only {len(lost)} visible row(s) live in frozen tuples")
+
+
 # ----------------------------------------------------------- authenticity
 def test_solver_files_carry_no_decoded_answer():
     """No solver-visible file may contain the reference rows, the verifier
@@ -375,6 +504,7 @@ def test_solver_files_carry_no_decoded_answer():
     files = [HEAP, SCHEMA]
     files += [f for f in PG_XACT.iterdir() if f.is_file()]
     files += [f for f in PG_SUBTRANS.iterdir() if f.is_file()]
+    files += [f for f in PG_MULTIXACT.rglob("*") if f.is_file()]
     for f in files:
         blob = f.read_bytes()
         assert golden not in blob, f"{f.name} embeds the reference answer"
@@ -397,13 +527,29 @@ def test_commit_log_is_a_bitmap_not_a_table():
 
 
 def test_every_referenced_xid_resolves_from_the_supplied_evidence(fixture):
-    """Recovery has to be possible from the shipped segments alone."""
+    """Recovery has to be possible from the shipped segments alone - every
+    plain xid, every multi, every member, every subtransaction chain."""
     log = fixture["status"]
     for x in fixture["referenced"]:
         assert log.state(x) in ("committed", "aborted", "in_progress"), x
         top = log.topmost(x)
         assert log.parent(top) == 0, (
             f"topmost of {x} is {top}, which still has a parent")
+    for m in fixture["multis"]:
+        assert log.multi.members(m)
+
+
+def test_slru_multixact_segments_look_genuine():
+    for d, label in ((PG_MULTIXACT / "offsets", "pg_multixact/offsets"),
+                     (PG_MULTIXACT / "members", "pg_multixact/members")):
+        assert d.is_dir(), f"{label}/ is missing"
+        segs = sorted(q for q in d.iterdir() if q.is_file())
+        assert segs, f"{label}/ holds no segment files"
+        for f in segs:
+            assert len(f.name) == 4 and all(c in "0123456789ABCDEFabcdef"
+                                            for c in f.name), f.name
+            size = f.stat().st_size
+            assert size and size % 8192 == 0, (f.name, size)
 
 
 # ------------------------------------------------------- subtransactions
@@ -514,6 +660,7 @@ def test_the_page_level_answer_equals_the_postgresql_reference():
                                                 "golden_recover.py"),
                             "--heap", str(HEAP), "--pg-xact", str(PG_XACT),
                             "--pg-subtrans", str(PG_SUBTRANS),
+                            "--pg-multixact", str(PG_MULTIXACT),
                             "--schema", str(SCHEMA), "--out", str(out)],
                            capture_output=True, text=True)
         assert r.returncode == 0, r.stderr

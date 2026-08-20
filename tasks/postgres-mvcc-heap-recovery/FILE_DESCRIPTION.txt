@@ -1,16 +1,18 @@
-postgres_mvcc_heap_inputs_v3.zip contains the input files for the task. Unzip it
+postgres_mvcc_heap_inputs_v4.zip contains the input files for the task. Unzip it
 into /app so the files appear as /app/heap_pages.bin, /app/table_schema.json,
-/app/pg_xact/0000 and /app/pg_subtrans/0000.
+/app/pg_xact/0000, /app/pg_subtrans/0000, /app/pg_multixact/offsets/0000 and
+/app/pg_multixact/members/0000.
 
 heap_pages.bin
     The raw main fork of a single PostgreSQL 16 table, copied byte for byte from
-    the server's data directory: 8 consecutive 8192-byte heap blocks in
+    the server's data directory: 9 consecutive 8192-byte heap blocks in
     block-number order, starting at block 0. Each block is an unmodified
     PostgreSQL page - page header, line pointer array, and the heap tuples
     themselves with their original headers, flags and payloads. Several
-    transactions wrote to this relation, so a single primary key may have more
-    than one physical version present, and some line pointers no longer address a
-    tuple of their own. Nothing has been decoded, annotated or reformatted.
+    transactions wrote to and locked rows in this relation, so a single primary
+    key may have more than one physical version present, and some line pointers
+    no longer address a tuple of their own. Nothing has been decoded, annotated
+    or reformatted.
 
 pg_xact/
     The commit log of the same PostgreSQL 16 cluster, copied verbatim. It holds
@@ -23,6 +25,13 @@ pg_subtrans/
     segment-file form. It records, for each transaction id that belongs to a
     subtransaction, the transaction that contains it.
 
+pg_multixact/offsets/ and pg_multixact/members/
+    The MultiXact metadata of the same cluster, copied verbatim as raw SLRU
+    segment files. Some rows were locked or modified by more than one
+    transaction at once; for those tuples the xmax field does not hold a single
+    transaction id, and these two directories hold the metadata needed to
+    resolve such values to the transactions involved.
+
 table_schema.json
     A UTF-8 JSON document describing the table and the point in time to
     reconstruct. It gives the PostgreSQL version, the block size, the table name,
@@ -30,6 +39,6 @@ table_schema.json
     type and nullability, the primary key, and the target MVCC snapshot as
     snapshot_xmin, snapshot_xmax and snapshot_xip.
 
-All four inputs are synthetic and were created for this task. Every value needed
-is stored inline in the heap pages; no TOAST data is required. No database server
+All inputs are synthetic and were created for this task. Every value needed is
+stored inline in the heap pages; no TOAST data is required. No database server
 is needed to complete the task, and no network access is required.

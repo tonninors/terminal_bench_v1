@@ -20,7 +20,8 @@ heap = pathlib.Path("artifacts/heap_pages.bin").read_bytes()
 schema = json.loads(pathlib.Path("artifacts/table_schema.json").read_text(encoding="utf-8"))
 slru = {a: sorted(p.name for p in pathlib.Path("artifacts", a).iterdir()
                   if p.is_file())
-        for a in ("pg_xact", "pg_subtrans")}
+        for a in ("pg_xact", "pg_subtrans", "pg_multixact/offsets",
+                  "pg_multixact/members")}
 exp = json.loads(pathlib.Path("tests/expected_state.json").read_text(encoding="utf-8"))
 rep = json.loads(pathlib.Path("build/internal/generation_report.json").read_text(encoding="utf-8"))
 prompt_raw = pathlib.Path("FINAL_PROMPT.txt").read_text(encoding="utf-8")
@@ -33,8 +34,10 @@ lv = [struct.unpack_from("<H", heap, b*8192+18)[0] for b in range(len(heap)//819
 chk(all(v & 0xFF00 == 8192 and v & 0xFF == 4 for v in lv), "every block is 8192 bytes, page layout version 4")
 chk(len(heap) % 8192 == 0 and schema["block_size"] == 8192, "len(heap_pages.bin) %% 8192 == 0 (%d bytes, %d blocks)" % (len(heap), len(heap)//8192))
 chk(sorted(p.name for p in pathlib.Path("artifacts").iterdir()) ==
-    ["heap_pages.bin", "pg_subtrans", "pg_xact", "table_schema.json"],
-    "solver receives exactly heap_pages.bin, table_schema.json, pg_xact/ and pg_subtrans/")
+    ["heap_pages.bin", "pg_multixact", "pg_subtrans", "pg_xact",
+     "table_schema.json"],
+    "solver receives exactly heap_pages.bin, table_schema.json, pg_xact/, "
+    "pg_subtrans/ and pg_multixact/")
 chk(not pathlib.Path("artifacts/tx_status.csv").exists(),
     "tx_status.csv is no longer solver-visible")
 for _a in ("pg_xact", "pg_subtrans"):
@@ -68,14 +71,21 @@ chk(bool(rep["aborted_children_of_committed_parents"]),
     "aborted children under committed parents: %s"
     % rep["aborted_children_of_committed_parents"])
 
-z = zipfile.ZipFile("dist/postgres_mvcc_heap_inputs_v3.zip")
+z = zipfile.ZipFile("dist/postgres_mvcc_heap_inputs_v4.zip")
 names = sorted(z.namelist())
 want = sorted(["heap_pages.bin", "table_schema.json"] +
               ["pg_xact/" + n for n in slru["pg_xact"]] +
-              ["pg_subtrans/" + n for n in slru["pg_subtrans"]])
+              ["pg_subtrans/" + n for n in slru["pg_subtrans"]] +
+              ["pg_multixact/offsets/" + n
+               for n in slru["pg_multixact/offsets"]] +
+              ["pg_multixact/members/" + n
+               for n in slru["pg_multixact/members"]])
 chk(names == want, "ZIP contents exactly: %s" % names)
 chk(not any(i.is_dir() for i in z.infolist()), "no directory entries in the ZIP")
-chk(all(n.count("/") == 0 or n.split("/")[0] in ("pg_xact", "pg_subtrans")
+chk(all(n.count("/") == 0
+        or n.rpartition("/")[0] in ("pg_xact", "pg_subtrans",
+                                    "pg_multixact/offsets",
+                                    "pg_multixact/members")
         for n in names),
     "the only nested paths are the real SLRU directory names")
 blob = b"".join(z.read(n) for n in names)
@@ -113,6 +123,8 @@ reqs = {
   "empty field is not NULL":   ("An empty field is the empty string, not NULL" in prompt, "empty fields found in nullable columns" in vsrc),
   "raw commit log named":      ("/app/pg_xact/" in prompt, True),
   "subtransaction map named":  ("/app/pg_subtrans/" in prompt, True),
+  "multixact metadata named":  ("/app/pg_multixact/" in prompt, True),
+  "multi-xmax purpose stated": ("set of transactions" in prompt, True),
   "no decoded state file":     ("tx_status" not in prompt, True),
   "only recovered.csv graded": ("Only /app/recovered.csv is evaluated" in prompt, True),
 }
@@ -140,14 +152,16 @@ chk("/app/evidence" not in dockerfile,
     "the image no longer creates duplicate inputs under /app/evidence")
 for f in ("heap_pages.bin", "table_schema.json"):
     chk("/app/" + f in dockerfile, "the image still provides /app/" + f)
-for d in ("pg_xact", "pg_subtrans"):
+for d in ("pg_xact", "pg_subtrans", "pg_multixact"):
     chk("/app/%s/" % d in dockerfile, "the image provides /app/%s/" % d)
 chk("tx_status" not in dockerfile, "the image no longer copies tx_status.csv")
 chk("/app/recovered.csv" in prompt_raw,
     "/app/recovered.csv is still the sole requested output")
-chk(not pathlib.Path("dist/postgres_mvcc_heap_inputs.zip").exists()
-    and not pathlib.Path("dist/postgres_mvcc_heap_inputs_v2.zip").exists(),
-    "the stale v1/v2 bundles have been removed from dist/")
+chk(not any(pathlib.Path("dist", z).exists()
+            for z in ("postgres_mvcc_heap_inputs.zip",
+                      "postgres_mvcc_heap_inputs_v2.zip",
+                      "postgres_mvcc_heap_inputs_v3.zip")),
+    "the stale v1/v2/v3 bundles have been removed from dist/")
 chk(rep["lock_only_tuples_requiring_infomask"] >= 15,
     "lock-only xmax needs the infomask on %d tuple(s)"
     % rep["lock_only_tuples_requiring_infomask"])
@@ -162,6 +176,21 @@ scores = json.loads(pathlib.Path(
 worst = min(v["keys_wrong_in_total"] for v in scores["strategies"].values())
 chk(worst >= 10,
     "every measured naive strategy is wrong on >= 10 keys (weakest: %d)" % worst)
+chk(rep["tuples_with_multixact_xmax"] >= 40,
+    "%d tuple(s) carry a MultiXact xmax" % rep["tuples_with_multixact_xmax"])
+chk(rep["lockonly_multixact_tuples"] >= 12 and
+    rep["updater_multixact_tuples"] >= 25,
+    "locker-only %d / updater %d multi tuples"
+    % (rep["lockonly_multixact_tuples"], rep["updater_multixact_tuples"]))
+chk(rep["subxid_updater_multixact_tuples"] >= 15,
+    "%d multi tuple(s) have a subtransaction updater"
+    % rep["subxid_updater_multixact_tuples"])
+chk(rep["snapshot_dependent_updater_tuples"] >= 18,
+    "the snapshot decides %d multi updater(s)"
+    % rep["snapshot_dependent_updater_tuples"])
+chk(rep["frozen_tuples"] >= 30 and rep["frozen_tuples_with_xmax"] >= 10,
+    "frozen %d / frozen-with-xmax %d tuples"
+    % (rep["frozen_tuples"], rep["frozen_tuples_with_xmax"]))
 
 print()
 print("=" * 46)

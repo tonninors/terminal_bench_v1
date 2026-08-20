@@ -36,9 +36,9 @@ def main() -> int:
                 continue
             if snap.in_progress(t.xmin):        # log deliberately not passed
                 continue
-        if not (t.infomask & HEAP_XMAX_INVALID) and t.xmax \
-                and not C.G.xmax_is_locked_only(t.infomask):
-            if log(t.xmax) == "committed" and not snap.in_progress(t.xmax):
+        u = C.deleting_xid(t, log)
+        if u is not None:
+            if log(u) == "committed" and not snap.in_progress(u):
                 continue
         rows.append(t.values)
     pk = C.pk_positions(js, attrs)

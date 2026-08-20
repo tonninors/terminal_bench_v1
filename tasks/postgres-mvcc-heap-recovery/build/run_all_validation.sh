@@ -32,12 +32,14 @@ fi
 for f in artifacts/heap_pages.bin artifacts/table_schema.json; do
   [ -f "$f" ] || bad "missing $f"
 done
-for d in artifacts/pg_xact artifacts/pg_subtrans; do
+for d in artifacts/pg_xact artifacts/pg_subtrans \
+         artifacts/pg_multixact/offsets artifacts/pg_multixact/members; do
   [ -d "$d" ] || bad "missing $d/"
 done
 [ -f artifacts/tx_status.csv ] && bad "tx_status.csv is still solver-visible"
 sha256sum artifacts/heap_pages.bin artifacts/table_schema.json \
           artifacts/pg_xact/* artifacts/pg_subtrans/* \
+          artifacts/pg_multixact/offsets/* artifacts/pg_multixact/members/* \
           build/internal/golden.csv tests/expected_state.json | sed 's/^/  /'
 
 step "2. the pages really are PostgreSQL 16 heap blocks"
@@ -60,6 +62,7 @@ $PYTEST -q -p no:cacheprovider build/fixture_test.py \
 step "4. oracle, from the solver-visible inputs only"
 $PY solution/golden_recover.py --heap artifacts/heap_pages.bin \
     --pg-xact artifacts/pg_xact --pg-subtrans artifacts/pg_subtrans \
+    --pg-multixact artifacts/pg_multixact \
     --schema artifacts/table_schema.json \
     --out "$TMP/recovered.csv" --report | sed 's/^/  /' || bad "oracle failed"
 
@@ -110,6 +113,7 @@ step "9. solution.sh is in sync and self-contained"
 $PY build/make_solution_sh.py >/dev/null
 HEAP_PAGES="$TASK/artifacts/heap_pages.bin" PG_XACT="$TASK/artifacts/pg_xact" \
   PG_SUBTRANS="$TASK/artifacts/pg_subtrans" \
+  PG_MULTIXACT="$TASK/artifacts/pg_multixact" \
   TABLE_SCHEMA="$TASK/artifacts/table_schema.json" RECOVERED_CSV="$TMP/via_sh.csv" \
   bash solution.sh >/dev/null 2>&1 || bad "solution.sh failed"
 TB_RECOVERED_CSV="$TMP/via_sh.csv" $PYTEST -q -p no:cacheprovider tests/test_outputs.py \
@@ -118,23 +122,26 @@ TB_RECOVERED_CSV="$TMP/via_sh.csv" $PYTEST -q -p no:cacheprovider tests/test_out
 
 step "10. rebuild and inspect the solver ZIP"
 $PY build/make_zip.py | sed 's/^/  /' || bad "ZIP build/inspection failed"
-sha_a=$(sha256sum dist/postgres_mvcc_heap_inputs_v3.zip | cut -d" " -f1)
+sha_a=$(sha256sum dist/postgres_mvcc_heap_inputs_v4.zip | cut -d" " -f1)
 $PY build/make_zip.py >/dev/null
-sha_b=$(sha256sum dist/postgres_mvcc_heap_inputs_v3.zip | cut -d" " -f1)
+sha_b=$(sha256sum dist/postgres_mvcc_heap_inputs_v4.zip | cut -d" " -f1)
 [ "$sha_a" = "$sha_b" ] && ok "ZIP is byte-reproducible" || bad "ZIP is not byte-reproducible"
 
 step "11. the ZIP leaks nothing"
 $PY - <<'PYEOF' || bad "ZIP leak check failed"
 import zipfile, json, pathlib
 for old in ("dist/postgres_mvcc_heap_inputs.zip",
-            "dist/postgres_mvcc_heap_inputs_v2.zip"):
+            "dist/postgres_mvcc_heap_inputs_v2.zip",
+            "dist/postgres_mvcc_heap_inputs_v3.zip"):
     assert not pathlib.Path(old).exists(), "stale bundle still present: " + old
-z = zipfile.ZipFile("dist/postgres_mvcc_heap_inputs_v3.zip")
+z = zipfile.ZipFile("dist/postgres_mvcc_heap_inputs_v4.zip")
 names = sorted(z.namelist())
 assert "tx_status.csv" not in names, "the decoded transaction table is in the ZIP"
 assert "heap_pages.bin" in names and "table_schema.json" in names, names
 assert any(n.startswith("pg_xact/") for n in names), names
 assert any(n.startswith("pg_subtrans/") for n in names), names
+assert any(n.startswith("pg_multixact/offsets/") for n in names), names
+assert any(n.startswith("pg_multixact/members/") for n in names), names
 golden = pathlib.Path("build/internal/golden.csv").read_bytes()
 expected = pathlib.Path("tests/expected_state.json").read_bytes()
 blob = b"".join(z.read(n) for n in names)
@@ -165,7 +172,7 @@ step "12b. final audit (package claims, prompt/verifier coverage, ZIP)"
 $PY build/final_audit.py | sed 's/^/  /' && ok "final audit passed" || bad "final audit failed"
 
 step "13. the verifier reads nothing but the candidate CSV"
-if grep -nE "heap_pages|pg_xact|pg_subtrans|golden\.csv|internal/|subprocess|os\.system" \
+if grep -nE "heap_pages|pg_xact|pg_subtrans|pg_multixact|golden\.csv|internal/|subprocess|os\.system" \
      tests/test_outputs.py >/dev/null 2>&1; then
   bad "the verifier references something other than its fixture and the output"
 else

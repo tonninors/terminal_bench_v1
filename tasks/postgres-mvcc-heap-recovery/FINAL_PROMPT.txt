@@ -1,16 +1,19 @@
 Recover the exact logical rows visible under the MVCC snapshot defined in
 /app/table_schema.json from the PostgreSQL 16 heap pages in /app/heap_pages.bin,
-using the transaction state recorded in /app/pg_xact/ and /app/pg_subtrans/.
-Write the result to /app/recovered.csv.
+using the transaction state recorded in /app/pg_xact/, /app/pg_subtrans/ and
+/app/pg_multixact/. Write the result to /app/recovered.csv.
 
 /app/heap_pages.bin contains consecutive raw 8192-byte PostgreSQL 16 heap pages
-in block-number order. /app/pg_xact/ and /app/pg_subtrans/ are the commit log and
-the subtransaction map of the same PostgreSQL 16 cluster, copied verbatim as raw
-SLRU segment files under their original names, and together they carry the state
-of every transaction the pages refer to. /app/table_schema.json provides the
-column definitions, primary key, PostgreSQL version, block size, and the target
-snapshot_xmin, snapshot_xmax and snapshot_xip. All required tuple values are
-stored inline; no TOAST data is required.
+in block-number order. /app/pg_xact/, /app/pg_subtrans/ and /app/pg_multixact/
+are the commit log, the subtransaction map and the MultiXact metadata of the
+same PostgreSQL 16 cluster, copied verbatim as raw SLRU segment files under
+their original names. Together they carry the state of every transaction the
+pages refer to; /app/pg_multixact/ holds the metadata needed to resolve xmax
+values that name a set of transactions rather than a single one.
+/app/table_schema.json provides the column definitions, primary key, PostgreSQL
+version, block size, and the target snapshot_xmin, snapshot_xmax and
+snapshot_xip. All required tuple values are stored inline; no TOAST data is
+required.
 
 /app/recovered.csv must be UTF-8, include a header with the schema columns in
 their defined order, contain exactly one row for each primary key visible under

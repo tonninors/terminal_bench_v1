@@ -42,7 +42,7 @@ if docker exec "$NAME" test -e /app/tx_status.csv; then
 else
   ok "no /app/tx_status.csv; state must come from pg_xact and pg_subtrans"
 fi
-for seg in pg_xact pg_subtrans; do
+for seg in pg_xact pg_subtrans pg_multixact/offsets pg_multixact/members; do
   n=$(docker exec "$NAME" sh -c "ls -1 /app/$seg | wc -l")
   if [ "$n" -ge 1 ]; then ok "/app/$seg/ ships $n segment file(s)"
   else bad "/app/$seg/ is empty"; fi
@@ -68,6 +68,7 @@ printf '\n=== the in-container answer matches the host oracle byte for byte ===\
 docker exec "$NAME" sha256sum /app/recovered.csv | sed 's/^/  /'
 $PY solution/golden_recover.py --heap artifacts/heap_pages.bin \
     --pg-xact artifacts/pg_xact --pg-subtrans artifacts/pg_subtrans \
+    --pg-multixact artifacts/pg_multixact \
     --schema artifacts/table_schema.json \
     --out "$WORK/host_recovered.csv" >/dev/null \
   || bad "the host oracle run failed"
