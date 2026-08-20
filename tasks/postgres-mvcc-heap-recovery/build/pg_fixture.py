@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the PostgreSQL 16 MVCC heap fixture (v2).
+"""Build the PostgreSQL 16 MVCC heap fixture (v3).
 
 Runs INSIDE a postgres:16 container, as the `postgres` OS user, and drives a
 real server through a scripted history of committed, aborted and still-running
@@ -27,9 +27,19 @@ The three ideas that do the work:
     aborted update, a later committed update, a row lock, a concurrent writer -
     so no single rule reproduces the answer.
 
+v3 removes the decoded `tx_status.csv` entirely.  The solver now receives the
+cluster's own commit log and subtransaction map as raw SLRU segments, and has to
+decode transaction state itself.  That makes real subtransactions usable as a
+difficulty lever, because `pg_current_snapshot()` exports only *top-level* xids
+in its xip list: a tuple written by a subtransaction of a still-running
+transaction carries a subxid that is marked COMMITTED in pg_xact and is absent
+from snapshot_xip, and only pg_subtrans reveals that its topmost parent was in
+flight when the snapshot was taken.
+
 Outputs (into --outdir):
     heap_pages.bin              solver input  - raw 8192-byte blocks, in order
-    tx_status.csv               solver input  - xid,status
+    pg_xact/NNNN                solver input  - the cluster's commit log, verbatim
+    pg_subtrans/NNNN            solver input  - the subtransaction parent map
     table_schema.json           solver input  - columns, PK, target snapshot
     internal/golden.csv         hidden reference, produced by PostgreSQL
     internal/generation_report.json
@@ -73,6 +83,16 @@ HEAP_ONLY_TUPLE = 0x8000
 
 FROZEN_XID = 2
 
+# SLRU geometry (src/include/access/clog.h, src/backend/access/transam/subtrans.c)
+BLCKSZ = 8192
+SLRU_PAGES_PER_SEGMENT = 32
+CLOG_XACTS_PER_BYTE = 4
+CLOG_XACTS_PER_PAGE = BLCKSZ * CLOG_XACTS_PER_BYTE          # 32768
+SUBTRANS_XACTS_PER_PAGE = BLCKSZ // 4                       # 2048
+XACT_IN_PROGRESS, XACT_COMMITTED, XACT_ABORTED, XACT_SUB_COMMITTED = 0, 1, 2, 3
+CLOG_NAMES = {0: "in progress", 1: "committed", 2: "aborted",
+              3: "sub committed"}
+
 COLUMNS = [
     ("account_id", "integer", False),
     ("region_code", "character varying(12)", False),
@@ -98,6 +118,8 @@ CREATE TABLE %(t)s (
 ) WITH (fillfactor = 60, autovacuum_enabled = false,
         toast.autovacuum_enabled = false);
 CREATE INDEX account_ledger_region_idx ON %(t)s (region_code);
+DROP TABLE IF EXISTS public.subxid_probe;
+CREATE TABLE public.subxid_probe (marker integer);
 """ % {"t": QUALIFIED}
 
 # ---------------------------------------------------------------- synthetic data
@@ -169,6 +191,38 @@ D_POST_UPD_ABORT = IDS.take("D_post_upd_abort", 6)
 D_POST_DEL_ABORT = IDS.take("D_post_del_abort", 6)
 D_POST_LOCK = IDS.take("D_post_lock", 5)
 
+# --- subtransactions -------------------------------------------------------
+# committed parent, one savepoint rolled back and one released.  The rolled-back
+# subtransaction is ABORTED in pg_xact while its parent is COMMITTED, so a solver
+# that resolves a subxid to its parent and then uses the *parent's* commit status
+# gets these wrong in both directions.
+# 16 keys: a rolled-back savepoint leaves a dead new version whose xmin is the
+# ABORTED subxid.  PostgreSQL does not stamp HEAP_XMIN_INVALID on all of them,
+# so a solver that hands the subtransaction its parent's COMMITTED status
+# resurrects the discarded update and reports the key twice.
+B_SUB_ROLLED = IDS.take("B_sub_rolled", 16)
+B_SUB_KEPT = IDS.take("B_sub_kept", 8)
+B_SUB_DEL_ROLLED = IDS.take("B_sub_del_rolled", 6)
+B_SUB_DEL_KEPT = IDS.take("B_sub_del_kept", 6)
+B_SUB_TOP = IDS.take("B_sub_top", 6)
+
+# The decisive group.  A writer holds nested savepoints across the snapshot and
+# commits afterwards.  Its subxids read COMMITTED in pg_xact and are NOT in
+# snapshot_xip - only pg_subtrans links them back to a top-level xid that is.
+C_SUBXIP_TOP = IDS.take("C_subxip_top", 6)
+C_SUBXIP_L1 = IDS.take("C_subxip_l1", 6)
+C_SUBXIP_L2 = IDS.take("C_subxip_l2", 6)
+# a subtransaction of a transaction that committed *between* the writers: its
+# topmost parent is NOT in xip, so its work IS visible
+C_GAP_SUB_TOP = IDS.take("C_gap_sub_top", 5)
+C_GAP_SUB = IDS.take("C_gap_sub", 6)
+# a subtransaction of a writer that never finishes
+C_SUBIP_TOP = IDS.take("C_subip_top", 5)
+C_SUBIP_DEL = IDS.take("C_subip_del", 6)
+# a savepoint rolled back inside a transaction that commits after the snapshot
+D_SUB_POST_ROLLED = IDS.take("D_sub_post_rolled", 6)
+D_SUB_POST_KEPT = IDS.take("D_sub_post_kept", 6)
+
 # --- filler: ordinary rows, so not every key is a trap ----------------------
 FILLER = IDS.take("filler", 60)
 F_UPD_COMMIT = FILLER[0:20]
@@ -196,6 +250,7 @@ INS_ABORT_IDS = EXTRA.take("ins_abort", 6)          # inserted by an aborted txn
 INS_XIP_IDS = EXTRA.take("ins_xip_committed", 6)    # inserted by a writer in xip
 INS_IP_IDS = EXTRA.take("ins_in_progress", 6)       # inserted by a running writer
 INS_POST_IDS = EXTRA.take("ins_post_snapshot", 6)   # inserted after the snapshot
+INS_SUBXIP_IDS = EXTRA.take("ins_subxip", 6)        # inserted by a nested subxact
 
 
 def base_row(i):
@@ -222,6 +277,43 @@ def extra_row(i, tag):
     )
 
 
+# ------------------------------------------------- raw SLRU decoding (verification)
+def slru_segment(xid, xacts_per_page):
+    """(segment file name, page index inside the segment) for an xid."""
+    pageno = xid // xacts_per_page
+    return "%04X" % (pageno // SLRU_PAGES_PER_SEGMENT), \
+        pageno % SLRU_PAGES_PER_SEGMENT
+
+
+def clog_status(segments, xid):
+    name, page = slru_segment(xid, CLOG_XACTS_PER_PAGE)
+    data = segments.get(name)
+    if data is None:
+        raise SystemExit("pg_xact segment %s is missing for xid %d" % (name, xid))
+    off = page * BLCKSZ + (xid % CLOG_XACTS_PER_PAGE) // CLOG_XACTS_PER_BYTE
+    shift = (xid % CLOG_XACTS_PER_BYTE) * 2
+    return (data[off] >> shift) & 0x03
+
+
+def subtrans_parent(segments, xid):
+    name, page = slru_segment(xid, SUBTRANS_XACTS_PER_PAGE)
+    data = segments.get(name)
+    if data is None:
+        return 0
+    off = page * BLCKSZ + (xid % SUBTRANS_XACTS_PER_PAGE) * 4
+    return int.from_bytes(data[off:off + 4], "little")
+
+
+def subtrans_topmost(segments, xid):
+    seen = set()
+    while True:
+        parent = subtrans_parent(segments, xid)
+        if parent == 0 or parent in seen or parent >= xid:
+            return xid
+        seen.add(xid)
+        xid = parent
+
+
 # ---------------------------------------------------------------- session helper
 class Session:
     """One server connection with explicit transaction control."""
@@ -243,6 +335,15 @@ class Session:
         self.cur.execute("SELECT pg_current_xact_id_if_assigned()")
         v = self.cur.fetchone()[0]
         return None if v is None else int(v)
+
+    def subxid(self):
+        """The xid of the subtransaction currently in force.
+
+        pg_current_xact_id() reports the *top-level* xid, so the only way to
+        observe a subtransaction's own xid is to look at a tuple it wrote."""
+        self.cur.execute("INSERT INTO public.subxid_probe VALUES (1) "
+                         "RETURNING xmin::text::bigint")
+        return int(self.cur.fetchone()[0])
 
     def commit(self):
         x = self.xid()
@@ -273,6 +374,12 @@ def one_shot(label, body, commit):
 # ---------------------------------------------------------------- the history
 def build(outdir):
     xids = {}
+    # subxid -> the top-level transaction it belongs to.  Used only to verify the
+    # captured pg_subtrans segment; never shipped.  The *immediate* parent is
+    # PostgreSQL's business: ROLLBACK TO SAVEPOINT re-enters a fresh
+    # subtransaction, so later savepoints nest inside it and the chains get
+    # deeper than the SQL text suggests.
+    sub_tops = {}
     internal = outdir / "internal"
     internal.mkdir(parents=True, exist_ok=True)
 
@@ -473,6 +580,54 @@ def build(outdir):
         do_lock(s, B_COMMIT_ABORT_LOCK, "FOR UPDATE")
     xids["B_cal_lock"] = one_shot("b-cal-lock", _cal_lock, True)
 
+    # --- subtransactions inside a committed transaction ---------------------
+    # One savepoint is rolled back and one is released.  After COMMIT the parent
+    # is COMMITTED in pg_xact while the rolled-back child is ABORTED, so the
+    # commit log has to be read per xid: inheriting the parent's status would
+    # resurrect the discarded work and drop the rows whose deletion was undone.
+    b_sub = {}
+
+    def _sub_mixed(s):
+        s.run(upd + "balance_cents = %s, owner_note = %s WHERE account_id = ANY(%s)",
+              (540000, "subxact parent", B_SUB_TOP))
+        top = s.subxid()
+        b_sub["top"] = top
+
+        s.run("SAVEPOINT sp_upd_rolled")
+        s.run(upd + "balance_cents = %s, region_code = %s, owner_note = %s "
+              "WHERE account_id = ANY(%s)",
+              (-501, "XX-SUBROLL", "savepoint discarded", B_SUB_ROLLED))
+        x = s.subxid()
+        sub_tops[x] = top
+        b_sub["upd_rolled"] = x
+        s.run("ROLLBACK TO SAVEPOINT sp_upd_rolled")
+
+        s.run("SAVEPOINT sp_upd_kept")
+        s.run(upd + "balance_cents = %s, risk_tier = %s, owner_note = %s "
+              "WHERE account_id = ANY(%s)",
+              (551000, 6, "savepoint kept", B_SUB_KEPT))
+        x = s.subxid()
+        sub_tops[x] = top
+        b_sub["upd_kept"] = x
+        s.run("RELEASE SAVEPOINT sp_upd_kept")
+
+        s.run("SAVEPOINT sp_del_rolled")
+        s.run(dele, (B_SUB_DEL_ROLLED,))
+        x = s.subxid()
+        sub_tops[x] = top
+        b_sub["del_rolled"] = x
+        s.run("ROLLBACK TO SAVEPOINT sp_del_rolled")
+
+        s.run("SAVEPOINT sp_del_kept")
+        s.run(dele, (B_SUB_DEL_KEPT,))
+        x = s.subxid()
+        sub_tops[x] = top
+        b_sub["del_kept"] = x
+        s.run("RELEASE SAVEPOINT sp_del_kept")
+
+    xids["B_subxact_parent"] = one_shot("b-subxact", _sub_mixed, True)
+    xids["B_subxact_children"] = b_sub
+
     # ================= phase C: writers interleaved with committed work ======
     writers = {}
 
@@ -515,6 +670,66 @@ def build(outdir):
     open_writer("w4_lock_commits_later",
                 lambda s: do_lock(s, C_XIP_LOCK_C, "FOR UPDATE"))
 
+    # --- the decisive writer -------------------------------------------------
+    # Three *nested* savepoints, so pg_subtrans holds a chain rather than a flat
+    # map and resolving a subxid to its top-level parent takes several hops.
+    # This transaction is still running when the snapshot is taken and commits
+    # afterwards: every one of its subxids ends up COMMITTED in pg_xact while
+    # being absent from snapshot_xip.
+    w10 = {}
+
+    def _w10(s):
+        s.run(upd + "balance_cents = %s, owner_note = %s WHERE account_id = ANY(%s)",
+              (-950, "inflight top level", C_SUBXIP_TOP))
+        top = s.subxid()
+        w10["top"] = top
+
+        s.run("SAVEPOINT l1")
+        s.run(upd + "balance_cents = %s, region_code = %s, owner_note = %s "
+              "WHERE account_id = ANY(%s)",
+              (-951, "XX-SUBFLY", "written by savepoint l1", C_SUBXIP_L1))
+        s1 = s.subxid()
+        sub_tops[s1] = top
+        w10["l1"] = s1
+
+        s.run("SAVEPOINT l2")
+        s.run(dele, (C_SUBXIP_L2,))
+        s2 = s.subxid()
+        sub_tops[s2] = top
+        w10["l2"] = s2
+
+        s.run("SAVEPOINT l3")
+        for i in INS_SUBXIP_IDS:
+            s.run(ins, extra_row(i, "subinflight"))
+        s3 = s.subxid()
+        sub_tops[s3] = top
+        w10["l3"] = s3
+
+    open_writer("w10_nested_subxacts_commit_later", _w10)
+    xids["C_w10_subxids"] = w10
+
+    # A transaction that uses a savepoint and COMMITS between the writers.  Its
+    # topmost parent is not in xip either, so its work is visible - proving that
+    # "this xid has a pg_subtrans parent" does not by itself mean invisible.
+    gap_sub = {}
+
+    def _gap_sub(s):
+        s.run(upd + "owner_note = %s WHERE account_id = ANY(%s)",
+              ("gap parent", C_GAP_SUB_TOP))
+        top = s.subxid()
+        gap_sub["top"] = top
+        s.run("SAVEPOINT g1")
+        s.run(upd + "balance_cents = %s, risk_tier = %s, owner_note = %s "
+              "WHERE account_id = ANY(%s)",
+              (660000, 3, "gap savepoint committed", C_GAP_SUB))
+        g1 = s.subxid()
+        sub_tops[g1] = top
+        gap_sub["g1"] = g1
+        s.run("RELEASE SAVEPOINT g1")
+
+    committed_between("subxact", _gap_sub)
+    xids["C_gap_subxids"] = gap_sub
+
     open_writer("w5_upd_aborts_later", lambda s: s.run(
         upd + "balance_cents = %s, owner_note = %s WHERE account_id = ANY(%s)",
         (-902, "in flight, later abandoned", C_XIP_UPD_A)))
@@ -536,6 +751,24 @@ def build(outdir):
 
     open_writer("w9_lock_never_finishes",
                 lambda s: do_lock(s, C_IP_LOCK, "FOR UPDATE"))
+
+    # a writer with a savepoint that never finishes: its subxid stays
+    # IN_PROGRESS in pg_xact
+    w11 = {}
+
+    def _w11(s):
+        s.run(upd + "owner_note = %s WHERE account_id = ANY(%s)",
+              ("uncommitted parent", C_SUBIP_TOP))
+        top = s.subxid()
+        w11["top"] = top
+        s.run("SAVEPOINT k1")
+        s.run(dele, (C_SUBIP_DEL,))
+        k1 = s.subxid()
+        sub_tops[k1] = top
+        w11["k1"] = k1
+
+    open_writer("w11_subxact_never_finishes", _w11)
+    xids["C_w11_subxids"] = w11
 
     # the last completed transaction before the snapshot: this is what lifts
     # snapshot_xmax above every running writer, so all of them land in xip
@@ -597,9 +830,30 @@ def build(outdir):
         do_lock(s, D_POST_LOCK, "FOR UPDATE")
     xids["D_post_lock"] = one_shot("d-post-lock", _post_lock, True)
 
+    # a savepoint rolled back inside a transaction that commits after the
+    # snapshot: an ABORTED child under a COMMITTED-but-invisible parent
+    d_sub = {}
+
+    def _post_sub(s):
+        s.run(upd + "owner_note = %s WHERE account_id = ANY(%s)",
+              ("future parent", D_SUB_POST_KEPT))
+        top = s.subxid()
+        d_sub["top"] = top
+        s.run("SAVEPOINT f1")
+        s.run(upd + "balance_cents = %s, owner_note = %s WHERE account_id = ANY(%s)",
+              (-7777, "future savepoint discarded", D_SUB_POST_ROLLED))
+        f1 = s.subxid()
+        sub_tops[f1] = top
+        d_sub["f1"] = f1
+        s.run("ROLLBACK TO SAVEPOINT f1")
+
+    xids["D_post_subxact"] = one_shot("d-post-sub", _post_sub, True)
+    xids["D_post_subxids"] = d_sub
+
     # ================= writers finish, after the snapshot ====================
     for name in ("w1_upd_commits_later", "w2_del_commits_later",
-                 "w3_ins_commits_later", "w4_lock_commits_later"):
+                 "w3_ins_commits_later", "w4_lock_commits_later",
+                 "w10_nested_subxacts_commit_later"):
         writers[name].commit()
         writers[name].close()
         del writers[name]
@@ -683,6 +937,24 @@ def build(outdir):
     if toast_rows:
         raise SystemExit("%d TOAST chunks exist; values are not inline" % toast_rows)
 
+    # ================= capture the commit log and subtransaction map =========
+    # Verbatim copies of the cluster's own SLRU segments.  CHECKPOINT above has
+    # already flushed both (CheckPointCLOG / CheckPointSUBTRANS), so what is on
+    # disk is what the server would read back.
+    slru = {}
+    for area in ("pg_xact", "pg_subtrans"):
+        srcdir = Path(datadir, area)
+        slru[area] = {}
+        for f in sorted(srcdir.iterdir()):
+            if f.is_file():
+                slru[area][f.name.upper()] = f.read_bytes()
+        if not slru[area]:
+            raise SystemExit("%s holds no segment files" % area)
+        for name, blob in slru[area].items():
+            if len(blob) % BLCKSZ:
+                raise SystemExit("%s/%s is %d bytes, not a multiple of %d"
+                                 % (area, name, len(blob), BLCKSZ))
+
     # ================= transaction states ====================================
     needed = sorted({it["t_xmin"] for it in normals if it["t_xmin"]} |
                     {it["t_xmax"] for it in normals if it["t_xmax"]})
@@ -694,6 +966,45 @@ def build(outdir):
         status[x] = acur.fetchone()[0]
     if set(status.values()) - {"committed", "aborted", "in progress"}:
         raise SystemExit("unexpected transaction states: %r" % (set(status.values()),))
+
+    # --- the captured pg_xact must agree with the running server -------------
+    for x in needed:
+        decoded = CLOG_NAMES[clog_status(slru["pg_xact"], x)]
+        if decoded == "sub committed":
+            decoded = CLOG_NAMES[clog_status(
+                slru["pg_xact"], subtrans_topmost(slru["pg_subtrans"], x))]
+        if decoded != status[x]:
+            raise SystemExit(
+                "captured pg_xact disagrees with the server for xid %d: "
+                "file says %r, pg_xact_status() says %r"
+                % (x, decoded, status[x]))
+
+    # --- the captured pg_subtrans must record the savepoint ancestry --------
+    for child, want_top in sorted(sub_tops.items()):
+        if subtrans_parent(slru["pg_subtrans"], child) == 0:
+            raise SystemExit("pg_subtrans has no parent for subxid %d, but it "
+                             "was written inside a savepoint" % child)
+        got = subtrans_topmost(slru["pg_subtrans"], child)
+        if got != want_top:
+            raise SystemExit(
+                "captured pg_subtrans resolves subxid %d to top-level %d, "
+                "expected %d" % (child, got, want_top))
+
+    subxids_on_pages = sorted(x for x in needed
+                              if subtrans_parent(slru["pg_subtrans"], x))
+    if len(subxids_on_pages) < 6:
+        raise SystemExit("only %d subtransaction xid(s) reach the heap pages"
+                         % len(subxids_on_pages))
+    max_depth = 0
+    for x in subxids_on_pages:
+        d, cur = 0, x
+        while subtrans_parent(slru["pg_subtrans"], cur):
+            cur = subtrans_parent(slru["pg_subtrans"], cur)
+            d += 1
+        max_depth = max(max_depth, d)
+    if max_depth < 3:
+        raise SystemExit("deepest subtransaction chain is %d; a single-hop "
+                         "lookup would be enough" % max_depth)
 
     # ================= the reference answer, computed by PostgreSQL ==========
     obs.run("SELECT " + ", ".join(COLNAMES) + " FROM " + QUALIFIED +
@@ -755,9 +1066,48 @@ def build(outdir):
                          "every recent xid as in progress would barely be "
                          "punished" % len(committed_gap))
     if not in_progress:
-        raise SystemExit("no transaction is still in progress in tx_status.csv")
+        raise SystemExit("no transaction is still in progress in the commit log")
     if not aborted_in_xip:
         raise SystemExit("no aborted transaction is listed in snapshot_xip")
+
+    # --- the load-bearing pg_subtrans assertion -----------------------------
+    # Tuples stamped by a subtransaction that pg_xact reports as COMMITTED,
+    # whose own xid is NOT in snapshot_xip, but whose topmost parent IS.
+    # Ignoring pg_subtrans flips every one of these the wrong way.
+    decisive = []
+    for it in normals:
+        for role in ("t_xmin", "t_xmax"):
+            x = it[role]
+            if not x:
+                continue
+            top = subtrans_topmost(slru["pg_subtrans"], x)
+            if (top != x and status.get(x) == "committed"
+                    and x not in snap_xip and in_snapshot(top)):
+                decisive.append((it["block"], it["lp"], role, x, top))
+    if len(decisive) < 12:
+        raise SystemExit(
+            "only %d tuple stamp(s) require pg_subtrans to be resolved "
+            "correctly; ignoring the subtransaction map would barely be "
+            "punished" % len(decisive))
+
+    # a subtransaction whose parent finished before the snapshot: its work IS
+    # visible, so "has a parent" must not be read as "invisible"
+    benign = [x for x in subxids_on_pages
+              if status.get(x) == "committed"
+              and not in_snapshot(subtrans_topmost(slru["pg_subtrans"], x))]
+    if not benign:
+        raise SystemExit("every subtransaction on the pages is invisible; the "
+                         "map could be replaced by a blanket rule")
+
+    # an aborted child under a committed parent
+    aborted_children = [x for x in sub_tops
+                        if clog_status(slru["pg_xact"], x) == XACT_ABORTED
+                        and clog_status(slru["pg_xact"],
+                                        subtrans_topmost(slru["pg_subtrans"], x))
+                        == XACT_COMMITTED]
+    if len(aborted_children) < 2:
+        raise SystemExit("only %d aborted subtransaction(s) sit under a "
+                         "committed parent" % len(aborted_children))
     for name, x in xids.items():
         if name.startswith("C_writer_") and x not in snap_xip:
             raise SystemExit("writer %s (xid %d) is not in snapshot_xip %r"
@@ -798,11 +1148,12 @@ def build(outdir):
 
     (outdir / "heap_pages.bin").write_bytes(heap)
 
-    with (outdir / "tx_status.csv").open("w", newline="", encoding="utf-8") as fh:
-        w = csv.writer(fh, lineterminator="\n")
-        w.writerow(["xid", "status"])
-        for x in needed:
-            w.writerow([x, status[x].replace(" ", "_")])
+    # the two SLRU areas, byte for byte, under their real segment names
+    for area in ("pg_xact", "pg_subtrans"):
+        d = outdir / area
+        d.mkdir(parents=True, exist_ok=True)
+        for name, blob in sorted(slru[area].items()):
+            (d / name).write_bytes(blob)
 
     schema = {
         "postgres_version": server_version,
@@ -850,9 +1201,18 @@ def build(outdir):
         "snapshot_xip": snap_xip,
         "transaction_xids": xids,
         "id_groups": {k: [v[0], v[-1]] for k, v in IDS.groups.items()},
-        "tx_status_counts": {s: sum(1 for v in status.values() if v == s)
-                             for s in sorted(set(status.values()))},
-        "xids_in_tx_status": len(needed),
+        "transaction_state_counts": {s: sum(1 for v in status.values() if v == s)
+                                    for s in sorted(set(status.values()))},
+        "xids_referenced_by_the_pages": len(needed),
+        "slru_segments": {area: sorted(slru[area]) for area in slru},
+        "slru_bytes": {area: sum(len(b) for b in slru[area].values())
+                       for area in slru},
+        "subtransaction_xids_on_pages": subxids_on_pages,
+        "subtransaction_parent_entries": len(sub_tops),
+        "deepest_subtransaction_chain": max_depth,
+        "tuple_stamps_requiring_pg_subtrans": len(decisive),
+        "visible_subtransactions": sorted(benign),
+        "aborted_children_of_committed_parents": sorted(aborted_children),
         "committed_visible_to_snapshot": len(committed_before),
         "committed_after_snapshot": sorted(committed_after),
         "committed_but_listed_in_xip": committed_in_xip,

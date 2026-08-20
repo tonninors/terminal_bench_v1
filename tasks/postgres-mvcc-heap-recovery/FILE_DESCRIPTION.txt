@@ -1,10 +1,10 @@
-postgres_mvcc_heap_inputs_v2.zip contains the three input files for the task. Unzip
-them into /app so they appear as /app/heap_pages.bin, /app/tx_status.csv and
-/app/table_schema.json.
+postgres_mvcc_heap_inputs_v3.zip contains the input files for the task. Unzip it
+into /app so the files appear as /app/heap_pages.bin, /app/table_schema.json,
+/app/pg_xact/0000 and /app/pg_subtrans/0000.
 
 heap_pages.bin
     The raw main fork of a single PostgreSQL 16 table, copied byte for byte from
-    the server's data directory: 6 consecutive 8192-byte heap blocks in
+    the server's data directory: 8 consecutive 8192-byte heap blocks in
     block-number order, starting at block 0. Each block is an unmodified
     PostgreSQL page - page header, line pointer array, and the heap tuples
     themselves with their original headers, flags and payloads. Several
@@ -12,11 +12,16 @@ heap_pages.bin
     than one physical version present, and some line pointers no longer address a
     tuple of their own. Nothing has been decoded, annotated or reformatted.
 
-tx_status.csv
-    A UTF-8 CSV file with the header xid,status and one row per transaction id.
-    status is exactly one of committed, aborted or in_progress. It lists every
-    transaction id that appears in the heap pages, so the outcome of every
-    transaction that touched a tuple can be looked up here.
+pg_xact/
+    The commit log of the same PostgreSQL 16 cluster, copied verbatim. It holds
+    one SLRU segment file, named with the segment number in hexadecimal exactly
+    as PostgreSQL names it. This is the authoritative record of how each
+    transaction ended.
+
+pg_subtrans/
+    The subtransaction map of the same cluster, copied verbatim, in the same
+    segment-file form. It records, for each transaction id that belongs to a
+    subtransaction, the transaction that contains it.
 
 table_schema.json
     A UTF-8 JSON document describing the table and the point in time to
@@ -25,6 +30,6 @@ table_schema.json
     type and nullability, the primary key, and the target MVCC snapshot as
     snapshot_xmin, snapshot_xmax and snapshot_xip.
 
-All three files are synthetic and were created for this task. Every value needed
+All four inputs are synthetic and were created for this task. Every value needed
 is stored inline in the heap pages; no TOAST data is required. No database server
 is needed to complete the task, and no network access is required.

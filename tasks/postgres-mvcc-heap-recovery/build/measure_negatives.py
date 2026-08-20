@@ -23,7 +23,8 @@ ART = TASK / "artifacts"
 ORACLE = TASK / "solution" / "golden_recover.py"
 
 STD = ["--heap", str(ART / "heap_pages.bin"),
-       "--tx", str(ART / "tx_status.csv"),
+       "--pg-xact", str(ART / "pg_xact"),
+       "--pg-subtrans", str(ART / "pg_subtrans"),
        "--schema", str(ART / "table_schema.json")]
 
 # label -> (script, needs the correct answer as --src)
@@ -40,6 +41,8 @@ STRATEGIES = [
     ("8. hint bits used as the commit log", "negative_i_hint_bits_only.py", False),
     ("9. every physical tuple", "negative_f_all_tuples.py", False),
     ("10. newest committed, no header state", "negative_m_newest_committed.py", False),
+    ("11. pg_subtrans ignored", "negative_p_ignore_subtrans.py", False),
+    ("12. subxact inherits parent status", "negative_q_subxact_inherits_parent.py", False),
 ]
 
 

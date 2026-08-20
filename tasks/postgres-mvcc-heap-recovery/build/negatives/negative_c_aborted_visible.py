@@ -22,11 +22,11 @@ def main() -> int:
         st_min = status(t.xmin)
         if st_min == "in_progress":
             continue
-        if snap.in_progress(t.xmin):
+        if snap.in_progress(t.xmin, status):
             continue
         if t.xmax:
             st_max = status(t.xmax)
-            if st_max != "in_progress" and not snap.in_progress(t.xmax):
+            if st_max != "in_progress" and not snap.in_progress(t.xmax, status):
                 continue
         rows.append(t.values)
     pk = C.pk_positions(js, attrs)

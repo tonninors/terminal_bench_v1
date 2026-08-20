@@ -6,18 +6,21 @@ Task root: `tasks/postgres-mvcc-heap-recovery/`
 
 | path | role |
 | --- | --- |
-| `artifacts/heap_pages.bin` | 6 raw 8192-byte PostgreSQL 16 heap blocks, block 0 first — task input |
-| `artifacts/tx_status.csv` | `xid,status` for every transaction id on those pages — task input |
+| `artifacts/heap_pages.bin` | 8 raw 8192-byte PostgreSQL 16 heap blocks, block 0 first — task input |
+| `artifacts/pg_xact/0000` | the cluster's commit log, copied verbatim as a raw SLRU segment — task input |
+| `artifacts/pg_subtrans/0000` | the cluster's subtransaction parent map, same form — task input |
 | `artifacts/table_schema.json` | columns, types, nullability, primary key, PostgreSQL version, block size and the target snapshot — task input |
-| `dist/postgres_mvcc_heap_inputs_v2.zip` | upload bundle; contains **only** those three files, at the archive root, no directory nesting |
+| `dist/postgres_mvcc_heap_inputs_v3.zip` | upload bundle; contains **only** those four files, with `pg_xact/` and `pg_subtrans/` keeping their real directory names |
 | `FINAL_PROMPT.txt` | the prompt shown to the solver |
 | `FILE_DESCRIPTION.txt` | the Outlier "File Description" text for the bundle |
 | `task.yaml` (`instruction:` field) | the same prompt, in the Terminal Bench task definition |
 | `Dockerfile`, `docker-compose.yaml` | build the task container; copy the three inputs to `/app/` |
 
 Inside the container the solver sees exactly `/app/heap_pages.bin`,
-`/app/tx_status.csv` and `/app/table_schema.json` - the three files the prompt
-names, with no duplicate copies and nothing else from this repository. The tests, the oracle, the generator and the
+`/app/table_schema.json`, `/app/pg_xact/` and `/app/pg_subtrans/` - what the
+prompt names, with no duplicate copies and nothing else from this repository.
+There is no decoded transaction table: v2 shipped `tx_status.csv`, and v3
+replaces it with the cluster's own SLRU segments. The tests, the oracle, the generator and the
 PostgreSQL reference answer are copied in only after the agent has finished, per
 the Terminal Bench execution model.
 
@@ -36,7 +39,7 @@ the Terminal Bench execution model.
 | `build/negatives/*.py` | twelve intentionally wrong answers, plus format/key-damage variants and two alternate correct constructions |
 | `build/measure_negatives.py` | scores every wrong strategy against the correct answer |
 | `build/internal/negative_scores.json` | the measured divergence of each wrong strategy |
-| `V1_VS_V2_DIFFICULTY.md` | what changed between the two fixture generations, and why |
+| `VERSION_HISTORY.md` | what changed between fixture generations v1, v2 and v3, and why |
 | `build/internal/golden.csv` | **the reference answer, produced by PostgreSQL itself**; used to build and validate the fixture, never by the oracle |
 | `build/internal/generation_report.json` | machine-readable record of the generated case, including every transaction id |
 | `build/internal/page_items.json` | `pageinspect` dump of the captured bytes, used to cross-check the parser |
@@ -59,16 +62,18 @@ byte-reproducible.
 
 ```
 $ python3 build/make_zip.py
-dist/postgres_mvcc_heap_inputs_v2.zip
-  sha256 8414cc24a5d4ab3f6d7262452026c30743bd049384a8136eb101bc7b779df5f6
-  3 member(s), no directory entries:
-         49152  heap_pages.bin       sha256 24af7a463883b3a237f495e08bc30bbb2b6bb10585bccf0f7caeb5863104101a
-          1121  table_schema.json    sha256 d22970565b32dfe9294b4a413dd451118d87e4269b1d306213c4e856443fd37d
-           645  tx_status.csv        sha256 4a25a6a31ed3aaf451b3e99f79284a66125b94b1062744949e2b17f438edabf3
+dist/postgres_mvcc_heap_inputs_v3.zip
+  sha256 678f0f9561082f332b6e28dc48b68fb84c1fe0af18a333362d84c14b8e59e912
+  4 member(s), no directory entries:
+         65536  heap_pages.bin         sha256 91a3205b8b5562542e67fa903ff3ab0739a73e011a05cc4fe408b628ca93413a
+          8192  pg_subtrans/0000       sha256 e9a3e47b122548e8f4c27d75cf05c9d202a7a33c6bf6bf72879970e6d860057c
+          8192  pg_xact/0000           sha256 60ec438e8d52508f46daa3db9655fdd3364ccf93a8dfc01a5eadda40d45bbfeb
+          1139  table_schema.json      sha256 ccd502b031201ecec2a4a2e0cbad924d2563bcd41cdf196ccd6a48cfb98ce3dc
 ```
 
-`make_zip.py` asserts on every build that the member list is exactly those three
-names, that no member is nested in a folder, and that no member name matches the
+`make_zip.py` asserts on every build that the member list is exactly those four
+names, that the only nested paths are `pg_xact/` and `pg_subtrans/`, that no
+explicit directory entry exists, and that no member name matches the
 internal-artefact patterns (`golden`, `expected`, `solution`, `oracle`, `answer`,
 `internal`, `negative`, `test`, `readme`, `hint`).
 `build/run_all_validation.sh` step 11 additionally asserts that neither
@@ -77,7 +82,7 @@ bytes, and that `table_schema.json` carries no answer-shaped key.
 
 ## The three inputs, in full
 
-`table_schema.json` (1121 bytes) describes `public.account_ledger`:
+`table_schema.json` (1139 bytes) describes `public.account_ledger`:
 
 | # | column | type | nullable |
 | --- | --- | --- | --- |
@@ -90,17 +95,22 @@ bytes, and that `table_schema.json` carries no answer-shaped key.
 | 7 | `owner_note` | `text` | yes |
 
 plus `postgres_version` `16.15`, `block_size` 8192, `primary_key`
-`["account_id"]`, and the target snapshot `snapshot_xmin` 781, `snapshot_xmax`
-795, `snapshot_xip` `[781, 783, 785, 787, 788, 790, 791, 792, 793]`.
+`["account_id"]`, and the target snapshot `snapshot_xmin` 789, `snapshot_xmax`
+811, `snapshot_xip` `[789, 791, 793, 795, 796, 802, 804, 805, 806, 807, 808]`.
 
-`tx_status.csv` (645 bytes) holds 46 transactions: 33 `committed`, 9 `aborted`,
-4 `in_progress`.
+`pg_xact/0000` (8192 bytes) is one SLRU segment of the cluster's commit log: two
+bits per transaction id, covering xids 0-32767. `pg_subtrans/0000` (8192 bytes)
+is one segment of the subtransaction map: a four-byte parent transaction id per
+entry, zero for a top-level transaction, covering xids 0-2047. Between them they
+resolve all 61 transactions the pages refer to (43 committed, 12 aborted, 6
+still in progress), including 10 subtransaction xids whose ancestry is up to 3
+hops deep.
 
-`heap_pages.bin` (49152 bytes) is 6 blocks holding 583 line pointers — 555
-`LP_NORMAL`, 15 `LP_REDIRECT`, 13 `LP_DEAD` — over 301 distinct primary keys, of
-which 265 are visible under the target snapshot. 53 of the surviving tuples
-carry a lock-only `xmax`, 40 keys have three or more physical versions, and the
-deepest chain is seven tuples long.
+`heap_pages.bin` (65536 bytes) is 8 blocks holding 753 line pointers — 725
+`LP_NORMAL`, 15 `LP_REDIRECT`, 13 `LP_DEAD` — over 393 distinct primary keys, of
+which 353 are visible under the target snapshot. 53 of the surviving tuples carry
+a lock-only `xmax`, and 24 tuple stamps cannot be resolved without
+`pg_subtrans`.
 
 ## Dependencies
 

@@ -19,7 +19,7 @@ def main() -> int:
     for t in tuples:
         if status(t.xmin) != "committed":
             continue
-        if snap.in_progress(t.xmin):
+        if snap.in_progress(t.xmin, status):
             continue
         rows.append(t.values)
     pk = C.pk_positions(js, attrs)

@@ -21,7 +21,7 @@ def main() -> int:
     js, attrs, snap, status, tuples = C.load(args)
     rows = []
     for t in tuples:
-        if status(t.xmin) != "committed" or snap.in_progress(t.xmin):
+        if status(t.xmin) != "committed" or snap.in_progress(t.xmin, status):
             continue
         if t.xmax and status(t.xmax) == "committed":
             continue                      # infomask never consulted

@@ -3,10 +3,12 @@
 
 Written from scratch against the PostgreSQL 16 on-disk format: it shares no code
 with solution/golden_recover.py, lays the parser out differently (memoryview
-slices and an explicit attribute cursor rather than per-tuple objects), states
-the visibility rules as an explicit decision table, and deliberately writes the
-output in a *different but permitted* shape - CRLF line endings, booleans
-spelled true/false, rows in descending primary key order.
+slices and an explicit attribute cursor rather than per-tuple objects), decodes
+the commit log and the subtransaction map with its own bit arithmetic and its own
+recursive topmost-parent walk, states the visibility rules as an explicit
+decision table, and deliberately writes the output in a *different but permitted*
+shape - CRLF line endings, booleans spelled true/false, rows in descending
+primary key order.
 
 Its purpose is to prove the verifier grades the outcome, not the method.
 """
@@ -23,6 +25,11 @@ from pathlib import Path
 BLOCK = 8192
 PAGE_HDR = 24
 EPOCH = dt.date(2000, 1, 1)
+
+# SLRU geometry, spelled out independently of the oracle
+PAGES_PER_SEG = 32
+CLOG_PER_PAGE = BLOCK * 4            # four transactions per byte
+SUB_PER_PAGE = BLOCK // 4            # one 4-byte parent xid per entry
 
 FIXED = {
     "smallint": (2, 2), "integer": (4, 4), "bigint": (8, 8),
@@ -111,11 +118,45 @@ def live_tuples(heap, cols):
             yield decode_tuple(page[off:off + ln], cols)
 
 
+class Slru:
+    """Segment files keyed by segment number, addressed by entries-per-page."""
+
+    def __init__(self, directory, per_page):
+        self.per_page = per_page
+        self.segs = {}
+        for f in sorted(Path(directory).iterdir()):
+            if f.is_file() and len(f.name) == 4:
+                self.segs[int(f.name, 16)] = f.read_bytes()
+        if not self.segs:
+            raise SystemExit("no SLRU segments in %s" % directory)
+
+    def offset(self, xid):
+        page, within = divmod(xid, self.per_page)
+        seg, page_in_seg = divmod(page, PAGES_PER_SEG)
+        return self.segs.get(seg), page_in_seg * BLOCK, within
+
+
+def commit_bits(clog, xid):
+    blob, base, within = clog.offset(xid)
+    if blob is None:
+        raise SystemExit("pg_xact segment missing for xid %d" % xid)
+    return (blob[base + within // 4] >> ((within % 4) * 2)) & 3
+
+
+def parent_of(subtrans, xid):
+    blob, base, within = subtrans.offset(xid)
+    if blob is None:
+        return 0
+    return struct.unpack_from("<I", blob, base + within * 4)[0]
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     here = Path(__file__).resolve().parent.parent.parent / "artifacts"
     ap.add_argument("--heap", default=str(here / "heap_pages.bin"))
-    ap.add_argument("--tx", default=str(here / "tx_status.csv"))
+    ap.add_argument("--pg-xact", dest="pg_xact", default=str(here / "pg_xact"))
+    ap.add_argument("--pg-subtrans", dest="pg_subtrans",
+                    default=str(here / "pg_subtrans"))
     ap.add_argument("--schema", default=str(here / "table_schema.json"))
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
@@ -127,21 +168,59 @@ def main() -> int:
     s_xmin, s_xmax = meta["snapshot_xmin"], meta["snapshot_xmax"]
     xip = frozenset(meta["snapshot_xip"])
 
-    clog = {}
-    with open(a.tx, encoding="utf-8", newline="") as fh:
-        for r in csv.DictReader(fh):
-            clog[int(r["xid"])] = r["status"].strip().lower()
+    clog = Slru(a.pg_xact, CLOG_PER_PAGE)
+    subtrans = Slru(a.pg_subtrans, SUB_PER_PAGE)
+
+    def top_of(x):
+        """Climb pg_subtrans to the enclosing top-level transaction."""
+        guard = 0
+        while True:
+            up = parent_of(subtrans, x)
+            if up == 0 or up >= x or guard > 64:
+                return x
+            x = up
+            guard += 1
+
+    def finished_state(x):
+        """committed / aborted / running, per xid.  A SUB_COMMITTED entry means
+        the child is done but the parent has the final say."""
+        guard = 0
+        while True:
+            bits = commit_bits(clog, x)
+            if bits == 1:
+                return "committed"
+            if bits == 2:
+                return "aborted"
+            if bits == 0:
+                return "running"
+            up = parent_of(subtrans, x)          # 3 == SUB_COMMITTED
+            if up == 0 or up >= x or guard > 64:
+                return "running"
+            x = up
+            guard += 1
 
     def unfinished(x):
-        """True when x had not committed as of the snapshot."""
+        """True when x had not completed as of the snapshot.
+
+        The xip list carries top-level xids only, so a subtransaction has to be
+        resolved through pg_subtrans before it can be looked up."""
         if x >= s_xmax:
             return True
         if x < s_xmin:
             return False
-        return x in xip
+        if x in xip:
+            return True
+        top = top_of(x)
+        if top == x:
+            return False
+        if top >= s_xmax:
+            return True
+        if top < s_xmin:
+            return False
+        return top in xip
 
     def committed_by_snapshot(x):
-        return clog[x] == "committed" and not unfinished(x)
+        return finished_state(x) == "committed" and not unfinished(x)
 
     visible = {}
     for xmin, xmax, mask, values in live_tuples(Path(a.heap).read_bytes(), cols):

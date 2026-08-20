@@ -12,7 +12,7 @@ local runs via `TB_RECOVERED_CSV`).
 It does **not** look at, and has no code path that could look at, the solver's
 scripts, commands, shell history, logs, intermediate files, timings, or the
 method used to produce the answer. It does not read `heap_pages.bin`,
-`tx_status.csv` or `table_schema.json`, does not start a database, does not use
+`table_schema.json`, `pg_xact/` or `pg_subtrans/`, does not start a database, does not use
 the network, and does not shell out. Every check is a pure function of the bytes
 of the candidate file and the static fixture, so repeated runs on the same file
 always return the same verdict.
@@ -112,27 +112,31 @@ independent primary keys each one gets wrong.
 
 ### Must FAIL
 
-Counts are against the 265-row correct answer, measured by
+Counts are against the 353-row correct answer, measured by
 `build/measure_negatives.py`. "keys off" counts primary keys that are missing,
 extra, duplicated or carrying wrong values.
 
-| # | strategy | rows | dup PK | missing | extra | wrong values | keys off | first failing check |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| 1 | greatest `xmin` per key | 301 | 0 | 0 | 36 | 96 | **132** | unexpected keys / digest |
-| 2 | ignore `xmax` entirely | 389 | 112 | 0 | 12 | 84 | **96** | duplicate keys |
-| 3 | a committed `xmax` means deleted | 161 | 0 | 104 | 0 | 0 | **104** | missing keys |
-| 4a | HOT redirects walked as tuples | 280 | 15 | 0 | 0 | 0 | **15** | duplicate keys |
-| 4b | heap-only versions skipped | 188 | 0 | 77 | 0 | 0 | **77** | missing keys |
-| 5 | aborted treated as committed | 239 | 6 | 38 | 6 | 35 | **79** | duplicate keys / digest |
-| 6 | in-progress treated as committed | 227 | 0 | 44 | 6 | 6 | **56** | missing keys / digest |
-| 7a | `snapshot_xip` ignored | 227 | 0 | 44 | 6 | 6 | **56** | missing keys / digest |
-| 7b | every recent xid is in progress | 238 | 0 | 33 | 6 | 24 | **63** | missing keys / digest |
-| 8 | hint bits used as the commit log | 121 | 0 | 144 | 0 | 0 | **144** | missing keys |
-| 9 | every physical tuple | 555 | 254 | 0 | 36 | 168 | **204** | duplicate keys |
-| 10 | newest committed, no header state | 289 | 0 | 0 | 24 | 49 | **73** | unexpected keys / digest |
+| # | strategy | rows | dup PK | missing | extra | wrong values | keys off |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | greatest `xmin` per key | 401 | 0 | 0 | 48 | 141 | **189** |
+| 2 | ignore `xmax` entirely | 508 | 137 | 0 | 18 | 109 | **127** |
+| 3 | a committed `xmax` means deleted | 225 | 0 | 128 | 0 | 0 | **128** |
+| 4a | HOT redirects walked as tuples | 368 | 15 | 0 | 0 | 0 | **15** |
+| 4b | heap-only versions skipped | 251 | 0 | 102 | 0 | 0 | **102** |
+| 5 | aborted treated as committed | 321 | 6 | 44 | 6 | 51 | **101** |
+| 6 | in-progress treated as committed | 309 | 0 | 50 | 6 | 11 | **67** |
+| 7a | `snapshot_xip` ignored | 315 | 0 | 50 | 12 | 18 | **80** |
+| 7b | every recent xid is in progress | 326 | 0 | 33 | 6 | 35 | **74** |
+| 8 | hint bits used as the commit log | 229 | 0 | 130 | 6 | 43 | **179** |
+| 9 | every physical tuple | 725 | 324 | 0 | 48 | 238 | **286** |
+| 10 | newest committed, no header state | 389 | 0 | 0 | 36 | 67 | **103** |
+| 11 | **`pg_subtrans` never opened** | 353 | 0 | 6 | 6 | 6 | **18** |
+| 12 | **subxact inherits its parent's status** | 369 | 16 | 0 | 0 | 16 | **16** |
 
-Strategies 6 and 7a land on the same summary counts but produce different files;
-both are checked independently.
+Strategies 11 and 12 are the two halves of getting subtransactions wrong.
+11 reads a subtransaction id at face value against `snapshot_xip`, which lists
+top-level xids only; 12 resolves the parent but then also borrows its commit
+status, resurrecting savepoints that were rolled back.
 
 Additional candidates that must also fail:
 
@@ -155,10 +159,11 @@ primary keys, so no wrong strategy can slip through as a near miss.
 
 ## Reward hacking
 
-There is nothing to hack: the answer is a 265-row table whose every field is
+There is nothing to hack: the answer is a 353-row table whose every field is
 checked and whose digest is fixed. The inputs are in the container but the
 expected answer is not, and it cannot be derived from them without performing the
 recovery. A partially correct decode fails on values; a correct decode with the
 wrong visibility rule fails on the key set; a correct visibility rule that
-ignores `HEAP_XMAX_LOCK_ONLY` loses 104 keys; and a naive line-pointer walk
-fails on duplicate keys.
+ignores `HEAP_XMAX_LOCK_ONLY` loses 128 keys; a solver that never opens
+`pg_subtrans` is wrong on 18; and a naive line-pointer walk fails on duplicate
+keys.

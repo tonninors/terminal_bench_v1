@@ -5,7 +5,9 @@ this benchmark.**
 
 `heap_pages.bin` is the unmodified main fork of a relation taken from a real
 PostgreSQL 16 server (16.15, x86-64 Linux), captured after `CHECKPOINT` and
-copied byte for byte in block-number order. Every physical state on those pages
+copied byte for byte in block-number order. `pg_xact/` and `pg_subtrans/` are
+that same cluster's commit log and subtransaction map, copied the same way, as
+raw SLRU segments under their original names. Every physical state on those pages
 — the HOT chains, the pruned redirects, the aborted versions, the row locks, the
 uncommitted writes — was produced by ordinary SQL against that server; no byte
 was hand-edited. The server was driven through a
@@ -38,20 +40,35 @@ alone:
   them, and the very next `integer` then has to be re-aligned to 4. Treating
   varlena as unconditionally 4-aligned decodes this fixture into garbage;
 * NULLs consume **zero** bytes, so a null in the middle of a row shifts every
-  later attribute. 81 of the visible cells in this fixture are NULL, spread
+  later attribute. 104 of the visible cells in this fixture are NULL, spread
   across a nullable `smallint` in the middle and a nullable `text` at the end.
 
 This fixture also contains HOT artefacts, which punish a naive line-pointer walk:
-15 `LP_REDIRECT` slots and 13 `LP_DEAD` slots among 583 line pointers. In an
+15 `LP_REDIRECT` slots and 13 `LP_DEAD` slots among 753 line pointers. In an
 `LP_REDIRECT` item, `lp_off` is an **OffsetNumber, not a byte offset**, and the
 slot holds no tuple of its own; `LP_DEAD` slots hold no storage either. A solver
 that walks every non-unused line pointer as if it addressed a tuple either reads
 arbitrary page bytes or double-counts live versions, and duplicates 15 primary
-keys. The opposite error is worse: 77 of the 265 visible rows live in a
+keys. The opposite error is worse: 102 of the 353 visible rows live in a
 `HEAP_ONLY_TUPLE`, so a solver that dismisses heap-only versions as internal HOT
 bookkeeping simply loses them.
 
-**b. Reproducing PostgreSQL's MVCC visibility rule.** Getting the right rows out
+**b. Decoding the cluster's own transaction metadata.** There is no decoded
+table of transaction states. `pg_xact` is a bitmap: two bits per transaction id,
+32768 ids per 8192-byte page, 32 pages per segment, with the four states
+`IN_PROGRESS`, `COMMITTED`, `ABORTED` and `SUB_COMMITTED`. `pg_subtrans` is a
+parallel array of four-byte parent transaction ids, 2048 per page, zero for a
+top-level transaction. A solver has to work out the geometry, index into it
+correctly, and then know what the two files *mean* — which is the harder half:
+
+* the commit log is authoritative **per transaction id**, with `SUB_COMMITTED`
+  the single exception that defers to the parent;
+* the subtransaction map is what the **snapshot** must be resolved through,
+  because savepoints nest and `pg_subtrans` records only the immediate parent;
+* those are different questions about the same xid, and answering either with
+  the other's result is wrong in a way that still produces a plausible CSV.
+
+**c. Reproducing PostgreSQL's MVCC visibility rule.** Getting the right rows out
 requires `HeapTupleSatisfiesMVCC` — the actual rule, not an approximation:
 
 * the inserting transaction must have committed **and** must not be in the
@@ -67,36 +84,43 @@ requires `HeapTupleSatisfiesMVCC` — the actual rule, not an approximation:
   `HEAP_XMAX_INVALID` hint that would let a solver stumble into the right answer:
   their pages were never pruned after the locker finished, so the hint was never
   stamped. The rule "xmax names a committed transaction, so the row is gone"
-  loses 104 primary keys;
+  loses 128 primary keys;
 * hint bits (`HEAP_XMIN_COMMITTED`, `HEAP_XMAX_INVALID`) are set lazily and are
-  **incomplete on these pages** — 126 of 555 tuples carry no xmin hint, and 12 of
-  the 53 tuples written by an aborted transaction carry no `HEAP_XMIN_INVALID`.
-  Trusting the hint bits as the commit state gets 144 keys wrong.
+  **incomplete on these pages** — 128 of 725 tuples carry no xmin hint, and 12 of
+  the 75 tuples written by an aborted transaction carry no `HEAP_XMIN_INVALID`.
+  Trusting the hint bits as the commit state gets 179 keys wrong.
 
-**c. The snapshot is the crux, and it is deliberately at odds with the commit
-log.** `tx_status.csv` reports the state of each transaction *now*; the snapshot
-describes what was running *then*. Both files are needed and neither is
-sufficient:
+**d. The snapshot is the crux, and it is deliberately at odds with the commit
+log.** `pg_xact` reports how each transaction *ended*; the snapshot describes
+what was running *then*. Both are needed and neither is sufficient:
 
-* seven transactions in `tx_status.csv` are `committed` yet sit at or beyond
+* seven transactions are `committed` yet sit at or beyond
   `snapshot_xmax` — their work must not appear;
 * four transactions are `committed` **and listed in `snapshot_xip`** — they were
   still running when the snapshot was taken and committed afterwards. Skipping
-  `snapshot_xip` gets 56 keys wrong;
+  `snapshot_xip` gets 80 keys wrong;
 * five *other* committed transactions sit numerically **inside**
   `[snapshot_xmin, snapshot_xmax)` while being absent from `xip`, interleaved
   with the ones that are in it. Their work **is** visible. So the list cannot be
   collapsed into a range test either: treating every recent xid as in progress
-  gets 63 keys wrong;
-* one transaction in `xip` aborted, and four are genuinely `in_progress`, with
-  uncommitted inserts, updates and deletes physically on the pages.
+  gets 74 keys wrong;
+* one transaction in `xip` aborted, and six are genuinely `in_progress`, with
+  uncommitted inserts, updates and deletes physically on the pages;
+* and **`snapshot_xip` lists top-level transaction ids only.** Ten
+  subtransaction ids stamp tuples on these pages. Once their parents commit they
+  read `COMMITTED` in `pg_xact` and match no xip entry, so at face value their
+  work looks finished and visible. For 24 tuple stamps it is not: the topmost
+  parent was still in flight. A solver that never opens `pg_subtrans` gets 18
+  keys wrong; one that opens it but then borrows the parent's commit status for
+  the child gets 16 wrong in the other direction, resurrecting savepoints that
+  were rolled back.
 
 Consequently the visible version of a key is frequently **not** the physically
-newest one. 96 of the 265 visible rows have a later version sitting in the same
+newest one. 133 of the 353 visible rows have a later version sitting in the same
 file with a larger `xmin`, and for 47 keys that later version was written by a
 transaction that **aborted**. "Take the greatest xmin" is not a near miss — it
-returns 301 rows, 36 of which should not exist and 96 of which carry the wrong
-values: 132 keys wrong in total.
+returns 401 rows, 48 of which should not exist and 141 of which carry the wrong
+values: 189 keys wrong in total.
 
 Nor can the answer be read off the end of a version chain. 40 keys have three or
 more physical versions still on the page, the deepest chain is seven tuples
@@ -114,20 +138,26 @@ with both older and newer versions present.
   reference output to check against.
 * **MVCC is summarised, not implemented.** The widely repeated summary is
   "visible if xmin committed and xmax not committed". That summary is wrong here
-  on 96 to 104 keys depending on which way it is read. The parts that get
+  on 127 to 128 keys depending on which way it is read. The parts that get
   dropped — `XidInMVCCSnapshot` as a *set* rather than a range,
   `HEAP_XMAX_LOCK_ONLY`, the hint-bit semantics — are precisely the parts this
-  fixture is built around. Every one of twelve independent wrong strategies is
-  wrong on at least 15 primary keys, and most on 60 or more.
+  fixture is built around. Every one of fourteen independent wrong strategies is
+  wrong on at least 15 primary keys, and most on 70 or more.
 * **The snapshot invites a shortcut.** With a commit log in hand it is tempting to
   treat `snapshot_xmin`/`xmax`/`xip` as metadata rather than as the deciding rule.
   The fixture is built so that every shortcut is punished: committed
   transactions inside `xip`, committed transactions above `xmax`, and committed
   transactions interleaved *between* the `xip` entries whose work is visible.
+* **Subtransactions are easy to miss entirely.** Nothing in the inputs
+  announces that some xids are subtransactions; `pg_subtrans` looks like a
+  mostly-zero file, and a solver that skips it produces a well-formed CSV that
+  is wrong on a handful of keys. Noticing that the file is load-bearing requires
+  knowing that `pg_current_snapshot()` omits the subtransaction array in the
+  first place.
 * **HOT is invisible until it isn't.** Redirect and dead line pointers do not
   announce themselves; a solver that never learned that `lp_flags` must gate the
   parse produces a file that looks entirely reasonable and contains 15 duplicate
-  keys. Over-correcting and filtering out `HEAP_ONLY_TUPLE` versions loses 77
+  keys. Over-correcting and filtering out `HEAP_ONLY_TUPLE` versions loses 102
   rows instead.
 * **There is no feedback signal.** The container holds three input files and
   nothing to check against — no server to query, no expected output, no
@@ -173,11 +203,14 @@ Every byte the solver receives is self-created for this benchmark:
 * `heap_pages.bin` is the relation's main fork as PostgreSQL 16 wrote it,
   copied unmodified — no page was hand-edited, and no field was rewritten to make
   the file tidier;
-* `tx_status.csv` reports each transaction's real state from `pg_xact_status()`;
+* `pg_xact/` and `pg_subtrans/` are the cluster's own segment files, copied
+  verbatim after `CHECKPOINT` flushed them; the generator re-decodes them and
+  asserts they agree with `pg_xact_status()` and with the savepoint structure it
+  drove;
 * `table_schema.json` reports the real snapshot from `pg_current_snapshot()`,
   taken inside a `REPEATABLE READ` transaction that stayed open for the rest of
   the run.
 
-The challenge comes from PostgreSQL heap parsing and MVCC visibility semantics,
-not from volume: the whole input is 6 blocks, 48 KiB, 555 physical tuples and 46
-transaction ids.
+The challenge comes from PostgreSQL storage formats and MVCC visibility
+semantics, not from volume: the whole input is 8 blocks of heap (64 KiB), two
+8 KiB SLRU segments, 725 physical tuples and 61 transaction ids.

@@ -43,17 +43,19 @@
       "nullable": true
     }
   ],
-  "snapshot_xmin": 781,
-  "snapshot_xmax": 795,
+  "snapshot_xmin": 789,
+  "snapshot_xmax": 811,
   "snapshot_xip": [
-    781,
-    783,
-    785,
-    787,
-    788,
-    790,
+    789,
     791,
-    792,
-    793
+    793,
+    795,
+    796,
+    802,
+    804,
+    805,
+    806,
+    807,
+    808
   ]
 }

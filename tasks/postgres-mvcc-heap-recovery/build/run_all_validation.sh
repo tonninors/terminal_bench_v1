@@ -29,12 +29,16 @@ if [ "$REGEN" -eq 1 ]; then
 else
   ok "using the committed artifacts (pass --regen to rebuild from PostgreSQL)"
 fi
-for f in artifacts/heap_pages.bin artifacts/tx_status.csv artifacts/table_schema.json; do
+for f in artifacts/heap_pages.bin artifacts/table_schema.json; do
   [ -f "$f" ] || bad "missing $f"
 done
-sha256sum artifacts/heap_pages.bin artifacts/tx_status.csv \
-          artifacts/table_schema.json build/internal/golden.csv \
-          tests/expected_state.json | sed 's/^/  /'
+for d in artifacts/pg_xact artifacts/pg_subtrans; do
+  [ -d "$d" ] || bad "missing $d/"
+done
+[ -f artifacts/tx_status.csv ] && bad "tx_status.csv is still solver-visible"
+sha256sum artifacts/heap_pages.bin artifacts/table_schema.json \
+          artifacts/pg_xact/* artifacts/pg_subtrans/* \
+          build/internal/golden.csv tests/expected_state.json | sed 's/^/  /'
 
 step "2. the pages really are PostgreSQL 16 heap blocks"
 $PY - <<'PYEOF' || bad "page sanity"
@@ -53,9 +57,10 @@ step "3. fixture properties (exclusions, HOT, snapshot boundary, traps)"
 $PYTEST -q -p no:cacheprovider build/fixture_test.py \
   && ok "fixture assertions hold" || bad "fixture assertions failed"
 
-step "4. oracle, from the three solver-visible inputs only"
+step "4. oracle, from the solver-visible inputs only"
 $PY solution/golden_recover.py --heap artifacts/heap_pages.bin \
-    --tx artifacts/tx_status.csv --schema artifacts/table_schema.json \
+    --pg-xact artifacts/pg_xact --pg-subtrans artifacts/pg_subtrans \
+    --schema artifacts/table_schema.json \
     --out "$TMP/recovered.csv" --report | sed 's/^/  /' || bad "oracle failed"
 
 step "5. oracle output equals the hidden PostgreSQL reference"
@@ -103,7 +108,8 @@ $PYTEST -q -p no:cacheprovider build/harness_test.py \
 
 step "9. solution.sh is in sync and self-contained"
 $PY build/make_solution_sh.py >/dev/null
-HEAP_PAGES="$TASK/artifacts/heap_pages.bin" TX_STATUS="$TASK/artifacts/tx_status.csv" \
+HEAP_PAGES="$TASK/artifacts/heap_pages.bin" PG_XACT="$TASK/artifacts/pg_xact" \
+  PG_SUBTRANS="$TASK/artifacts/pg_subtrans" \
   TABLE_SCHEMA="$TASK/artifacts/table_schema.json" RECOVERED_CSV="$TMP/via_sh.csv" \
   bash solution.sh >/dev/null 2>&1 || bad "solution.sh failed"
 TB_RECOVERED_CSV="$TMP/via_sh.csv" $PYTEST -q -p no:cacheprovider tests/test_outputs.py \
@@ -112,19 +118,23 @@ TB_RECOVERED_CSV="$TMP/via_sh.csv" $PYTEST -q -p no:cacheprovider tests/test_out
 
 step "10. rebuild and inspect the solver ZIP"
 $PY build/make_zip.py | sed 's/^/  /' || bad "ZIP build/inspection failed"
-sha_a=$(sha256sum dist/postgres_mvcc_heap_inputs_v2.zip | cut -d" " -f1)
+sha_a=$(sha256sum dist/postgres_mvcc_heap_inputs_v3.zip | cut -d" " -f1)
 $PY build/make_zip.py >/dev/null
-sha_b=$(sha256sum dist/postgres_mvcc_heap_inputs_v2.zip | cut -d" " -f1)
+sha_b=$(sha256sum dist/postgres_mvcc_heap_inputs_v3.zip | cut -d" " -f1)
 [ "$sha_a" = "$sha_b" ] && ok "ZIP is byte-reproducible" || bad "ZIP is not byte-reproducible"
 
 step "11. the ZIP leaks nothing"
 $PY - <<'PYEOF' || bad "ZIP leak check failed"
 import zipfile, json, pathlib
-stale = pathlib.Path("dist/postgres_mvcc_heap_inputs.zip")
-assert not stale.exists(), "the stale v1 bundle is still present in dist/"
-z = zipfile.ZipFile("dist/postgres_mvcc_heap_inputs_v2.zip")
+for old in ("dist/postgres_mvcc_heap_inputs.zip",
+            "dist/postgres_mvcc_heap_inputs_v2.zip"):
+    assert not pathlib.Path(old).exists(), "stale bundle still present: " + old
+z = zipfile.ZipFile("dist/postgres_mvcc_heap_inputs_v3.zip")
 names = sorted(z.namelist())
-assert names == ["heap_pages.bin", "table_schema.json", "tx_status.csv"], names
+assert "tx_status.csv" not in names, "the decoded transaction table is in the ZIP"
+assert "heap_pages.bin" in names and "table_schema.json" in names, names
+assert any(n.startswith("pg_xact/") for n in names), names
+assert any(n.startswith("pg_subtrans/") for n in names), names
 golden = pathlib.Path("build/internal/golden.csv").read_bytes()
 expected = pathlib.Path("tests/expected_state.json").read_bytes()
 blob = b"".join(z.read(n) for n in names)
@@ -134,7 +144,7 @@ for forbidden in ("rows", "visible", "answer", "sha256", "expected"):
     assert forbidden not in schema, forbidden
 print("  no reference answer, digest or oracle artefact inside the bundle")
 PYEOF
-ok "ZIP contains only the three inputs"
+ok "ZIP contains only the intended inputs"
 
 step "12. no network or third-party data access anywhere in the task code"
 # Look for real use, not mentions: build/final_audit.py lists these names as
@@ -155,7 +165,7 @@ step "12b. final audit (package claims, prompt/verifier coverage, ZIP)"
 $PY build/final_audit.py | sed 's/^/  /' && ok "final audit passed" || bad "final audit failed"
 
 step "13. the verifier reads nothing but the candidate CSV"
-if grep -nE "heap_pages|tx_status|golden\.csv|internal/|subprocess|os\.system" \
+if grep -nE "heap_pages|pg_xact|pg_subtrans|golden\.csv|internal/|subprocess|os\.system" \
      tests/test_outputs.py >/dev/null 2>&1; then
   bad "the verifier references something other than its fixture and the output"
 else

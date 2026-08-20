@@ -1,14 +1,16 @@
 Recover the exact logical rows visible under the MVCC snapshot defined in
 /app/table_schema.json from the PostgreSQL 16 heap pages in /app/heap_pages.bin,
-using the transaction states in /app/tx_status.csv. Write the result to
-/app/recovered.csv.
+using the transaction state recorded in /app/pg_xact/ and /app/pg_subtrans/.
+Write the result to /app/recovered.csv.
 
 /app/heap_pages.bin contains consecutive raw 8192-byte PostgreSQL 16 heap pages
-in block-number order. /app/tx_status.csv provides the required transaction IDs
-and their states, and /app/table_schema.json provides the column definitions,
-primary key, PostgreSQL version, block size, and the target snapshot_xmin,
-snapshot_xmax and snapshot_xip. All required tuple values are stored inline; no
-TOAST data is required.
+in block-number order. /app/pg_xact/ and /app/pg_subtrans/ are the commit log and
+the subtransaction map of the same PostgreSQL 16 cluster, copied verbatim as raw
+SLRU segment files under their original names, and together they carry the state
+of every transaction the pages refer to. /app/table_schema.json provides the
+column definitions, primary key, PostgreSQL version, block size, and the target
+snapshot_xmin, snapshot_xmax and snapshot_xip. All required tuple values are
+stored inline; no TOAST data is required.
 
 /app/recovered.csv must be UTF-8, include a header with the schema columns in
 their defined order, contain exactly one row for each primary key visible under
@@ -22,8 +24,5 @@ quotes. Non-null values are written as follows: integer and smallint in decimal;
 boolean as t or f (true and false are also accepted, in any letter case); date
 as YYYY-MM-DD; text and character varying literally, with no quoting beyond what
 CSV escaping requires. An empty field is the empty string, not NULL.
-
-/app/tx_status.csv has the header xid,status and one row per transaction ID, with
-status being exactly one of committed, aborted or in_progress.
 
 Only /app/recovered.csv is evaluated.

@@ -20,10 +20,10 @@ def main() -> int:
     for t in tuples:
         if status(t.xmin) == "aborted":
             continue
-        if snap.in_progress(t.xmin) and status(t.xmin) == "committed":
+        if snap.in_progress(t.xmin, status) and status(t.xmin) == "committed":
             continue
         if t.xmax and status(t.xmax) != "aborted":
-            if not (snap.in_progress(t.xmax) and status(t.xmax) == "committed"):
+            if not (snap.in_progress(t.xmax, status) and status(t.xmax) == "committed"):
                 continue
         rows.append(t.values)
     pk = C.pk_positions(js, attrs)

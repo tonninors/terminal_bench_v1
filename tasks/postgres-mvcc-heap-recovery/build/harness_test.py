@@ -22,7 +22,8 @@ ORACLE = TASK / "solution" / "golden_recover.py"
 VERIFIER = TASK / "tests" / "test_outputs.py"
 
 STD = ["--heap", str(ART / "heap_pages.bin"),
-       "--tx", str(ART / "tx_status.csv"),
+       "--pg-xact", str(ART / "pg_xact"),
+       "--pg-subtrans", str(ART / "pg_subtrans"),
        "--schema", str(ART / "table_schema.json")]
 
 
@@ -109,7 +110,8 @@ def test_solution_sh_matches_the_oracle_and_passes(tmp_path):
     r = subprocess.run(["bash", str(TASK / "solution.sh")], capture_output=True,
                        text=True, env=_env({
                            "HEAP_PAGES": str(ART / "heap_pages.bin"),
-                           "TX_STATUS": str(ART / "tx_status.csv"),
+                           "PG_XACT": str(ART / "pg_xact"),
+                           "PG_SUBTRANS": str(ART / "pg_subtrans"),
                            "TABLE_SCHEMA": str(ART / "table_schema.json"),
                            "RECOVERED_CSV": str(out)}))
     assert r.returncode == 0, r.stdout + r.stderr
@@ -161,6 +163,11 @@ NEGATIVES = [
      {"test_no_duplicate_primary_keys", "test_content_digest"}),
     ("10-newest-committed-no-header", "negative_m_newest_committed.py", STD,
      {"test_content_digest", "test_no_unexpected_primary_key"}),
+    ("11-ignore-pg-subtrans", "negative_p_ignore_subtrans.py", STD,
+     {"test_content_digest", "test_no_missing_primary_key",
+      "test_no_unexpected_primary_key"}),
+    ("12-subxact-inherits-parent", "negative_q_subxact_inherits_parent.py", STD,
+     {"test_no_duplicate_primary_keys", "test_content_digest"}),
 ]
 
 

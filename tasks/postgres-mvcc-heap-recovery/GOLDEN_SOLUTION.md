@@ -4,16 +4,17 @@ Reference implementation: [`solution/golden_recover.py`](solution/golden_recover
 wrapped for the container by [`solution.sh`](solution.sh) (generated — edit the
 Python and rerun `build/make_solution_sh.py`).
 
-It reads **only** `/app/heap_pages.bin`, `/app/tx_status.csv` and
-`/app/table_schema.json`. It never opens the hidden reference CSV, never
+It reads **only** `/app/heap_pages.bin`, `/app/pg_xact/`, `/app/pg_subtrans/`
+and `/app/table_schema.json`. It never opens the hidden reference CSV, never
 hard-codes a row, never contacts a database, and contains no lookup table.
 
 ```
 python3 solution/golden_recover.py \
-    --heap artifacts/heap_pages.bin \
-    --tx   artifacts/tx_status.csv \
-    --schema artifacts/table_schema.json \
-    --out  /app/recovered.csv --report
+    --heap        artifacts/heap_pages.bin \
+    --pg-xact     artifacts/pg_xact \
+    --pg-subtrans artifacts/pg_subtrans \
+    --schema      artifacts/table_schema.json \
+    --out         /app/recovered.csv --report
 ```
 
 ---
@@ -34,12 +35,43 @@ nullability, the primary key, the block size and the target snapshot. Build one
 
 The snapshot is `(snapshot_xmin, snapshot_xmax, snapshot_xip)`.
 
-## Step 2 — read the transaction states
+## Step 2 — decode the commit log and the subtransaction map
 
-`tx_status.csv` is `xid,status` with `status` in `{committed, aborted,
-in_progress}`. Load it into a dict. It is authoritative for *whether* a
-transaction finished and how; it says nothing about *when*, which is what the
-snapshot is for.
+Both are SLRU areas: a directory of fixed-size segment files, each holding 32
+pages of 8192 bytes, named with the segment number in four hex digits.
+
+**`pg_xact`** packs two bits per transaction id — 32768 ids per page:
+
+```python
+CLOG_XACTS_PER_PAGE = 8192 * 4
+pageno          = xid // CLOG_XACTS_PER_PAGE
+segno, page     = divmod(pageno, 32)
+byte            = segment[segno][page*8192 + (xid % CLOG_XACTS_PER_PAGE)//4]
+status          = (byte >> ((xid % 4) * 2)) & 0x03
+# 0 IN_PROGRESS   1 COMMITTED   2 ABORTED   3 SUB_COMMITTED
+```
+
+**`pg_subtrans`** stores a four-byte parent transaction id per entry — 2048 ids
+per page. Zero means the transaction is top-level:
+
+```python
+SUBTRANS_XACTS_PER_PAGE = 8192 // 4
+pageno       = xid // SUBTRANS_XACTS_PER_PAGE
+segno, page  = divmod(pageno, 32)
+parent       = uint32_le(segment[segno], page*8192 + (xid % SUBTRANS_XACTS_PER_PAGE)*4)
+```
+
+Two derived operations matter, and they are **not** the same thing:
+
+* `TransactionIdDidCommit(xid)` — the commit log is authoritative **per xid**.
+  A `SUB_COMMITTED` entry is the one exception: the subtransaction finished but
+  its parent had not, so follow the parent. Everything else answers directly.
+  In particular a savepoint that was rolled back inside a transaction that later
+  committed is `ABORTED` in its own right.
+* `SubTransGetTopmostTransaction(xid)` — walk `pg_subtrans` parents until one is
+  zero. Savepoints nest, so the map records the *immediate* parent and the walk
+  takes several hops; a parent id is always lower than its child, which bounds
+  the loop. This is what the **snapshot** must be tested against.
 
 ## Step 3 — split the file into 8192-byte blocks
 
@@ -85,12 +117,12 @@ lp_len   = (raw >> 17) & 0x7FFF  # tuple length in bytes
 
 Every live version — including heap-only tuples that have no index entry — is
 reachable by simply visiting every `LP_NORMAL` slot, so no chain following is
-needed once redirects are skipped. This fixture has 555 `LP_NORMAL`, 15
+needed once redirects are skipped. This fixture has 725 `LP_NORMAL`, 15
 `LP_REDIRECT` and 13 `LP_DEAD` slots.
 
 Both directions of getting this wrong are punished. Walking an `LP_REDIRECT` as
 a tuple duplicates 15 keys. Going the other way and *skipping* heap-only tuples,
-on the theory that they are internal HOT bookkeeping, loses 77 visible rows: a
+on the theory that they are internal HOT bookkeeping, loses 102 visible rows: a
 `HEAP_ONLY_TUPLE` is a complete row version that merely has no index entry, and
 on these pages it is very often the version the snapshot can see.
 
@@ -141,15 +173,28 @@ First, the snapshot predicate — `XidInMVCCSnapshot`, i.e. "was this transactio
 still running when the snapshot was taken?":
 
 ```python
-def in_progress(xid, snap):
+def in_progress(xid, snap, log):
     if xid >= snap.xmax:  return True    # had not completed; may not have started
     if xid <  snap.xmin:  return False   # had already completed
-    return xid in snap.xip               # the explicit running list decides
+    if xid in snap.xip:   return True    # a running top-level transaction
+    top = log.topmost(xid)               # a subtransaction? ask pg_subtrans
+    if top == xid:        return False   # top-level and not listed: finished
+    if top >= snap.xmax:  return True
+    if top <  snap.xmin:  return False
+    return top in snap.xip
 ```
 
-Note what this means: a transaction that `tx_status.csv` reports as `committed`
-is still invisible to this snapshot if it is at or above `snapshot_xmax`, or if
-it appears in `snapshot_xip`. Both cases are present in this fixture.
+Note two things. First, a transaction the commit log reports as `committed` is
+still invisible to this snapshot if it is at or above `snapshot_xmax`, or if it
+appears in `snapshot_xip`.
+
+Second, and this is where most of the difficulty now lives: **`snapshot_xip`
+lists top-level transaction ids only.** `pg_current_snapshot()` does not export
+the subtransaction array. A tuple written inside a savepoint carries the
+*subtransaction's* xid, which appears in no xip entry and — once its parent
+commits — reads `COMMITTED` in the commit log. Taken at face value it looks like
+an ordinary finished transaction whose work is visible. It is not: resolve it
+through `pg_subtrans` first, and test the topmost parent.
 
 Then the rule itself:
 
@@ -160,7 +205,7 @@ if (infomask & HEAP_XMIN_FROZEN) == HEAP_XMIN_FROZEN:   # 0x0300; absent here
 elif infomask & HEAP_XMIN_INVALID:                      # 0x0200 hint: aborted
     inserted_ok = False
 else:
-    inserted_ok = status[xmin] == "committed" and not in_progress(xmin, snap)
+    inserted_ok = did_commit(xmin) and not in_progress(xmin, snap, log)
 if not inserted_ok:
     return False
 
@@ -169,11 +214,18 @@ if infomask & HEAP_XMAX_INVALID:   return True   # 0x0800 hint: xmax is void
 if xmax == 0:                      return True
 if infomask & HEAP_XMAX_LOCK_ONLY: return True   # 0x0080: a row lock, not a delete
 if infomask & HEAP_XMAX_IS_MULTI:  ...           # 0x1000; absent here by design
-if status[xmax] != "committed":    return True   # deleter aborted or still running
-return not in_progress(xmax, snap)               # deleted after the snapshot? visible
+if not did_commit(xmax):           return True   # deleter aborted or still running
+return not in_progress(xmax, snap, log)          # deleted after the snapshot? visible
 ```
 
-Four details carry real weight here:
+Five details carry real weight here:
+
+* **A subtransaction is one transaction for the commit log and another for the
+  snapshot.** `pg_xact` decides, per xid, whether that particular savepoint's
+  work survived; `pg_subtrans` decides which top-level transaction the snapshot
+  should be tested against. Using the parent for both resurrects rolled-back
+  savepoints (16 dead tuples here); using the child for both makes an in-flight
+  transaction's work visible (24 tuple stamps here).
 
 * **`xmax != 0` is not a deletion, and this is the single biggest trap.** 53
   tuples in this fixture were locked by `SELECT ... FOR UPDATE`, `FOR NO KEY
@@ -184,10 +236,10 @@ Four details carry real weight here:
   `HEAP_XMAX_LOCK_ONLY`, and nothing else: none of these tuples carries the
   `HEAP_XMAX_INVALID` hint, because their pages were never pruned after the
   locker finished. The infomask has to be read.
-* **Hint bits are not the commit log.** 126 of 555 tuples have no
-  `HEAP_XMIN_COMMITTED`, and 12 of the 53 tuples inserted by aborted
-  transactions carry no `HEAP_XMIN_INVALID` either. Use `tx_status.csv`; the
-  hints only ever confirm it.
+* **Hint bits are not the commit log.** 128 of 725 tuples have no
+  `HEAP_XMIN_COMMITTED`, and 12 of the 75 tuples inserted by aborted
+  transactions carry no `HEAP_XMIN_INVALID` either. Read `pg_xact`; the hints
+  only ever confirm it.
 * **An aborted deleter leaves the row visible**, and an aborted inserter's tuple
   is dead no matter what its `xmax` says. For 47 keys the tuple with the
   greatest `xmin` is exactly such a dead version.
@@ -201,8 +253,8 @@ Four details carry real weight here:
 
 Collect the visible tuples, key them by the primary key columns, and assert that
 no key appears twice. MVCC guarantees at most one visible version per key; two
-would mean a parsing or visibility bug, not an ambiguous snapshot. Here 555
-physical tuples over 301 distinct keys reduce to exactly 265 visible rows.
+would mean a parsing or visibility bug, not an ambiguous snapshot. Here 725
+physical tuples over 393 distinct keys reduce to exactly 353 visible rows.
 
 40 keys have three or more physical versions still on the page and the deepest
 chain is seven tuples long, so this reduction is not "take the last one": for 12
@@ -221,17 +273,21 @@ oracle sorts by primary key for determinism.
 ## What the oracle reports on this fixture
 
 ```
-blocks                                            6
-line pointers      LP_NORMAL 555, LP_REDIRECT 15, LP_DEAD 13, LP_UNUSED 0
-physical tuples                                 555
-distinct primary keys on disk                   301
-keys with several physical versions             168
-visible rows                                    265
-snapshot        xmin 781, xmax 795, xip [781,783,785,787,788,790,791,792,793]
-keys whose visible version is NOT the newest xmin 96
+blocks                                            8
+line pointers      LP_NORMAL 725, LP_REDIRECT 15, LP_DEAD 13, LP_UNUSED 0
+physical tuples                                 725
+distinct primary keys on disk                   393
+keys with several physical versions             230
+visible rows                                    353
+snapshot                                        789:811:789,791,793,795,796,802,804,805,806,807,808
+commit log segments                             pg_xact/0000
+subtransaction map segments                     pg_subtrans/0000
+subtransaction xids resolved via pg_subtrans    10
+deepest subtransaction chain                    3
+keys whose visible version is NOT the newest xmin 133
 tuples kept despite a non-zero lock-only xmax     53
 frozen tuples seen                                0
-hint-bit conflicts with tx_status                 0
+hint-bit conflicts with the commit log            0
 ```
 
 ## Independent confirmation
@@ -239,9 +295,9 @@ hint-bit conflicts with tx_status                 0
 `build/internal/golden.csv` was produced by the PostgreSQL server itself, by
 running `SELECT * FROM account_ledger ORDER BY account_id` inside the very
 `REPEATABLE READ` transaction that owns the target snapshot. The oracle's output
-is **byte-identical** to it, on all 265 rows, (`build/run_all_validation.sh` step 5,
+is **byte-identical** to it, on all 353 rows, (`build/run_all_validation.sh` step 5,
 `build/fixture_test.py::test_the_page_level_answer_equals_the_postgresql_reference`).
-The page-level recovery and the database engine agree on all 265 rows.
+The page-level recovery and the database engine agree on all 353 rows.
 
 `build/negatives/alt_independent_parser.py` is a second recovery written from
 scratch — different parser structure, different formulation of the visibility

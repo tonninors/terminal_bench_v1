@@ -36,7 +36,7 @@ step through 1-, 2- and 4-byte alignment in a row; and the nullable `text`
 `region_code` is what makes updates that change that column *non*-HOT, so the
 fixture contains both kinds.
 
-## Transaction history (v2)
+## Transaction history (v3)
 
 The generator runs four phases. What separates v2 from v1 is a **horizon
 holder**: a read-only `REPEATABLE READ` session opened at the end of phase A and
@@ -55,11 +55,13 @@ survives into the captured file.
 | B2 | committed updates, multi-round updates, a committed delete | ordinary visible history |
 | B3 | aborted insert, aborted update, aborted delete | dead versions that keep the greatest `xmin` on their keys |
 | B4 | abort-then-commit, and commit-abort-lock | keys where three mechanisms interact at once |
-| C | nine writers opened **interleaved** with five transactions that commit between them | a sparse `snapshot_xip` inside `[xmin, xmax)` |
-| — | **the target snapshot is taken** by a read-only `REPEATABLE READ` observer | `781:795:781,783,785,787,788,790,791,792,793` |
+| B5 | a committed transaction with four savepoints: two released, two rolled back | an ABORTED child under a COMMITTED parent, in both the update and the delete direction |
+| C | eleven writers opened **interleaved** with six transactions that commit between them | a sparse `snapshot_xip` inside `[xmin, xmax)` |
+| C1 | one of those writers holds **three nested savepoints** and commits after the snapshot | subxids that read COMMITTED and match no xip entry |
+| — | **the target snapshot is taken** by a read-only `REPEATABLE READ` observer | `789:811:789,791,793,795,796,802,804,805,806,807,808` |
 | D | after the snapshot: committed update, insert, delete, three more HOT rounds, a committed lock, an aborted update and an aborted delete | committed-but-invisible work, and chains whose visible member is in the middle |
 | — | writers 1-4 commit, writer 5 aborts, writers 6-9 stay open | four `committed` xids inside `xip`, one `aborted` inside `xip`, four `in_progress` |
-| — | `CHECKPOINT`, then the relation's main fork is copied byte for byte | `heap_pages.bin` |
+| — | `CHECKPOINT`, then the relation's main fork **and the `pg_xact` / `pg_subtrans` directories** are copied byte for byte | `heap_pages.bin`, `pg_xact/0000`, `pg_subtrans/0000` |
 
 ### Why the horizon holder is the whole trick
 
@@ -72,14 +74,61 @@ Three things depend on it, and all three were weak in v1:
    need `HEAP_XMAX_LOCK_ONLY`. With the horizon pinned, no prune runs, and all 53
    lock-only tuples keep a bare lock bit. 33 of them name an `xmax` that both
    committed and is visible to the snapshot, so the infomask is now mandatory.
-2. **HOT chains survive.** 40 keys keep three or more versions, the deepest chain
-   is seven, and for 12 keys the visible version is strictly mid-chain.
+2. **HOT chains survive.** Keys keep three or more versions, chains run seven
+   deep, and for a dozen keys the visible version is strictly mid-chain.
 3. **Aborted versions survive**, so the greatest-`xmin` tuple is an aborted one
    for 47 keys.
 
 The locks deliberately run *after* the holder opens but *before* any concurrent
 writer, so their xids land below `snapshot_xmin` - plainly visible, with no
 snapshot escape hatch for a solver that skips the infomask.
+
+### Why subtransactions are the v3 lever
+
+`pg_current_snapshot()` builds its xip list from the snapshot's `xip` array,
+which holds **top-level** xids. It does not export `subxip`. So when a
+transaction writes inside a `SAVEPOINT`, the tuple carries the subtransaction's
+own xid, and that xid appears in no `snapshot_xip` entry. Once the parent
+commits, `pg_xact` reports the subxid as `COMMITTED`.
+
+A solver reading only the commit log therefore sees "committed, not listed as
+running, inside the xid range" and concludes the work is visible. It is not: the
+topmost parent was still in flight when the snapshot was taken. Resolving that
+needs `pg_subtrans`, and nothing else in the inputs can substitute for it.
+
+The fixture pins this down in three directions so no blanket rule works:
+
+* **w10** holds three *nested* savepoints across the snapshot and commits
+  afterwards. Its subxids must be resolved to a parent that is in `xip` -
+  %d tuple stamps depend on it, and the chain is %d hops deep, so a single-hop
+  lookup is not enough.
+* **the gap savepoint transaction** commits *between* the writers. Its subxid is
+  equally a subtransaction, but its topmost parent is not in `xip`, so its work
+  **is** visible. "Has a `pg_subtrans` parent" must not be read as "invisible".
+* **B5** rolls back two savepoints inside a transaction that then commits. Those
+  children are `ABORTED` in their own right while the parent is `COMMITTED`, so
+  the commit log has to be consulted per xid. Inheriting the parent's status
+  resurrects 16 dead tuples.
+
+`ROLLBACK TO SAVEPOINT` re-enters a *fresh* subtransaction, so later savepoints
+nest inside it and PostgreSQL picks the immediate parents itself. The generator
+therefore records only the expected **topmost** ancestor and asserts
+`SubTransGetTopmostTransaction` reproduces it, rather than hard-coding a parent
+chain the server is free to choose.
+
+### Capturing the SLRU areas
+
+`CHECKPOINT` runs `CheckPointCLOG` and `CheckPointSUBTRANS`, so both areas are
+flushed before the directories are copied. The generator then re-decodes the
+copied bytes and asserts that
+
+* every xid the heap refers to decodes to the same state `pg_xact_status()`
+  reports on the live server, and
+* every subxid it drove through a savepoint resolves, through the copied
+  `pg_subtrans`, to the top-level transaction it actually belonged to.
+
+That is what makes "these are genuine files from the same cluster" a checked
+claim rather than an assertion.
 
 ### Why the writers are interleaved
 
@@ -107,8 +156,12 @@ in v1 was wrong on only 9 keys.
   forever, and a second updater or locker on an already-locked row is exactly how
   a MultiXact `xmax` appears. Every id range is disjoint by construction.
 * **The observer and the horizon holder must stay read-only.** `pg_fixture.py`
-  asserts `pg_current_xact_id_if_assigned()` is NULL for both, so neither appears
-  in the snapshot or in `tx_status.csv`.
+  asserts `pg_current_xact_id_if_assigned()` is NULL for both, so neither is
+  assigned an xid and neither appears in the snapshot or the commit log.
+* **Savepoint groups must not overlap their own parent's other work.** A
+  transaction that both creates and later modifies the same tuple gets
+  `HEAP_COMBOCID`; every savepoint here touches a disjoint id range, and the
+  generator still aborts if the flag appears.
 * **The file is copied before the observer runs its final `SELECT`,** so the
   reference query cannot add hint bits to the bytes the solver receives.
 
@@ -122,7 +175,7 @@ appears. `build/fixture_test.py` re-asserts all four from the solver-facing byte
 | --- | --- | --- | --- |
 | **Combo CIDs** (`HEAP_COMBOCID`, `0x0020`) | resolving `t_cid` into a `cmin`/`cmax` pair needs the writing backend's in-memory combo array, which no on-disk artefact can supply | no transaction both creates and removes the same tuple; and an external snapshot never consults a command id in the first place | `test_no_combo_command_ids` |
 | **Frozen tuples** (`t_infomask & 0x0300 == 0x0300`, or `xmin` 1/2) | correct handling means treating `xmin` as older than every snapshot and bypassing the commit log | no `VACUUM`/`VACUUM FREEZE` runs, `autovacuum` is off, and the cluster is fresh so no xid is near the freeze horizon | `test_no_frozen_tuples` |
-| **MultiXact `xmax`** (`HEAP_XMAX_IS_MULTI`, `0x1000`) | visibility would depend on `pg_multixact` membership, which is not part of the input | no foreign keys (so no share locks), a single locker for the one `FOR UPDATE`, and no second writer on a locked row | `test_no_multixact_xmax` |
+| **MultiXact `xmax`** (`HEAP_XMAX_IS_MULTI`, `0x1000`) | visibility would depend on `pg_multixact` membership, which is not shipped | no foreign keys (so no share locks), a single locker per row-lock transaction, and no second writer or locker on an already-locked row - including from a subtransaction of the same parent | `test_no_multixact_xmax` |
 | **Out-of-line TOAST** (`HEAP_HASEXTERNAL`, `0x0004`; 1-byte header `0x01`) | the TOAST relation is not shipped | every text value is far below the 2 KiB threshold; the generator also asserts the TOAST relation is empty | `test_no_out_of_line_toast_datum` |
 
 The oracle nevertheless *handles* frozen tuples correctly and raises a clear
@@ -144,7 +197,10 @@ than three committed transactions sit inside the xid range but outside `xip`, if
 no transaction in `xip` aborted, or if any writer is missing from `xip`.
 `build/fixture_test.py` re-derives all of it from the solver-facing bytes alone,
 and `build/measure_negatives.py` additionally asserts that no wrong strategy is
-within 10 primary keys of correct.
+within 10 primary keys of correct.  v3 adds: at least six subtransaction xids on
+the pages, a chain at least three hops deep, at least twelve tuple stamps that
+need `pg_subtrans`, at least one *visible* subtransaction, and at least two
+aborted children under committed parents.
 
 ## Reproducibility
 
@@ -152,13 +208,17 @@ PostgreSQL assigns transaction ids and page LSNs itself. Forcing byte-for-byte
 equality would mean editing genuine page structures, which would defeat the point
 of using a real server, so exact input reproducibility is not a requirement here.
 
-In practice the procedure is stronger than required: two consecutive
-`build/generate_case.py` runs against fresh containers produced **byte-identical**
-`heap_pages.bin`, `tx_status.csv`, `table_schema.json`, `golden.csv` and
-`expected_state.json` (verified during authoring). A third, earlier run with the
-container started by hand produced different page LSNs but the **same logical
-expected state** — identical `golden.csv` and identical canonical digest
-`31137c1baca1ff41b2f194e807f3bb1462d95d71aefb3ece8979605a674e8a11`.
+In practice the procedure is stronger than required. Two consecutive
+`build/generate_case.py` runs against fresh containers produced
+**byte-identical** `heap_pages.bin`, `table_schema.json`, `pg_xact/0000`,
+`pg_subtrans/0000`, `golden.csv` and `expected_state.json` (verified during
+authoring, for v3 as for v2). The canonical digest of the expected state is
+`c9bd582a5f5ff33fafecf7b931af467a75f63501bf69c3b661672677ff5a4720`.
+
+The SLRU segments reproduce for the same reason the heap does: a fresh `initdb`
+starts the xid counter at the same value and the generator drives the same
+statements in the same order, so the same transaction ids land in the same
+commit-log and subtransaction-map slots.
 
 What *is* guaranteed:
 
@@ -174,6 +234,13 @@ If the fixture is regenerated, `build/generate_case.py` rebuilds
 package stays self-consistent. Run `build/run_all_validation.sh` afterwards.
 
 ## Things a reviewer might ask
+
+**Why ship whole SLRU segments rather than just the needed entries?** Because a
+segment is what PostgreSQL writes. Trimming it to the referenced xids would be a
+custom format, and the size argument does not bite: `pg_xact` is two bits per
+transaction and `pg_subtrans` four bytes, so both areas are one 8 KiB page each.
+The segments cover every transaction in the cluster, which leaks nothing - two
+status bits per xid is not an answer.
 
 **Is `pageinspect` needed to solve it?** No. It is used only during generation,
 to cross-check the parser against the server's own reading of the same bytes
@@ -193,6 +260,10 @@ but does not need to walk it.
 ordinary value, and RFC 4180 quoting is part of the stated output contract. It
 makes a hand-rolled `','.join(...)` writer fail, which is a real CSV bug, not a
 trick.
+
+**Could a solver point PostgreSQL at these files?** No. There is no
+`pg_control`, no catalog, no `base/` directory and no server in the image; the
+segments are evidence to decode, not a cluster to start.
 
 **Row order:** genuinely free. The verifier hashes rows keyed by primary key and
 separately asserts that reversing and re-sorting the records does not change the

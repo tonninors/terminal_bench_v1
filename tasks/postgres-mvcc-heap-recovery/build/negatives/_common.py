@@ -23,7 +23,9 @@ ART = TASK / "artifacts"
 def standard_args(description: str):
     ap = argparse.ArgumentParser(description=description)
     ap.add_argument("--heap", default=str(ART / "heap_pages.bin"))
-    ap.add_argument("--tx", default=str(ART / "tx_status.csv"))
+    ap.add_argument("--pg-xact", dest="pg_xact", default=str(ART / "pg_xact"))
+    ap.add_argument("--pg-subtrans", dest="pg_subtrans",
+                    default=str(ART / "pg_subtrans"))
     ap.add_argument("--schema", default=str(ART / "table_schema.json"))
     ap.add_argument("--out", required=True)
     return ap
@@ -31,7 +33,8 @@ def standard_args(description: str):
 
 def load(args):
     js, attrs, snap = G.load_schema(Path(args.schema))
-    status = G.load_tx_status(Path(args.tx))
+    status = G.load_transaction_log(Path(args.pg_xact),
+                                    Path(args.pg_subtrans))
     heap = Path(args.heap).read_bytes()
     tuples = []
     for blk in range(len(heap) // 8192):

@@ -29,7 +29,8 @@ ART = TASK / "artifacts"
 INTERNAL = BUILD / "internal"
 CONTAINER = "tb-pg-mvcc-fixture"
 
-SOLVER_FILES = ["heap_pages.bin", "tx_status.csv", "table_schema.json"]
+SOLVER_FILES = ["heap_pages.bin", "table_schema.json"]
+SOLVER_DIRS = ["pg_xact", "pg_subtrans"]
 INTERNAL_FILES = ["golden.csv", "generation_report.json", "page_items.json"]
 
 
@@ -88,6 +89,11 @@ def main() -> int:
 
         for name in SOLVER_FILES:
             docker("cp", f"{CONTAINER}:/tmp/fixture/{name}", str(ART / name))
+        for name in SOLVER_DIRS:
+            target = ART / name
+            if target.exists():
+                shutil.rmtree(target)
+            docker("cp", f"{CONTAINER}:/tmp/fixture/{name}", str(target))
         for name in INTERNAL_FILES:
             docker("cp", f"{CONTAINER}:/tmp/fixture/internal/{name}",
                    str(INTERNAL / name))
@@ -98,6 +104,16 @@ def main() -> int:
     heap = (ART / "heap_pages.bin").read_bytes()
     if len(heap) % 8192:
         raise SystemExit("heap_pages.bin is not a whole number of 8192-byte blocks")
+    stale = ART / "tx_status.csv"
+    if stale.exists():
+        stale.unlink()
+        print("removed the v2 tx_status.csv; the commit log replaces it")
+    for name in SOLVER_DIRS:
+        segs = sorted((ART / name).iterdir())
+        if not segs:
+            raise SystemExit(f"{name}/ came back empty")
+        print(f"  {name}/: " + ", ".join(f"{p.name} ({p.stat().st_size} bytes)"
+                                         for p in segs))
 
     print("rebuilding the verifier fixture, solution.sh and the ZIP")
     sh([sys.executable, str(BUILD / "make_expected_state.py")])

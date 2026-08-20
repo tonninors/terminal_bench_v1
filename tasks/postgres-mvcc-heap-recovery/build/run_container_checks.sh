@@ -36,6 +36,18 @@ docker cp tests "$NAME:/app/tests" >/dev/null
 docker cp run-tests.sh "$NAME:/app/run-tests.sh" >/dev/null
 docker cp solution.sh "$NAME:/tmp/solution.sh" >/dev/null
 
+printf '\n=== the decoded transaction table is gone ===\n'
+if docker exec "$NAME" test -e /app/tx_status.csv; then
+  bad "tx_status.csv is present in the image"
+else
+  ok "no /app/tx_status.csv; state must come from pg_xact and pg_subtrans"
+fi
+for seg in pg_xact pg_subtrans; do
+  n=$(docker exec "$NAME" sh -c "ls -1 /app/$seg | wc -l")
+  if [ "$n" -ge 1 ]; then ok "/app/$seg/ ships $n segment file(s)"
+  else bad "/app/$seg/ is empty"; fi
+done
+
 printf '\n=== nop: no agent ran, /app/recovered.csv absent ===\n'
 docker exec "$NAME" bash -c 'rm -f /app/recovered.csv; bash /app/run-tests.sh' \
   >$WORK/nop.log 2>&1
@@ -55,7 +67,8 @@ tail -2 $WORK/verify.log | sed 's/^/  /'
 printf '\n=== the in-container answer matches the host oracle byte for byte ===\n'
 docker exec "$NAME" sha256sum /app/recovered.csv | sed 's/^/  /'
 $PY solution/golden_recover.py --heap artifacts/heap_pages.bin \
-    --tx artifacts/tx_status.csv --schema artifacts/table_schema.json \
+    --pg-xact artifacts/pg_xact --pg-subtrans artifacts/pg_subtrans \
+    --schema artifacts/table_schema.json \
     --out "$WORK/host_recovered.csv" >/dev/null \
   || bad "the host oracle run failed"
 host=$(sha256sum "$WORK/host_recovered.csv" | cut -d' ' -f1)

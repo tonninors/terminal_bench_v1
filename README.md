@@ -9,9 +9,11 @@ Terminal Bench 3.0 task packages.
 | [`tasks/sqlite-wal-crash-recovery`](tasks/sqlite-wal-crash-recovery) | systems / databases | hard |
 | [`tasks/postgres-mvcc-heap-recovery`](tasks/postgres-mvcc-heap-recovery) | systems / databases | hard |
 
-`postgres-mvcc-heap-recovery` is at fixture generation **v2**; see
-[`V1_VS_V2_DIFFICULTY.md`](tasks/postgres-mvcc-heap-recovery/V1_VS_V2_DIFFICULTY.md)
-for what changed and why. The solver-facing contract is identical in both.
+`postgres-mvcc-heap-recovery` is at fixture generation **v3**; see
+[`VERSION_HISTORY.md`](tasks/postgres-mvcc-heap-recovery/VERSION_HISTORY.md) for
+what changed at each step and why. v3 replaces the decoded `tx_status.csv` with
+the cluster's raw `pg_xact` and `pg_subtrans` segments, so the solver has to
+decode transaction state and subtransaction ancestry itself.
 
 Each task is self-contained; they share no code, no artifacts and no fixtures.
 

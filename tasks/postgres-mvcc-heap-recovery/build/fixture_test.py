@@ -24,7 +24,8 @@ import golden_recover as G          # noqa: E402
 
 ART = TASK / "artifacts"
 HEAP = ART / "heap_pages.bin"
-TXCSV = ART / "tx_status.csv"
+PG_XACT = ART / "pg_xact"
+PG_SUBTRANS = ART / "pg_subtrans"
 SCHEMA = ART / "table_schema.json"
 GOLDEN = TASK / "build" / "internal" / "golden.csv"
 
@@ -45,7 +46,7 @@ FRESH_NOTES = {"frozen": 0, "hint_conflicts": 0, "lock_only": 0}
 @pytest.fixture(scope="module")
 def fixture():
     js, attrs, snap = G.load_schema(SCHEMA)
-    status = G.load_tx_status(TXCSV)
+    status = G.load_transaction_log(PG_XACT, PG_SUBTRANS)
     heap = HEAP.read_bytes()
     tuples, census = [], {"LP_UNUSED": 0, "LP_NORMAL": 0,
                           "LP_REDIRECT": 0, "LP_DEAD": 0}
@@ -54,8 +55,12 @@ def fixture():
         tuples.extend(t)
         for k in census:
             census[k] += c[k]
+    referenced = sorted({t.xmin for t in tuples if t.xmin} |
+                        {t.xmax for t in tuples if t.xmax})
+    states = {x: status.state(x) for x in referenced}
     return dict(js=js, attrs=attrs, snap=snap, status=status, heap=heap,
-                tuples=tuples, census=census)
+                tuples=tuples, census=census, referenced=referenced,
+                states=states)
 
 
 def pk_index(fixture):
@@ -210,11 +215,11 @@ def test_lock_only_xmax_is_not_masked_by_a_hint_bit(fixture):
     can see, HEAP_XMAX_INVALID is NOT set, and the row is alive purely because
     the xmax records a row lock.  Reading xmax without consulting the infomask
     deletes every one of these rows."""
-    snap, status = fixture["snap"], fixture["status"].map
+    snap, status = fixture["snap"], fixture["states"]
     hard = [t for t in lock_only_tuples(fixture)
             if not (t.infomask & HEAP_XMAX_INVALID)
             and status.get(t.xmax) == "committed"
-            and not snap.in_progress(t.xmax)]
+            and not snap.in_progress(t.xmax, fixture['status'])]
     assert len(hard) >= 15, (
         f"only {len(hard)} lock-only tuple(s) force the infomask to be read; "
         "the rest would already be excused by HEAP_XMAX_INVALID")
@@ -228,7 +233,7 @@ def test_several_row_lock_modes_are_represented(fixture):
 
 def test_committed_xmax_rule_would_lose_many_keys(fixture):
     """Strategy 3, 'a committed xmax means deleted', must be badly wrong."""
-    status = fixture["status"].map
+    status = fixture["states"]
     lost = {k for k, t in visible_by_key(fixture).items()
             if t.xmax and status.get(t.xmax) == "committed"}
     assert len(lost) >= 30, (
@@ -244,36 +249,60 @@ def test_nonzero_xmax_does_not_mean_gone(fixture):
 
 
 # ------------------------------------------------------ snapshot and statuses
-def test_tx_status_covers_every_xid_on_the_pages(fixture):
-    needed = {t.xmin for t in fixture["tuples"]} | {
-        t.xmax for t in fixture["tuples"] if t.xmax}
-    missing = sorted(needed - set(fixture["status"].map))
-    assert not missing, f"tx_status.csv is missing xids {missing[:8]}"
+def test_no_decoded_transaction_table_is_shipped():
+    """v2 handed the solver a decoded xid,status CSV.  v3 must not."""
+    leftovers = [p.name for p in ART.iterdir()
+                 if p.is_file() and p.name not in
+                 ("heap_pages.bin", "table_schema.json")]
+    assert not leftovers, (
+        f"unexpected solver-facing files in artifacts/: {leftovers}")
+    assert not (ART / "tx_status.csv").exists(), (
+        "tx_status.csv is still present; the commit log replaces it")
 
 
-def test_tx_status_uses_only_the_documented_states():
-    with TXCSV.open(encoding="utf-8", newline="") as fh:
-        rows = list(csv.DictReader(fh))
-    assert rows and list(rows[0].keys()) == ["xid", "status"]
-    states = {r["status"] for r in rows}
-    assert states <= {"committed", "aborted", "in_progress"}, states
-    assert {"committed", "aborted", "in_progress"} <= states, (
-        f"the fixture must exercise all three states, saw {sorted(states)}")
+def test_slru_directories_look_like_real_segments():
+    for d, label in ((PG_XACT, "pg_xact"), (PG_SUBTRANS, "pg_subtrans")):
+        assert d.is_dir(), f"{label}/ is missing"
+        segs = sorted(p for p in d.iterdir() if p.is_file())
+        assert segs, f"{label}/ holds no segment files"
+        for f in segs:
+            assert len(f.name) == 4 and all(c in "0123456789ABCDEFabcdef"
+                                            for c in f.name), (
+                f"{label}/{f.name} is not a four-hex-digit SLRU segment name")
+            size = f.stat().st_size
+            assert size and size % 8192 == 0, (
+                f"{label}/{f.name} is {size} bytes, not a whole number of "
+                "8192-byte SLRU pages")
+
+
+def test_commit_log_resolves_every_xid_on_the_pages(fixture):
+    """Every transaction the heap refers to must be decidable from pg_xact."""
+    unknown = [x for x, st in fixture["states"].items()
+               if st not in ("committed", "aborted", "in_progress")]
+    assert not unknown, f"unresolvable transaction states: {unknown[:8]}"
+    assert len(fixture["referenced"]) >= 20, (
+        f"only {len(fixture['referenced'])} transaction(s) touch the pages")
+
+
+def test_all_three_transaction_states_occur(fixture):
+    seen = set(fixture["states"].values())
+    assert {"committed", "aborted", "in_progress"} <= seen, (
+        f"the fixture must exercise all three states, saw {sorted(seen)}")
 
 
 def test_snapshot_has_transactions_on_both_sides_of_the_boundary(fixture):
-    snap, status = fixture["snap"], fixture["status"].map
+    snap, status = fixture["snap"], fixture["states"]
     before = [x for x, s in status.items()
-              if s == "committed" and not snap.in_progress(x)]
+              if s == "committed" and not snap.in_progress(x, fixture['status'])]
     after = [x for x, s in status.items()
-             if s == "committed" and snap.in_progress(x)]
+             if s == "committed" and snap.in_progress(x, fixture['status'])]
     assert before, "no committed transaction is visible under the snapshot"
     assert after, ("no committed transaction is invisible under the snapshot; "
                    "snapshot reasoning would be unnecessary")
 
 
 def test_several_committed_transactions_are_listed_in_snapshot_xip(fixture):
-    status = fixture["status"].map
+    status = fixture["states"]
     inxip = [x for x in sorted(fixture["snap"].xip)
              if status.get(x) == "committed"]
     assert len(inxip) >= 3, (
@@ -286,7 +315,7 @@ def test_snapshot_xip_is_interleaved_with_committed_transactions(fixture):
 
     Otherwise "anything at or above snapshot_xmin is still running" would be a
     correct shortcut and the explicit list would carry no information."""
-    snap, status = fixture["snap"], fixture["status"].map
+    snap, status = fixture["snap"], fixture["states"]
     gap = sorted(x for x, s in status.items()
                  if s == "committed" and snap.xmin <= x < snap.xmax
                  and x not in snap.xip)
@@ -299,13 +328,13 @@ def test_snapshot_xip_is_interleaved_with_committed_transactions(fixture):
 
 
 def test_an_aborted_transaction_is_listed_in_snapshot_xip(fixture):
-    status = fixture["status"].map
+    status = fixture["states"]
     aborted = [x for x in fixture["snap"].xip if status.get(x) == "aborted"]
     assert aborted, "no xid in snapshot_xip aborted"
 
 
 def test_an_in_progress_transaction_wrote_to_the_pages(fixture):
-    status = fixture["status"].map
+    status = fixture["states"]
     running = {x for x, s in status.items() if s == "in_progress"}
     touched = {t.xmin for t in fixture["tuples"]} | {
         t.xmax for t in fixture["tuples"] if t.xmax}
@@ -313,7 +342,7 @@ def test_an_in_progress_transaction_wrote_to_the_pages(fixture):
 
 
 def test_an_aborted_transaction_wrote_to_the_pages(fixture):
-    status = fixture["status"].map
+    status = fixture["states"]
     aborted = {x for x, s in status.items() if s == "aborted"}
     inserted = {t.xmin for t in fixture["tuples"]}
     deleted = {t.xmax for t in fixture["tuples"] if t.xmax}
@@ -323,7 +352,7 @@ def test_an_aborted_transaction_wrote_to_the_pages(fixture):
 
 def test_hint_bits_alone_are_insufficient(fixture):
     """The hints must be too incomplete to reconstruct the commit log."""
-    status = fixture["status"].map
+    status = fixture["states"]
     no_hint = [t for t in fixture["tuples"]
                if not t.infomask & HEAP_XMIN_COMMITTED]
     aborted_unhinted = [t for t in fixture["tuples"]
@@ -334,6 +363,131 @@ def test_hint_bits_alone_are_insufficient(fixture):
     assert len(aborted_unhinted) >= 5, (
         f"only {len(aborted_unhinted)} tuple(s) from aborted transactions lack "
         "HEAP_XMIN_INVALID, so the hints would nearly give the commit log away")
+
+
+# ----------------------------------------------------------- authenticity
+def test_solver_files_carry_no_decoded_answer():
+    """No solver-visible file may contain the reference rows, the verifier
+    fixture, or the expected digest."""
+    golden = GOLDEN.read_bytes()
+    expected = (TASK / "tests" / "expected_state.json").read_bytes()
+    digest = json.loads(expected.decode("utf-8"))["sha256"].encode()
+    files = [HEAP, SCHEMA]
+    files += [f for f in PG_XACT.iterdir() if f.is_file()]
+    files += [f for f in PG_SUBTRANS.iterdir() if f.is_file()]
+    for f in files:
+        blob = f.read_bytes()
+        assert golden not in blob, f"{f.name} embeds the reference answer"
+        assert expected not in blob, f"{f.name} embeds the verifier fixture"
+        assert digest not in blob, f"{f.name} embeds the expected digest"
+    meta = json.loads(SCHEMA.read_text(encoding="utf-8"))
+    for key in ("rows", "visible", "answer", "sha256", "expected", "status",
+                "tx_status"):
+        assert key not in meta, f"table_schema.json carries a {key!r} key"
+
+
+def test_commit_log_is_a_bitmap_not_a_table():
+    """pg_xact packs two bits per transaction, so it cannot be a decoded
+    listing: a text table of xids and states would be mostly ASCII."""
+    for f in PG_XACT.iterdir():
+        blob = f.read_bytes()
+        printable = sum(1 for b in blob if 0x20 <= b < 0x7F)
+        assert printable < len(blob) // 2, (
+            f"{f.name} looks like text, not an SLRU bitmap")
+
+
+def test_every_referenced_xid_resolves_from_the_supplied_evidence(fixture):
+    """Recovery has to be possible from the shipped segments alone."""
+    log = fixture["status"]
+    for x in fixture["referenced"]:
+        assert log.state(x) in ("committed", "aborted", "in_progress"), x
+        top = log.topmost(x)
+        assert log.parent(top) == 0, (
+            f"topmost of {x} is {top}, which still has a parent")
+
+
+# ------------------------------------------------------- subtransactions
+def subtransaction_xids(fixture):
+    log = fixture["status"]
+    return [x for x in fixture["referenced"] if log.is_subtransaction(x)]
+
+
+def test_subtransactions_reach_the_heap(fixture):
+    subs = subtransaction_xids(fixture)
+    assert len(subs) >= 6, (
+        f"only {len(subs)} subtransaction xid(s) stamp tuples on these pages")
+
+
+def test_subtransaction_chains_need_more_than_one_hop(fixture):
+    log = fixture["status"]
+    depths = []
+    for x in subtransaction_xids(fixture):
+        d, cur = 0, x
+        while True:
+            parent = log.parent(cur)
+            if parent == 0 or parent >= cur:
+                break
+            d += 1
+            cur = parent
+        depths.append(d)
+    assert depths and max(depths) >= 2, (
+        f"deepest subtransaction chain is {max(depths) if depths else 0}; a "
+        "single-hop parent lookup would be enough")
+
+
+def test_ignoring_pg_subtrans_changes_the_answer(fixture):
+    """The decisive case: a subxid that pg_xact reports COMMITTED, that is not
+    itself in snapshot_xip, but whose topmost parent is.  Reading the xid at
+    face value marks its work visible when it is not."""
+    log, snap = fixture["status"], fixture["snap"]
+    decisive = []
+    for t in fixture["tuples"]:
+        for role, x in (("xmin", t.xmin), ("xmax", t.xmax)):
+            if not x:
+                continue
+            top = log.topmost(x)
+            if (top != x and fixture["states"].get(x) == "committed"
+                    and x not in snap.xip and snap.in_progress(top, log)):
+                decisive.append((t.block, t.lp, role, x, top))
+    assert len(decisive) >= 12, (
+        f"only {len(decisive)} tuple stamp(s) require pg_subtrans; ignoring the "
+        "subtransaction map would barely be punished")
+
+
+def test_some_subtransactions_are_visible(fixture):
+    """A subtransaction whose parent finished before the snapshot is visible, so
+    "has a pg_subtrans parent" must not be read as "invisible"."""
+    log, snap = fixture["status"], fixture["snap"]
+    benign = [x for x in subtransaction_xids(fixture)
+              if fixture["states"][x] == "committed"
+              and not snap.in_progress(log.topmost(x), log)]
+    assert benign, (
+        "every subtransaction on the pages is invisible; the map could be "
+        "replaced by a blanket rule")
+
+
+def test_aborted_subtransaction_under_a_committed_parent(fixture):
+    """A rolled-back savepoint inside a committed transaction.  The commit log
+    is authoritative per xid, so inheriting the parent's status is wrong."""
+    log = fixture["status"]
+    bad = [x for x in subtransaction_xids(fixture)
+           if fixture["states"][x] == "aborted"
+           and log.state(log.topmost(x)) == "committed"]
+    assert len(bad) >= 2, (
+        f"only {len(bad)} aborted subtransaction(s) sit under a committed parent")
+
+
+def test_inheriting_the_parent_status_loses_keys(fixture):
+    """Count the tuples a solver would wrongly resurrect by using the parent's
+    commit status for a subtransaction."""
+    log = fixture["status"]
+    resurrected = [t for t in fixture["tuples"]
+                   if fixture["states"].get(t.xmin) == "aborted"
+                   and log.topmost(t.xmin) != t.xmin
+                   and log.state(log.topmost(t.xmin)) == "committed"]
+    assert len(resurrected) >= 10, (
+        f"only {len(resurrected)} dead tuple(s) would be resurrected by "
+        "inheriting a parent's commit status")
 
 
 # --------------------------------------------------- the answer is unique...
@@ -358,7 +512,8 @@ def test_the_page_level_answer_equals_the_postgresql_reference():
         out = Path(d) / "recovered.csv"
         r = subprocess.run([sys.executable, str(TASK / "solution" /
                                                 "golden_recover.py"),
-                            "--heap", str(HEAP), "--tx", str(TXCSV),
+                            "--heap", str(HEAP), "--pg-xact", str(PG_XACT),
+                            "--pg-subtrans", str(PG_SUBTRANS),
                             "--schema", str(SCHEMA), "--out", str(out)],
                            capture_output=True, text=True)
         assert r.returncode == 0, r.stderr
@@ -398,7 +553,7 @@ def test_greatest_xmin_is_the_wrong_answer(fixture):
 def test_greatest_xmin_tuple_is_often_from_an_aborted_transaction(fixture):
     """max-xmin must fail specifically because of aborted work, not only
     because of transactions that committed after the snapshot."""
-    status = fixture["status"].map
+    status = fixture["states"]
     n = 0
     for key, versions in versions_by_key(fixture).items():
         newest = max(versions, key=lambda t: (t.xmin, t.block, t.lp))

@@ -1,4 +1,4 @@
-# V1 vs V2 — what changed and why it is harder
+# Version history — v1, v2, v3
 
 Internal document. Not part of the solver-facing bundle.
 
@@ -13,6 +13,98 @@ semantics has to be integrated before the answer comes out right.
 1.3× change in size against the difficulty changes tabulated below.
 
 ---
+
+## v3 — the decoded transaction table is gone
+
+v2 was still solved by a frontier model. v3 removes `tx_status.csv`, the file
+that handed the solver a ready-made `xid,status` mapping, and replaces it with
+the cluster's own metadata: `pg_xact/` (the commit log) and `pg_subtrans/` (the
+subtransaction parent map), copied verbatim as raw SLRU segments.
+
+The solver-facing contract is otherwise unchanged: same heap pages, same
+`table_schema.json`, same `/app/recovered.csv`, same CSV requirements. Only the
+sentence naming the transaction-state input changed in `FINAL_PROMPT.txt`.
+
+### What that buys
+
+Decoding the two files is a modest amount of bit arithmetic. The difficulty is
+what they *mean*, and specifically that **`pg_current_snapshot()` exports
+top-level xids only** — it does not export the snapshot's subtransaction array.
+So a tuple written inside a `SAVEPOINT` carries a subtransaction id that:
+
+* reads `COMMITTED` in `pg_xact` once its parent commits, and
+* matches no entry in `snapshot_xip`, and
+* therefore looks, to a solver that stops there, like ordinary finished work.
+
+It is not. Its topmost parent was still in flight when the snapshot was taken,
+and only `pg_subtrans` says so.
+
+| | v2 | v3 |
+| --- | --- | --- |
+| transaction state input | `tx_status.csv` (decoded `xid,status`) | **`pg_xact/0000` + `pg_subtrans/0000`, raw SLRU** |
+| visible rows (the answer) | 265 | **353** |
+| blocks / heap bytes | 6 / 49152 | **8 / 65536** |
+| physical tuples | 555 | **725** |
+| transactions referenced by the pages | 46 | **61** |
+| subtransaction xids stamping tuples | 0 | **10** |
+| deepest subtransaction chain | – | **3 hops** |
+| tuple stamps needing `pg_subtrans` | – | **24** |
+| aborted children under committed parents | – | **3** |
+| *visible* subtransactions | – | **3** |
+| lock-only `xmax` needing the infomask | 33 | 33 |
+| committed transactions inside `snapshot_xip` | 4 | **5** |
+| committed transactions in range but outside `xip` | 5 | **10** |
+
+### The two new failure modes, and why both are punished
+
+A solver can get subtransactions wrong in two opposite directions, and the
+fixture makes both cost keys:
+
+| strategy | keys wrong | why |
+| --- | ---: | --- |
+| never open `pg_subtrans` | **18** | subxids of an in-flight parent look committed and unlisted, so their work is wrongly applied |
+| resolve the parent, then use *its* commit status | **16** | savepoints that were rolled back are `ABORTED` in their own right; inheriting `COMMITTED` resurrects them |
+
+A third guard stops a blanket rule from working: the fixture also contains
+subtransactions whose topmost parent finished *before* the snapshot, so their
+work **is** visible. "Has a `pg_subtrans` parent" cannot be read as "invisible".
+
+### Every strategy, measured against v3
+
+| # | strategy | v2 keys off | v3 keys off |
+| --- | --- | ---: | ---: |
+| 1 | greatest xmin per key | 132 | **189** |
+| 2 | ignore xmax entirely | 96 | **127** |
+| 3 | committed xmax means deleted | 104 | **128** |
+| 4a | HOT redirects walked as tuples | 15 | **15** |
+| 4b | heap-only versions skipped | 77 | **102** |
+| 5 | aborted treated as committed | 79 | **101** |
+| 6 | in-progress treated as committed | 56 | **67** |
+| 7a | snapshot_xip ignored | 56 | **80** |
+| 7b | every recent xid is in progress | 63 | **74** |
+| 8 | hint bits used as the commit log | 144 | **179** |
+| 9 | every physical tuple | 204 | **286** |
+| 10 | newest committed, no header state | 73 | **103** |
+| 11 | pg_subtrans ignored | n/a (new) | **18** |
+| 12 | subxact inherits parent status | n/a (new) | **16** |
+
+Every one of the fourteen is wrong on at least 15 independent primary keys, and
+`build/harness_test.py` asserts that floor on every run.
+
+### Still true in v3
+
+* genuine PostgreSQL 16 heap pages, 8192 bytes, block-number order;
+* the HOT chains, `LP_REDIRECT`/`LP_DEAD` artefacts and lock-only `xmax` cases
+  v2 introduced, unchanged;
+* `snapshot_xip` sparse and interleaved with committed transactions;
+* no MultiXact, combo CID, frozen tuple, wraparound, prepared transaction or
+  out-of-line TOAST dependency — all still asserted absent;
+* everything synthetic and self-created;
+* `/app/recovered.csv` the only output, verifier outcome-only.
+
+---
+
+## v1 to v2 — the earlier comparison
 
 ## 1. Headline numbers
 
