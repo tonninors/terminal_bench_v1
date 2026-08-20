@@ -1,0 +1,9 @@
+services:
+  client:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: postgres-mvcc-heap-recovery
+    container_name: postgres-mvcc-heap-recovery
+    working_dir: /app
+    command: ["sleep", "infinity"]

@@ -1,0 +1,101 @@
+{
+  "postgres_version_full": "PostgreSQL 16.15 (Debian 16.15-1.pgdg13+2) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+  "block_size": 8192,
+  "blocks": 4,
+  "heap_bytes": 32768,
+  "heap_sha256": "469c05309cd49962e8b8fc17ef32a359eb7e740a75c76df843d5c10d8298955e",
+  "relation_path": "base/16384/16430",
+  "snapshot_text": "770:774:770,771,772",
+  "snapshot_xmin": 770,
+  "snapshot_xmax": 774,
+  "snapshot_xip": [
+    770,
+    771,
+    772
+  ],
+  "transaction_xids": {
+    "T_base_insert": 735,
+    "T_hot_rounds": [
+      736,
+      737,
+      738,
+      739,
+      740,
+      741,
+      742,
+      743,
+      744,
+      745,
+      746,
+      747,
+      748,
+      749,
+      750,
+      751,
+      752,
+      753,
+      754,
+      755,
+      756,
+      757,
+      758,
+      759
+    ],
+    "T_hot_final": 760,
+    "T_update_committed": 761,
+    "T_delete_committed": 762,
+    "T_multiversion": [
+      763,
+      764,
+      765
+    ],
+    "T_insert_aborted": 766,
+    "T_update_aborted": 767,
+    "T_delete_aborted": 768,
+    "T_lock_only": 769,
+    "T_in_progress_1": 770,
+    "T_in_progress_2": 771,
+    "T_in_xip_then_committed": 772,
+    "T_committed_after_open_writers": 773,
+    "T_post_update": 774,
+    "T_post_insert": 775,
+    "T_post_delete": 776,
+    "T_post_hot_update": 777,
+    "T_post_update_aborted": 778,
+    "T_post_delete_aborted": 779
+  },
+  "tx_status_counts": {
+    "aborted": 5,
+    "committed": 12,
+    "in progress": 2
+  },
+  "xids_in_tx_status": 19,
+  "committed_before_snapshot": 7,
+  "committed_after_snapshot": 4,
+  "committed_but_listed_in_xip": [
+    772
+  ],
+  "still_in_progress": [
+    770,
+    771
+  ],
+  "line_pointer_counts": {
+    "LP_UNUSED": 0,
+    "LP_NORMAL": 323,
+    "LP_REDIRECT": 37,
+    "LP_DEAD": 34
+  },
+  "physical_tuples": 323,
+  "tuples_with_nulls": 83,
+  "hot_updated_tuples": 60,
+  "heap_only_tuples": 67,
+  "lock_only_tuples": 3,
+  "toast_chunks": 0,
+  "golden_rows": 210,
+  "excluded_cases_present": {
+    "multixact": 0,
+    "frozen": 0,
+    "combocid": 0,
+    "toast_external": 0
+  }
+}

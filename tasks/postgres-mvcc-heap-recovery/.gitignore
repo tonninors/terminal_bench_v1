@@ -1,0 +1,5 @@
+build/_work/
+build/_work_*
+__pycache__/
+.pytest_cache/
+*.pyc

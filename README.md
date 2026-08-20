@@ -7,12 +7,16 @@ Terminal Bench 3.0 task packages.
 | task | domain / subdomain | difficulty |
 | --- | --- | --- |
 | [`tasks/sqlite-wal-crash-recovery`](tasks/sqlite-wal-crash-recovery) | systems / databases | hard |
+| [`tasks/postgres-mvcc-heap-recovery`](tasks/postgres-mvcc-heap-recovery) | systems / databases | hard |
+
+Each task is self-contained; they share no code, no artifacts and no fixtures.
 
 ## Layout of a task package
 
 ```
 tasks/<name>/
   FINAL_PROMPT.txt           prompt shown to the solver
+  FILE_DESCRIPTION.txt       description of the solver-facing bundle
   task.yaml                  Terminal Bench task definition
   Dockerfile                 task image (copies the inputs to /app)
   docker-compose.yaml
@@ -31,6 +35,24 @@ tasks/<name>/
 are internal-only.
 
 ## Running the local validation
+
+### `postgres-mvcc-heap-recovery`
+
+```
+cd tasks/postgres-mvcc-heap-recovery
+bash build/run_all_validation.sh          # inputs, oracle, verifier, negatives, ZIP
+bash build/run_all_validation.sh --regen  # regenerate from a live PostgreSQL 16 first
+bash build/run_container_checks.sh        # oracle / nop against the real task image
+pytest -q build/fixture_test.py           # properties of the fixture itself
+pytest -q build/harness_test.py           # PASS/FAIL matrix over all candidate answers
+```
+
+Solving and verifying need only the Python 3.11 standard library plus `pytest`.
+Regenerating the fixture (`--regen`) needs Docker and the `postgres:16` image; it
+starts a throwaway container, drives it through the scripted transaction history
+and copies the relation file back out.
+
+### `sqlite-wal-crash-recovery`
 
 ```
 cd tasks/sqlite-wal-crash-recovery

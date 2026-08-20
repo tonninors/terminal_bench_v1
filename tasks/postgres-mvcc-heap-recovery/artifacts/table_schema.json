@@ -1,0 +1,53 @@
+{
+  "postgres_version": "16.15 (Debian 16.15-1.pgdg13+2)",
+  "postgres_version_full": "PostgreSQL 16.15 (Debian 16.15-1.pgdg13+2) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+  "block_size": 8192,
+  "table_name": "public.account_ledger",
+  "primary_key": [
+    "account_id"
+  ],
+  "columns": [
+    {
+      "name": "account_id",
+      "type": "integer",
+      "nullable": false
+    },
+    {
+      "name": "region_code",
+      "type": "character varying(12)",
+      "nullable": false
+    },
+    {
+      "name": "balance_cents",
+      "type": "integer",
+      "nullable": false
+    },
+    {
+      "name": "is_active",
+      "type": "boolean",
+      "nullable": false
+    },
+    {
+      "name": "risk_tier",
+      "type": "smallint",
+      "nullable": true
+    },
+    {
+      "name": "opened_on",
+      "type": "date",
+      "nullable": false
+    },
+    {
+      "name": "owner_note",
+      "type": "text",
+      "nullable": true
+    }
+  ],
+  "snapshot_xmin": 770,
+  "snapshot_xmax": 774,
+  "snapshot_xip": [
+    770,
+    771,
+    772
+  ]
+}
