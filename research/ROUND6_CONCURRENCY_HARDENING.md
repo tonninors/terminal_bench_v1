@@ -136,26 +136,30 @@ mechanical.
 
 ## What six rounds now add up to
 
+> **CORRECTION (post-round).** This section originally claimed the V5
+> family "remains untested against a frontier model." That was wrong.
+> V5 *was* run through the Outlier frontier Failure Test, and the model
+> produced `recovered.csv` byte-identical to the committed golden
+> (42262 bytes; SHA-256 `71faf96e14ba820b8eb6d8988eb7c36b6097b9272e57c1dad0da7428ab6c9510`;
+> git blob `2eae7d57ab020558d79d7ed45e93d05ef04a3db8` — verified against
+> the repository's `build/internal/golden.csv`, which carries the same
+> blob SHA). **The V5 architecture is empirically frontier-solved.**
+> The corrected synthesis lives in `SIX_ROUND_POSTMORTEM.md`.
+
 Three task physics have been tested to destruction with real engines:
 static forensics (Rounds 1–4: complete evidence collapses to
-simulation, incomplete evidence collapses to ill-posedness, and the
-one genuinely abductive family is the banned MVCC-outcome transplant),
-live operational repair (Rounds 5–6: behavioral verification works
+simulation, incomplete evidence collapses to ill-posedness), live
+operational repair (Rounds 5–6: behavioral verification works
 beautifully, but the difficulty collapses under one canonical
 concurrency architecture), and every measured candidate has fallen to a
-single-sitting frontier-equivalent solution. The only architecture in
-this entire program that has never been measured-trivial is the V5
-family itself — engine-defined outcome abduction under destroyed
-authority with constraint pinning — which remains untested against a
-frontier model and excluded by rule. The tournament's empirical
-recommendation is therefore not "keep searching adjacent task shapes":
-it is that the difficulty bar being sought lives either in (a) the
-banned family, pending an explicit decision to re-admit it with
-distance requirements, or (b) task shapes this program has not yet been
-permitted to explore (multi-session interactive incidents, adversarial
-live workloads, or proof-carrying deliverables). A seventh round of
-candidate roulette inside the current constraints is not supported by
-the evidence.
+single-sitting frontier-equivalent solution. With the correction above,
+the abduction family (V5) is *also* known-solved by an actual frontier
+trial — the frontier executed the full parse → evidence-classification
+→ exhaustive-enumeration pipeline to a byte-identical result. There is
+therefore no surviving architecture inside the constraint set this
+program has explored. A seventh round of candidate roulette inside the
+current constraints is not supported by the evidence; the postmortem
+ranks the genuinely unexplored directions.
 
 ---
 
