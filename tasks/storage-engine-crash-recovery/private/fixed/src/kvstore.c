@@ -88,13 +88,36 @@ static int keep_log_bounded(kvstore_t *s);
 
 /* ---------------------------------------------------------- transactions */
 
-/* Keep the page as it stands, so that kv_abort can put it back.  Only the
- * first time a page is touched in a transaction matters. */
+/* Keep the page as it stands, so that the transaction can be put back
+ * the way it found things.  Only the first time a page is touched in a
+ * transaction matters.
+ *
+ * The image also goes into the log.  Keeping it in memory is enough to
+ * undo a transaction the process decides to abandon, and no use at all
+ * for one the process does not survive: the buffer pool will write these
+ * pages back long before the transaction commits, and a checkpoint
+ * forced by the log budget will write them back on purpose.  Whatever is
+ * needed to put them back therefore has to be on disk before they go,
+ * which is the same write-ahead rule the redo records already follow. */
 int txn_snapshot(kvstore_t *s, page_t *pg)
 {
     if (!s->in_txn || !pg) return KV_OK;
     for (size_t i = 0; i < s->undo_n; i++)
         if (s->undo[i].page == pg->id) return KV_OK;
+    {
+        wal_rec_t r;
+        uint64_t lsn = 0;
+        int rc;
+        memset(&r, 0, sizeof r);
+        r.type = WR_UNDO;
+        r.txn  = s->txn;
+        r.page = pg->id;
+        rc = wal_append(s->wal, &r, pg->buf, PAGE_SIZE, &lsn);
+        if (rc != KV_OK) return rc;
+        /* the page may not reach the data file before this record does;
+         * the pager holds back any page whose LSN is not durable yet */
+        if (PHDR(pg)->lsn < lsn) PHDR(pg)->lsn = lsn;
+    }
     if (s->undo_n == s->undo_cap) {
         size_t cap = s->undo_cap ? s->undo_cap * 2 : 64;
         undo_page_t *p = realloc(s->undo, cap * sizeof *p);
@@ -108,6 +131,27 @@ int txn_snapshot(kvstore_t *s, page_t *pg)
     return KV_OK;
 }
 
+/* Put a page back the way the image found it.
+ *
+ * The meta page is not restored wholesale: the tree fields belong to the
+ * transaction and have to go back, but how far the log has been absorbed
+ * and which sequence numbers have been handed out are facts about the
+ * log, not about the transaction, and undoing those would replay work
+ * that is already durable. */
+void undo_restore(page_t *pg, const uint8_t *img)
+{
+    if (pg->id == META_PAGE) {
+        meta_t *cur = (meta_t *)pg->buf;
+        const meta_t *was = (const meta_t *)img;
+        cur->hdr = was->hdr;
+        cur->num_pages = was->num_pages;
+        cur->root = was->root;
+        cur->height = was->height;
+    } else {
+        memcpy(pg->buf, img, PAGE_SIZE);
+    }
+}
+
 static void txn_forget(kvstore_t *s)
 {
     free(s->undo);
@@ -119,7 +163,9 @@ int kv_begin(kvstore_t *s)
 {
     if (!s) return KV_ERR_INVAL;
     if (s->in_txn) return KV_ERR_INVAL;
-    int rc = txn_begin(s);
+    int rc;
+    s->txn_first_lsn = wal_next_lsn(s->wal);   /* the BEGIN record's own lsn */
+    rc = txn_begin(s);
     if (rc != KV_OK) return rc;
     s->in_txn = 1;
     txn_forget(s);
@@ -134,6 +180,7 @@ int kv_commit(kvstore_t *s)
     int rc = txn_commit(s);
     if (rc != KV_OK) return rc;
     s->in_txn = 0;
+    s->txn_first_lsn = 0;
     txn_forget(s);
     return keep_log_bounded(s);
 }
@@ -143,16 +190,34 @@ int kv_abort(kvstore_t *s)
     if (!s || !s->in_txn) return KV_ERR_INVAL;
     /* newest first, so a page touched several times ends up at its
      * oldest remembered image */
+    int rc;
+    wal_rec_t r;
     for (size_t i = s->undo_n; i-- > 0; ) {
         page_t *pg = pager_ensure(s->pg, s->undo[i].page);
         if (!pg) return KV_ERR_IO;
-        memcpy(pg->buf, s->undo[i].img, PAGE_SIZE);
+        undo_restore(pg, s->undo[i].img);
         pager_mark_dirty(s->pg, pg);
         pager_unpin(s->pg, pg);
     }
     s->in_txn = 0;
+
+    /* The rolled back pages have to be on disk before the log is allowed
+     * to say this transaction needs no undoing: until they are, the only
+     * thing that can repair them is the undo records still in the log. */
+    rc = pager_flush_all(s->pg);
+    if (rc == KV_OK) rc = pager_sync(s->pg);
+    if (rc != KV_OK) return rc;
+
+    memset(&r, 0, sizeof r);
+    r.type = WR_END;
+    r.txn  = s->txn;
+    rc = wal_append(s->wal, &r, NULL, 0, NULL);
+    if (rc == KV_OK) rc = wal_sync(s->wal);
+    if (rc != KV_OK) return rc;
+
+    s->txn_first_lsn = 0;
     txn_forget(s);
-    return KV_OK;
+    return keep_log_bounded(s);
 }
 
 /* The log is not allowed to grow without bound.  The budget is checked
@@ -163,8 +228,10 @@ int kv_abort(kvstore_t *s)
  * reclaims the records the data file no longer needs. */
 static int keep_log_bounded(kvstore_t *s)
 {
-    if (wal_bytes(s->wal) < MS_LOG_LIMIT) return KV_OK;
-    return kv_checkpoint(s);
+    if (wal_bytes(s->wal) < s->log_mark + MS_LOG_LIMIT) return KV_OK;
+    int rc = kv_checkpoint(s);
+    if (rc == KV_OK) s->log_mark = wal_bytes(s->wal);
+    return rc;
 }
 
 int kv_put(kvstore_t *s, uint64_t key, const void *val, uint32_t len)
@@ -240,10 +307,20 @@ int kv_checkpoint(kvstore_t *s)
     if (rc != KV_OK) return rc;
 
     /* Every page is on disk and the meta page records how far the log has
-     * been absorbed, so the log can be recycled: nothing before this
-     * point will ever be replayed again. */
+     * been absorbed, so nothing before this point will ever be replayed
+     * again - but replay is not the only thing the log is for.  A
+     * transaction still running has pages on disk that this checkpoint
+     * has just published, and the only description of what they held
+     * before it touched them is in the records this would throw away.
+     * The log may not be recycled out from underneath it. */
+    if (s->in_txn) {
+        ms_crash_hook("checkpoint");
+        return KV_OK;
+    }
     rc = wal_truncate(s->wal);
-    if (rc == KV_OK) ms_crash_hook("checkpoint");
+    if (rc != KV_OK) return rc;
+    s->log_mark = 0;
+    ms_crash_hook("checkpoint");
     return rc;
 }
 

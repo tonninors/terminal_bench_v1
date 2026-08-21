@@ -56,6 +56,11 @@ def main():
                 sys.exit("refusing to package %s with CRLF line endings" % rel)
             info = zipfile.ZipInfo(PREFIX + "/" + rel, FIXED_TIME)
             mode = 0o755 if rel.endswith(EXEC_SUFFIX) else 0o644
+            # the permission bits only survive extraction if the entry
+            # claims to have been made on a unix system; packaging from
+            # Windows otherwise ships the scripts without their execute
+            # bit, and `make test` cannot run them
+            info.create_system = 3
             info.external_attr = (mode << 16) | 0o100000
             info.compress_type = zipfile.ZIP_DEFLATED
             z.writestr(info, data)

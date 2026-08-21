@@ -1,0 +1,902 @@
+--- /tmp/orig/internal.h	2026-08-21 22:33:43.152296679 +0000
++++ src/internal.h	2026-08-21 23:08:59.000000000 +0000
+@@ -2,6 +2,7 @@
+ #ifndef MINISTORE_INTERNAL_H
+ #define MINISTORE_INTERNAL_H
+ 
++#include <stddef.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include "kvstore.h"
+@@ -98,6 +99,17 @@
+ typedef struct wal wal_t;
+ typedef struct pager pager_t;
+ 
++/* An in-memory index of the records the log holds right now: everything
++ * appended since the last wal_truncate().  It lets a page that had to be
++ * thrown out of the buffer pool before its changes could be written be
++ * rebuilt from the log without walking the whole file. */
++typedef struct {
++    uint64_t lsn;
++    uint64_t off;
++    uint32_t page;
++    uint32_t aux;
++} wal_idx_t;
++
+ /* ---------------------------------------------------------------- pager */
+ pager_t *pager_open(const char *path, int *created);
+ int      pager_close(pager_t *p);
+@@ -116,6 +128,28 @@
+ void     pager_attach_wal(pager_t *p, wal_t *w);
+ void     pager_reset_cache(pager_t *p);
+ 
++/* Buffer management under an open transaction.  A page an uncommitted
++ * transaction has changed may not reach the data file - redo recovery has
++ * no way to take such a change back - so the pool evicts one by putting
++ * back the image the transaction found and dropping the changed image,
++ * which the log can rebuild on demand.
++ *
++ *   pager_set_txn_floor  lsn from which changes count as uncommitted
++ *                        (0 while no transaction is open)
++ *   pager_set_hooks      rebuild: bring a page just read from disk up to
++ *                        date from the log; before_image: the image the
++ *                        open transaction found on the page, if any
++ *   pager_forget_dropped stop rebuilding this page: its owner has just
++ *                        put a known image back into the frame
++ *   pager_settle         rebuild and write every page still owed to the
++ *                        data file, so that the log can be recycled */
++void     pager_set_txn_floor(pager_t *p, uint64_t lsn);
++void     pager_set_hooks(pager_t *p, void *ctx,
++                         int (*rebuild)(void *ctx, page_t *pg, uint32_t id),
++                         const uint8_t *(*before_image)(void *ctx, uint32_t id));
++void     pager_forget_dropped(pager_t *p, uint32_t id);
++int      pager_settle(pager_t *p);
++
+ /* ------------------------------------------------------------------ wal */
+ wal_t   *wal_open(const char *path, uint64_t next_lsn);
+ int      wal_close(wal_t *w);
+@@ -127,9 +161,13 @@
+ void     wal_set_next_lsn(wal_t *w, uint64_t lsn);
+ int      wal_read_first(wal_t *w);
+ int      wal_read_next(wal_t *w, wal_rec_t *r, void *payload, uint32_t cap);
++int      wal_read_at(wal_t *w, uint64_t off, wal_rec_t *r, void *payload,
++                     uint32_t cap);
+ int      wal_truncate(wal_t *w);
+ uint64_t wal_durable_lsn(wal_t *w);
+ uint64_t wal_bytes(wal_t *w);
++size_t   wal_index_count(wal_t *w);
++const wal_idx_t *wal_index(wal_t *w);
+ 
+ /* --------------------------------------------------------------- nodes  */
+ void node_init(page_t *pg, uint16_t type);
+@@ -145,7 +183,8 @@
+ 
+ /* -------------------------------------------------------------- btree   */
+ /* A page as it looked before the active transaction first changed it.
+- * kv_abort puts these back. */
++ * kv_abort puts these back, and the pager puts one back on disk when it
++ * has to evict a page the open transaction has changed. */
+ typedef struct {
+     uint32_t page;
+     uint8_t  img[PAGE_SIZE];
+@@ -159,6 +198,12 @@
+     int          in_txn;
+     undo_page_t *undo;          /* before images for the active transaction */
+     size_t       undo_n, undo_cap;
++
++    /* Transactions rolled back since the log was last recycled.  Their
++     * records are still sitting in the log, so anything that replays the
++     * log while the engine is running has to step over them. */
++    uint64_t    *aborted;
++    size_t       aborted_n, aborted_cap;
+ };
+ 
+ /* Remember what `pg` looked like before the active transaction changes
+@@ -166,6 +211,12 @@
+  * page in a transaction is the one that counts. */
+ int txn_snapshot(kvstore_t *s, page_t *pg);
+ 
++/* Did this transaction roll back?  A rolled back transaction left no mark
++ * on the tree, so a replay of the log onto a page has to skip its
++ * records - unlike recovery, which never sees them as committed in the
++ * first place. */
++int txn_was_aborted(const kvstore_t *s, uint64_t txn);
++
+ int btree_put(kvstore_t *s, uint64_t key, const void *val, uint32_t vlen);
+ int btree_del(kvstore_t *s, uint64_t key);
+ int btree_get(kvstore_t *s, uint64_t key, void *buf, uint32_t cap,
+@@ -174,6 +225,11 @@
+ /* ------------------------------------------------------------ recovery  */
+ int recover_redo(kvstore_t *s);
+ 
++/* Bring `pg` - just read from the data file - up to date by replaying the
++ * records the log still holds for page `id`.  Returns 1 when something
++ * was applied, 0 when the page was already current, or an error. */
++int recover_rebuild_page(kvstore_t *s, page_t *pg, uint32_t id);
++
+ /* ---------------------------------------------------------------- util  */
+ uint32_t ms_crc32(const void *data, size_t len);
+ void     ms_crash_hook(const char *point);   /* fault injection           */
+--- /tmp/orig/pager.c	2026-08-21 22:33:43.148296458 +0000
++++ src/pager.c	2026-08-21 22:37:28.000000000 +0000
+@@ -2,10 +2,30 @@
+  *
+  * The buffer pool is deliberately small, the way an embedded engine on a
+  * constrained device is configured: any working set larger than NFRAMES
+- * pages evicts, and eviction writes the frame back.  Frames are written
+- * back lazily and in no particular order.  The write-ahead rule is
+- * enforced here: a dirty page is never written to the data file before
++ * pages evicts, and eviction normally writes the frame back.  Frames are
++ * written back lazily and in no particular order.  The write-ahead rule
++ * is enforced here: a dirty page is never written to the data file before
+  * the log record that describes its newest change is durable.
++ *
++ * There is a second rule, and it is the one crash recovery depends on:
++ * a change made by a transaction that has not committed yet may never
++ * reach the data file.  The log is a redo log - it records what a change
++ * made a page look like afterwards, never what it looked like before - so
++ * once an uncommitted change is in the data file nothing can take it back
++ * again, and an interrupted transaction would come back half applied.
++ *
++ * That rule and the fixed pool would be in conflict - a transaction may
++ * touch far more pages than the pool holds - if evicting such a page
++ * meant writing it.  It does not.  Evicting a page the open transaction
++ * has changed puts the image the transaction *found* back on disk (so the
++ * data file keeps moving forwards through committed work) and throws the
++ * changed image away.  Nothing is lost by that: every change the frame
++ * held is described by a log record, and the log is not recycled while
++ * the transaction that wrote those records is still open, so the page can
++ * be rebuilt from the log the next time it is read.  Recovery gets the
++ * same treatment for free: a crash simply leaves the data file with the
++ * pre-transaction image, which is exactly what "none of it happened"
++ * looks like.
+  */
+ #include <errno.h>
+ #include <fcntl.h>
+@@ -20,6 +40,21 @@
+     int      fd;
+     uint64_t clock;
+     wal_t   *wal;
++
++    /* Changes at or after this lsn belong to a transaction that has not
++     * committed; 0 while no transaction is open. */
++    uint64_t txn_floor;
++
++    /* Pages whose newest image was dropped rather than written, and so
++     * has to be replayed out of the log when they are read again.  One
++     * byte per page id; grown on demand. */
++    uint8_t *owed;
++    uint32_t owed_len;
++
++    void *hook_ctx;
++    int  (*rebuild)(void *ctx, page_t *pg, uint32_t id);
++    const uint8_t *(*before_image)(void *ctx, uint32_t id);
++
+     page_t   meta;
+     page_t   frames[NFRAMES];
+ };
+@@ -38,9 +73,48 @@
+     return (n == PAGE_SIZE) ? KV_OK : KV_ERR_IO;
+ }
+ 
++/* Does this frame hold a change the open transaction made? */
++static int frame_uncommitted(pager_t *p, page_t *f)
++{
++    return p->txn_floor && f->dirty && PHDR(f)->lsn >= p->txn_floor;
++}
++
++static int owed_mark(pager_t *p, uint32_t id)
++{
++    if (id >= p->owed_len) {
++        uint32_t len = p->owed_len ? p->owed_len : 64;
++        while (len <= id) len *= 2;
++        uint8_t *n = realloc(p->owed, len);
++        if (!n) return KV_ERR_IO;
++        memset(n + p->owed_len, 0, len - p->owed_len);
++        p->owed = n;
++        p->owed_len = len;
++    }
++    p->owed[id] = 1;
++    return KV_OK;
++}
++
++void pager_forget_dropped(pager_t *p, uint32_t id)
++{
++    if (id < p->owed_len) p->owed[id] = 0;
++}
++
++void pager_set_txn_floor(pager_t *p, uint64_t lsn) { p->txn_floor = lsn; }
++
++void pager_set_hooks(pager_t *p, void *ctx,
++                     int (*rebuild)(void *ctx, page_t *pg, uint32_t id),
++                     const uint8_t *(*before_image)(void *ctx, uint32_t id))
++{
++    p->hook_ctx = ctx;
++    p->rebuild = rebuild;
++    p->before_image = before_image;
++}
++
+ static int frame_writeback(pager_t *p, page_t *f)
+ {
+     if (!f->dirty) return KV_OK;
++    /* an uncommitted change may not reach the data file */
++    if (frame_uncommitted(p, f)) return KV_OK;
+     /* write-ahead rule */
+     if (p->wal) {
+         int rc = wal_flush_upto(p->wal, PHDR(f)->lsn);
+@@ -53,6 +127,27 @@
+     return KV_OK;
+ }
+ 
++/* Evicting a frame the open transaction has changed: put the image the
++ * transaction found back on disk and note that the frame owes the data
++ * file an image, which the log can rebuild. */
++static int frame_drop(pager_t *p, page_t *f)
++{
++    const uint8_t *img = p->before_image ? p->before_image(p->hook_ctx, f->id)
++                                         : NULL;
++    int rc = owed_mark(p, f->id);
++    if (rc != KV_OK) return rc;
++    if (!img) return KV_OK;
++    if (p->wal) {
++        rc = wal_flush_upto(p->wal, ((const page_hdr_t *)img)->lsn);
++        if (rc != KV_OK) return rc;
++    }
++    rc = page_write(p, f->id, img);
++    if (rc != KV_OK) return rc;
++    ms_crash_hook("page_write");
++    f->dirty = 0;
++    return KV_OK;
++}
++
+ meta_t *pager_meta(pager_t *p) { return (meta_t *)p->meta.buf; }
+ page_t *pager_meta_page(pager_t *p) { return &p->meta; }
+ void pager_meta_dirty(pager_t *p) { p->meta.dirty = 1; }
+@@ -100,6 +195,7 @@
+     return p;
+ fail:
+     close(p->fd);
++    free(p->owed);
+     free(p);
+     return NULL;
+ }
+@@ -109,6 +205,7 @@
+     int rc = pager_flush_all(p);
+     if (rc == KV_OK) rc = pager_sync(p);
+     close(p->fd);
++    free(p->owed);
+     free(p);
+     return rc;
+ }
+@@ -130,17 +227,30 @@
+         if (!victim || p->frames[i].used < victim->used) victim = &p->frames[i];
+     }
+     if (!victim || victim->pin) return NULL;
+-    if (victim->id != INVALID_PAGE && frame_writeback(p, victim) != KV_OK)
+-        return NULL;
++    if (victim->id != INVALID_PAGE) {
++        int rc = frame_uncommitted(p, victim) ? frame_drop(p, victim)
++                                              : frame_writeback(p, victim);
++        if (rc != KV_OK) return NULL;
++    }
+     victim->id = id;
+     victim->dirty = 0;
+     victim->pin = 1;
+     victim->used = ++p->clock;
+-    if (fresh) memset(victim->buf, 0, PAGE_SIZE);
+-    else if (page_read(p, id, victim->buf) != KV_OK) {
++    if (fresh) {
++        memset(victim->buf, 0, PAGE_SIZE);
++        pager_forget_dropped(p, id);
++        return victim;
++    }
++    if (page_read(p, id, victim->buf) != KV_OK) {
+         victim->id = INVALID_PAGE;
+         return NULL;
+     }
++    /* the data file image of this page is behind the log: catch it up */
++    if (id < p->owed_len && p->owed[id] && p->rebuild) {
++        int rc = p->rebuild(p->hook_ctx, victim, id);
++        if (rc < 0) { victim->id = INVALID_PAGE; return NULL; }
++        if (rc > 0) victim->dirty = 1;
++    }
+     return victim;
+ }
+ 
+@@ -191,19 +301,43 @@
+     return frame_for(p, id, 0);
+ }
+ 
++/* Rebuild and write back every page whose image the pool dropped, so that
++ * the data file holds all of the work the log describes.  Only meaningful
++ * with no transaction open - while one is, its pages are exactly the ones
++ * that may not be written. */
++int pager_settle(pager_t *p)
++{
++    if (p->txn_floor) return KV_OK;
++    for (uint32_t id = 0; id < p->owed_len; id++) {
++        if (!p->owed[id]) continue;
++        page_t *pg = frame_for(p, id, 0);
++        if (!pg) return KV_ERR_IO;
++        int rc = frame_writeback(p, pg);
++        pager_unpin(p, pg);
++        if (rc != KV_OK) return rc;
++        p->owed[id] = 0;
++    }
++    return KV_OK;
++}
++
+ int pager_flush_all(pager_t *p)
+ {
++    int rc = pager_settle(p);
++    if (rc != KV_OK) return rc;
+     for (int i = 0; i < NFRAMES; i++) {
+         if (p->frames[i].id == INVALID_PAGE) continue;
+-        int rc = frame_writeback(p, &p->frames[i]);
++        rc = frame_writeback(p, &p->frames[i]);
+         if (rc != KV_OK) return rc;
+     }
+-    if (p->meta.dirty) {
++    /* The meta page carries the root, which structural work inside an
++     * open transaction moves; writing it would publish an uncommitted
++     * tree, so it waits like every other uncommitted change. */
++    if (p->meta.dirty && !p->txn_floor) {
+         if (p->wal) {
+-            int rc = wal_flush_upto(p->wal, PHDR(&p->meta)->lsn);
++            rc = wal_flush_upto(p->wal, PHDR(&p->meta)->lsn);
+             if (rc != KV_OK) return rc;
+         }
+-        int rc = page_write(p, META_PAGE, p->meta.buf);
++        rc = page_write(p, META_PAGE, p->meta.buf);
+         if (rc != KV_OK) return rc;
+         ms_crash_hook("meta_write");
+         p->meta.dirty = 0;
+--- /tmp/orig/wal.c	2026-08-21 22:33:43.152296679 +0000
++++ src/wal.c	2026-08-21 22:38:07.000000000 +0000
+@@ -4,6 +4,14 @@
+  * by a crash can be detected and ignored.  A checkpoint recycles the log
+  * with wal_truncate(): once every page is on disk, nothing before that
+  * point can be needed again.
++ *
++ * Alongside the file the log keeps an in-memory index of the records it
++ * currently holds - everything appended since the last wal_truncate().
++ * The pager uses it to rebuild a page whose newest image it had to drop
++ * rather than write (see pager.c) without scanning the whole log.  The
++ * index describes only what this process appended, which is exactly
++ * right: recovery brings the data file up to date with everything older
++ * before the first record is appended.
+  */
+ #include <fcntl.h>
+ #include <stdlib.h>
+@@ -18,6 +26,8 @@
+     uint64_t next_lsn;
+     uint64_t written_lsn;  /* highest lsn handed to the OS      */
+     uint64_t durable_lsn;  /* highest lsn known to be on disk   */
++    wal_idx_t *idx;        /* records the log holds right now   */
++    size_t   idx_n, idx_cap;
+ };
+ 
+ wal_t *wal_open(const char *path, uint64_t next_lsn)
+@@ -36,12 +46,15 @@
+ {
+     int rc = (fsync(w->fd) == 0) ? KV_OK : KV_ERR_IO;
+     close(w->fd);
++    free(w->idx);
+     free(w);
+     return rc;
+ }
+ 
+ uint64_t wal_next_lsn(wal_t *w) { return w->next_lsn; }
+ uint64_t wal_bytes(wal_t *w) { return (uint64_t)w->end; }
++size_t wal_index_count(wal_t *w) { return w->idx_n; }
++const wal_idx_t *wal_index(wal_t *w) { return w->idx; }
+ 
+ /* Recovery learns from the log how far sequence numbers actually got, so
+  * that the records written after it continue past the ones already
+@@ -55,6 +68,23 @@
+ }
+ uint64_t wal_durable_lsn(wal_t *w) { return w->durable_lsn; }
+ 
++static int idx_add(wal_t *w, const wal_rec_t *r, off_t off)
++{
++    if (w->idx_n == w->idx_cap) {
++        size_t cap = w->idx_cap ? w->idx_cap * 2 : 512;
++        wal_idx_t *p = realloc(w->idx, cap * sizeof *p);
++        if (!p) return KV_ERR_IO;
++        w->idx = p;
++        w->idx_cap = cap;
++    }
++    w->idx[w->idx_n].lsn  = r->lsn;
++    w->idx[w->idx_n].off  = (uint64_t)off;
++    w->idx[w->idx_n].page = r->page;
++    w->idx[w->idx_n].aux  = r->aux;
++    w->idx_n++;
++    return KV_OK;
++}
++
+ int wal_append(wal_t *w, wal_rec_t *r, const void *payload, uint32_t vlen,
+                uint64_t *out_lsn)
+ {
+@@ -74,6 +104,7 @@
+ 
+     ssize_t n = pwrite(w->fd, buf, r->len, w->end);
+     if (n != (ssize_t)r->len) return KV_ERR_IO;
++    if (idx_add(w, r, w->end) != KV_OK) return KV_ERR_IO;
+     w->end += r->len;
+     w->written_lsn = r->lsn;
+     if (out_lsn) *out_lsn = r->lsn;
+@@ -126,9 +157,22 @@
+     return KV_OK;
+ }
+ 
++/* Read the record the index says sits at `off`, leaving the iteration
++ * cursor where it was. */
++int wal_read_at(wal_t *w, uint64_t off, wal_rec_t *r, void *payload,
++                uint32_t cap)
++{
++    off_t save = w->read_off;
++    w->read_off = (off_t)off;
++    int rc = wal_read_next(w, r, payload, cap);
++    w->read_off = save;
++    return rc;
++}
++
+ int wal_truncate(wal_t *w)
+ {
+     if (ftruncate(w->fd, 0) != 0) return KV_ERR_IO;
+     w->end = 0;
++    w->idx_n = 0;
+     return wal_sync(w);
+ }
+--- /tmp/orig/recover.c	2026-08-21 22:33:43.148296458 +0000
++++ src/recover.c	2026-08-21 22:47:36.000000000 +0000
+@@ -6,6 +6,17 @@
+  * transactions against the data file, skipping any page whose stored LSN
+  * shows the change already reached disk.  Replaying an already recovered
+  * database must therefore change nothing.
++ *
++ * Redo on its own is only enough because the pager refuses to put an
++ * uncommitted change into the data file (see pager.c): what a crash
++ * leaves behind is committed work, some of it still only in the log, and
++ * never a fragment of a transaction that had not committed.  So there is
++ * nothing here to take back - the loser transactions are simply the ones
++ * this pass does not replay.
++ *
++ * The same record-by-record apply is used while the engine is running, by
++ * recover_rebuild_page(), to catch up a page the buffer pool had to drop
++ * rather than write.
+  */
+ #include <stdlib.h>
+ #include <string.h>
+@@ -40,104 +51,136 @@
+     return lo < t->n && t->ids[lo] == id;
+ }
+ 
+-static page_t *page_for(kvstore_t *s, uint32_t id, uint64_t lsn, int *apply)
+-{
+-    page_t *pg = pager_ensure(s->pg, id);
+-    if (!pg) return NULL;
+-    *apply = (PHDR(pg)->lsn < lsn);
+-    return pg;
+-}
++/* ------------------------------------------------------------- apply --- */
+ 
+-static void stamp(kvstore_t *s, page_t *pg, uint64_t lsn)
++/* The page ids a record changes: at most two, and for a split the new
++ * sibling comes first because it is logged as a whole image and so does
++ * not depend on the page it came from. */
++static int rec_pages(const wal_rec_t *r, uint32_t *out)
+ {
+-    PHDR(pg)->lsn = lsn;
+-    pager_mark_dirty(s->pg, pg);
++    switch (r->type) {
++    case WR_LEAF_PUT:
++    case WR_LEAF_DEL:
++    case WR_INT_INSERT:
++    case WR_NEW_ROOT:
++        out[0] = r->page;
++        return 1;
++    case WR_LEAF_SPLIT:
++    case WR_INT_SPLIT:
++        out[0] = r->aux;
++        out[1] = r->page;
++        return 2;
++    default:
++        return 0;                       /* begin / commit / checkpoint */
++    }
+ }
+ 
+-static int redo_one(kvstore_t *s, const wal_rec_t *r, const uint8_t *payload)
++/* Apply `r` to page `id`, whose current image is in `pg`.  A record older
++ * than the page LSN has already reached this image and is skipped, which
++ * is what makes replaying the log twice - or finishing a replay that was
++ * interrupted - leave exactly the same page. */
++static int apply_to_page(page_t *pg, uint32_t id, const wal_rec_t *r,
++                         const uint8_t *payload)
+ {
+-    page_t *pg, *right;
+-    int apply = 0;
++    if (PHDR(pg)->lsn >= r->lsn) return KV_OK;
+ 
+     switch (r->type) {
+     case WR_LEAF_PUT:
+-        pg = page_for(s, r->page, r->lsn, &apply);
+-        if (!pg) return KV_ERR_IO;
+-        if (apply) {
+-            if (PHDR(pg)->type != PT_LEAF) node_init(pg, PT_LEAF);
+-            leaf_put(pg, r->key, payload, r->vlen);
+-            stamp(s, pg, r->lsn);
+-        }
+-        pager_unpin(s->pg, pg);
+-        return KV_OK;
++        if (PHDR(pg)->type != PT_LEAF) node_init(pg, PT_LEAF);
++        leaf_put(pg, r->key, payload, r->vlen);
++        break;
+ 
+     case WR_LEAF_DEL:
+-        pg = page_for(s, r->page, r->lsn, &apply);
+-        if (!pg) return KV_ERR_IO;
+-        if (apply) {
+-            leaf_del(pg, r->key);
+-            stamp(s, pg, r->lsn);
+-        }
+-        pager_unpin(s->pg, pg);
+-        return KV_OK;
++        leaf_del(pg, r->key);
++        break;
++
++    case WR_INT_INSERT:
++        if (PHDR(pg)->type != PT_INTERNAL) node_init(pg, PT_INTERNAL);
++        int_insert(pg, r->key, r->arg);
++        break;
++
++    case WR_NEW_ROOT:
++        node_init(pg, PT_INTERNAL);
++        int_set_leftmost(pg, r->aux);
++        int_insert(pg, r->key, r->arg);
++        break;
+ 
+     case WR_LEAF_SPLIT:
+-    case WR_INT_SPLIT: {
++    case WR_INT_SPLIT:
+         /* The new sibling is logged as a formatted image, so neither half
+          * depends on the other having survived: each is replayed only if
+          * its own LSN is behind this record. */
+-        int apply_left = 0, apply_right = 0;
+-        right = page_for(s, r->aux, r->lsn, &apply_right);
+-        if (!right) return KV_ERR_IO;
+-        if (apply_right) {
+-            if (r->vlen != PAGE_SIZE) {
+-                pager_unpin(s->pg, right);
+-                return KV_ERR_CORRUPT;
+-            }
+-            memcpy(right->buf, payload, PAGE_SIZE);
+-            stamp(s, right, r->lsn);
+-        }
+-        pager_unpin(s->pg, right);
+-
+-        pg = page_for(s, r->page, r->lsn, &apply_left);
+-        if (!pg) return KV_ERR_IO;
+-        if (apply_left) {
++        if (id == r->aux) {
++            if (r->vlen != PAGE_SIZE) return KV_ERR_CORRUPT;
++            memcpy(pg->buf, payload, PAGE_SIZE);
++        } else {
+             PHDR(pg)->nkeys = (uint16_t)r->arg;
+             if (r->type == WR_LEAF_SPLIT) PHDR(pg)->link = r->aux;
+-            stamp(s, pg, r->lsn);
+         }
+-        pager_unpin(s->pg, pg);
++        break;
++
++    default:
+         return KV_OK;
+     }
++    PHDR(pg)->lsn = r->lsn;
++    return KV_OK;
++}
+ 
+-    case WR_INT_INSERT:
+-        pg = page_for(s, r->page, r->lsn, &apply);
+-        if (!pg) return KV_ERR_IO;
+-        if (apply) {
+-            if (PHDR(pg)->type != PT_INTERNAL) node_init(pg, PT_INTERNAL);
+-            int_insert(pg, r->key, r->arg);
+-            stamp(s, pg, r->lsn);
+-        }
+-        pager_unpin(s->pg, pg);
+-        return KV_OK;
++static int redo_one(kvstore_t *s, const wal_rec_t *r, const uint8_t *payload)
++{
++    uint32_t ids[2];
++    int n = rec_pages(r, ids);
+ 
+-    case WR_NEW_ROOT:
+-        pg = page_for(s, r->page, r->lsn, &apply);
++    for (int i = 0; i < n; i++) {
++        page_t *pg = pager_ensure(s->pg, ids[i]);
+         if (!pg) return KV_ERR_IO;
+-        if (apply) {
+-            node_init(pg, PT_INTERNAL);
+-            int_set_leftmost(pg, r->aux);
+-            int_insert(pg, r->key, r->arg);
+-            stamp(s, pg, r->lsn);
+-        }
++        uint64_t was = PHDR(pg)->lsn;
++        int rc = apply_to_page(pg, ids[i], r, payload);
++        if (PHDR(pg)->lsn != was) pager_mark_dirty(s->pg, pg);
+         pager_unpin(s->pg, pg);
++        if (rc != KV_OK) return rc;
++    }
++    if (r->type == WR_NEW_ROOT) {
+         pager_meta(s->pg)->root = r->page;
+         pager_meta_dirty(s->pg);
+-        return KV_OK;
++    }
++    return KV_OK;
++}
+ 
+-    default:
+-        return KV_OK;                       /* begin / commit / checkpoint */
++/* Catch a page just read from the data file up with the records the log
++ * still holds for it.  The pager calls this when it reads a page whose
++ * newest image it had to drop instead of write; every one of those
++ * changes is still in the log, because the log is not recycled until the
++ * data file holds everything it describes. */
++int recover_rebuild_page(kvstore_t *s, page_t *pg, uint32_t id)
++{
++    const wal_idx_t *ix = wal_index(s->wal);
++    size_t n = wal_index_count(s->wal);
++    wal_rec_t r;
++    uint8_t payload[PAGE_SIZE];
++    uint32_t ids[2];
++    int applied = 0;
++
++    for (size_t i = 0; i < n; i++) {
++        if (ix[i].lsn <= PHDR(pg)->lsn) continue;
++        if (ix[i].page != id && ix[i].aux != id) continue;
++        if (wal_read_at(s->wal, ix[i].off, &r, payload, sizeof payload)
++            != KV_OK)
++            return KV_ERR_CORRUPT;
++        /* A rolled back transaction still has its records in the log -
++         * nothing rewrites the log to take them out - but it left no mark
++         * on the tree, so replaying them here would put its changes back. */
++        if (txn_was_aborted(s, r.txn)) continue;
++        int np = rec_pages(&r, ids);
++        for (int k = 0; k < np; k++) {
++            if (ids[k] != id) continue;
++            uint64_t was = PHDR(pg)->lsn;
++            int rc = apply_to_page(pg, id, &r, payload);
++            if (rc != KV_OK) return rc;
++            if (PHDR(pg)->lsn != was) applied = 1;
++        }
+     }
++    return applied;
+ }
+ 
+ /* height is bookkeeping, not data: derive it from the recovered tree */
+--- /tmp/orig/kvstore.c	2026-08-21 22:33:43.144296236 +0000
++++ src/kvstore.c	2026-08-21 23:09:00.000000000 +0000
+@@ -28,6 +28,26 @@
+     }
+ }
+ 
++/* ---- what the pager needs from us -------------------------------------
++ * The pool may not write a page the open transaction has changed.  When
++ * it has to evict one it asks for the image that transaction found - the
++ * same before image kv_abort puts back - writes that instead, and asks
++ * for the dropped image to be replayed out of the log next time the page
++ * is read. */
++
++static int rebuild_hook(void *ctx, page_t *pg, uint32_t id)
++{
++    return recover_rebuild_page((kvstore_t *)ctx, pg, id);
++}
++
++static const uint8_t *before_image_hook(void *ctx, uint32_t id)
++{
++    kvstore_t *s = ctx;
++    for (size_t i = 0; i < s->undo_n; i++)
++        if (s->undo[i].page == id) return s->undo[i].img;
++    return NULL;
++}
++
+ kvstore_t *kv_open(const char *path)
+ {
+     kvstore_t *s = calloc(1, sizeof *s);
+@@ -43,10 +63,11 @@
+     free(wp);
+     if (!s->wal) { pager_close(s->pg); free(s->path); free(s); return NULL; }
+     pager_attach_wal(s->pg, s->wal);
++    pager_set_hooks(s->pg, s, rebuild_hook, before_image_hook);
+ 
+     if (recover_redo(s) != KV_OK) {
++        pager_close(s->pg);     /* before the log it may still want to read */
+         wal_close(s->wal);
+-        pager_close(s->pg);
+         free(s->path);
+         free(s);
+         return NULL;
+@@ -61,11 +82,18 @@
+ static int txn_begin(kvstore_t *s)
+ {
+     wal_rec_t r;
++    uint64_t lsn = 0;
+     memset(&r, 0, sizeof r);
+     s->txn++;
+     r.type = WR_BEGIN;
+     r.txn = s->txn;
+-    return wal_append(s->wal, &r, NULL, 0, NULL);
++    int rc = wal_append(s->wal, &r, NULL, 0, &lsn);
++    if (rc != KV_OK) return rc;
++    /* From here on every change carries a higher lsn than this, which is
++     * how the pager tells the work of this transaction apart from the
++     * committed work it is allowed to write out. */
++    pager_set_txn_floor(s->pg, lsn);
++    return KV_OK;
+ }
+ 
+ static int txn_commit(kvstore_t *s)
+@@ -78,6 +106,8 @@
+     if (rc != KV_OK) return rc;
+     rc = wal_sync(s->wal);                 /* the commit is durable here */
+     if (rc != KV_OK) return rc;
++    /* Its changes are committed work now, so the pool may write them. */
++    pager_set_txn_floor(s->pg, 0);
+     pager_meta(s->pg)->next_lsn = wal_next_lsn(s->wal);
+     pager_meta_dirty(s->pg);
+     ms_crash_hook("commit");
+@@ -115,14 +145,40 @@
+     s->undo_n = s->undo_cap = 0;
+ }
+ 
++/* Rolling a transaction back leaves its records in the log; nothing goes
++ * back and rewrites them.  Recovery does not care - it replays only what
++ * committed - but the pool rebuilds dropped pages out of the same log
++ * while the engine runs, so it has to be told which transactions to step
++ * over.  The list only has to reach as far back as the log does, so a
++ * checkpoint clears it along with the log. */
++static int txn_note_aborted(kvstore_t *s, uint64_t txn)
++{
++    if (s->aborted_n == s->aborted_cap) {
++        size_t cap = s->aborted_cap ? s->aborted_cap * 2 : 32;
++        uint64_t *p = realloc(s->aborted, cap * sizeof *p);
++        if (!p) return KV_ERR_IO;
++        s->aborted = p;
++        s->aborted_cap = cap;
++    }
++    s->aborted[s->aborted_n++] = txn;
++    return KV_OK;
++}
++
++int txn_was_aborted(const kvstore_t *s, uint64_t txn)
++{
++    for (size_t i = 0; i < s->aborted_n; i++)
++        if (s->aborted[i] == txn) return 1;
++    return 0;
++}
++
+ int kv_begin(kvstore_t *s)
+ {
+     if (!s) return KV_ERR_INVAL;
+     if (s->in_txn) return KV_ERR_INVAL;
++    txn_forget(s);
+     int rc = txn_begin(s);
+     if (rc != KV_OK) return rc;
+     s->in_txn = 1;
+-    txn_forget(s);
+     /* the meta page carries the root and the page count, which structural
+      * work changes too */
+     return txn_snapshot(s, pager_meta_page(s->pg));
+@@ -141,28 +197,56 @@
+ int kv_abort(kvstore_t *s)
+ {
+     if (!s || !s->in_txn) return KV_ERR_INVAL;
++    meta_t *m = pager_meta(s->pg);
++    int rc = txn_note_aborted(s, s->txn);
++    if (rc != KV_OK) return rc;
++
+     /* newest first, so a page touched several times ends up at its
+      * oldest remembered image */
+     for (size_t i = s->undo_n; i-- > 0; ) {
+-        page_t *pg = pager_ensure(s->pg, s->undo[i].page);
++        uint32_t id = s->undo[i].page;
++        if (id == META_PAGE) {
++            /* Only the tree the meta page describes belongs to the
++             * transaction.  The page count is left where it is - the
++             * pages this transaction allocated stay allocated and simply
++             * end up unreachable, which is cheaper than risking a page id
++             * being handed out twice - and the checkpoint and lsn fields
++             * are the log's bookkeeping, not the transaction's. */
++            const meta_t *old = (const meta_t *)s->undo[i].img;
++            m->root = old->root;
++            m->height = old->height;
++            pager_meta_dirty(s->pg);
++            continue;
++        }
++        /* The frame is about to hold a known image, so the pager must
++         * stop trying to replay the log onto it. */
++        pager_forget_dropped(s->pg, id);
++        page_t *pg = pager_ensure(s->pg, id);
+         if (!pg) return KV_ERR_IO;
+         memcpy(pg->buf, s->undo[i].img, PAGE_SIZE);
+         pager_mark_dirty(s->pg, pg);
+         pager_unpin(s->pg, pg);
+     }
+     s->in_txn = 0;
++    pager_set_txn_floor(s->pg, 0);
+     txn_forget(s);
+     return KV_OK;
+ }
+ 
+-/* The log is not allowed to grow without bound.  The budget is checked
+- * after every operation, not only at commit, because one transaction may
+- * write far more than MS_LOG_LIMIT on its own: a transaction is not
+- * allowed to hold the log open indefinitely.  Once the log passes the
+- * budget the engine takes a checkpoint, which flushes the pages and
+- * reclaims the records the data file no longer needs. */
++/* The log is not allowed to grow without bound: once it passes the budget
++ * the engine takes a checkpoint, which flushes the pages, records how far
++ * the log has been absorbed and recycles it.
++ *
++ * The budget is enforced between transactions, not inside one.  While a
++ * transaction is open the log holds the only copy of the changes the pool
++ * dropped rather than write - dropping them is what keeps uncommitted
++ * work out of the data file - so recycling the log there would throw away
++ * work that has nowhere else to live.  A checkpoint taken inside a
++ * transaction would also have to claim that every page older than it is
++ * on disk, which is exactly what an open transaction makes untrue. */
+ static int keep_log_bounded(kvstore_t *s)
+ {
++    if (s->in_txn) return KV_OK;
+     if (wal_bytes(s->wal) < MS_LOG_LIMIT) return KV_OK;
+     return kv_checkpoint(s);
+ }
+@@ -217,6 +301,20 @@
+     int rc;
+ 
+     if (!s) return KV_ERR_INVAL;
++
++    if (s->in_txn) {
++        /* Most of a checkpoint is impossible with a transaction open: its
++         * pages may not be written, so the records describing them may
++         * not be recycled and the log has not been absorbed up to here.
++         * Flush the committed pages and leave the log alone. */
++        rc = pager_flush_all(s->pg);
++        if (rc == KV_OK) rc = pager_sync(s->pg);
++        return rc;
++    }
++
++    /* pager_flush_all also rebuilds and writes the pages the pool dropped
++     * while the last transaction was running, so that the data file
++     * really does hold everything the log describes. */
+     rc = pager_flush_all(s->pg);
+     if (rc != KV_OK) return rc;
+     rc = pager_sync(s->pg);
+@@ -243,8 +341,10 @@
+      * been absorbed, so the log can be recycled: nothing before this
+      * point will ever be replayed again. */
+     rc = wal_truncate(s->wal);
+-    if (rc == KV_OK) ms_crash_hook("checkpoint");
+-    return rc;
++    if (rc != KV_OK) return rc;
++    s->aborted_n = 0;          /* their records went with the log */
++    ms_crash_hook("checkpoint");
++    return KV_OK;
+ }
+ 
+ int kv_close(kvstore_t *s)
+@@ -252,9 +352,11 @@
+     if (!s) return KV_ERR_INVAL;
+     if (s->in_txn) kv_abort(s);
+     int rc = kv_checkpoint(s);
+-    int rc2 = wal_close(s->wal);
+-    int rc3 = pager_close(s->pg);
++    /* the pager may still need the log to settle a page, so it goes first */
++    int rc2 = pager_close(s->pg);
++    int rc3 = wal_close(s->wal);
+     txn_forget(s);
++    free(s->aborted);
+     free(s->path);
+     free(s);
+     if (rc != KV_OK) return rc;

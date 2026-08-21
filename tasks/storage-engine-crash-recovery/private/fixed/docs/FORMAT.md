@@ -68,7 +68,7 @@ Entries are sorted by key.  `link` is the leftmost child: keys below
 
 ## Log file
 
-The log is a sequence of records, each a 56 byte header followed by
+The log is a sequence of records, each a 48 byte header followed by
 `vlen` payload bytes.
 
 | offset | size | field | meaning                                       |

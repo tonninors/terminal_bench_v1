@@ -25,7 +25,7 @@ $(BIN): tools/kvcli.c $(LIB)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 test check: all
-	@bash tests/run_all.sh
+	@tests/run_all.sh
 
 clean:
 	rm -f $(OBJ)

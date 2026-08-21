@@ -666,6 +666,8 @@ static const char *rec_name(uint32_t t)
     case WR_INT_SPLIT:  return "INT_SPLIT";
     case WR_NEW_ROOT:   return "NEW_ROOT";
     case WR_CHECKPOINT: return "CHECKPOINT";
+    case WR_UNDO:       return "UNDO";
+    case WR_END:        return "END";
     default:            return "?";
     }
 }

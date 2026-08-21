@@ -77,6 +77,8 @@ typedef struct page {
 #define WR_INT_SPLIT   7
 #define WR_NEW_ROOT    8
 #define WR_CHECKPOINT  9
+#define WR_UNDO       10   /* page as it was before this txn */
+#define WR_END        11   /* txn rolled back; do not undo again */
 
 #define WAL_MAGIC 0x57414C31u        /* "WAL1" */
 #define WAL_MAX_PAYLOAD PAGE_SIZE    /* a split logs the new page in full */
@@ -128,6 +130,9 @@ void     wal_set_next_lsn(wal_t *w, uint64_t lsn);
 int      wal_read_first(wal_t *w);
 int      wal_read_next(wal_t *w, wal_rec_t *r, void *payload, uint32_t cap);
 int      wal_truncate(wal_t *w);
+int      wal_read_at(wal_t *w, uint64_t off, wal_rec_t *r,
+                     void *payload, uint32_t cap);
+uint64_t wal_read_offset(wal_t *w);
 uint64_t wal_durable_lsn(wal_t *w);
 uint64_t wal_bytes(wal_t *w);
 
@@ -157,6 +162,8 @@ struct kvstore {
     uint64_t     txn;
     char        *path;
     int          in_txn;
+    uint64_t     txn_first_lsn; /* first record of the active txn */
+    uint64_t     log_mark;      /* log size at the last checkpoint */
     undo_page_t *undo;          /* before images for the active transaction */
     size_t       undo_n, undo_cap;
 };
@@ -165,6 +172,7 @@ struct kvstore {
  * it.  Called by btree.c before every page mutation; the first call for a
  * page in a transaction is the one that counts. */
 int txn_snapshot(kvstore_t *s, page_t *pg);
+void undo_restore(page_t *pg, const uint8_t *img);
 
 int btree_put(kvstore_t *s, uint64_t key, const void *val, uint32_t vlen);
 int btree_del(kvstore_t *s, uint64_t key);

@@ -105,7 +105,20 @@ int wal_read_first(wal_t *w)
  * KV_ERR_CORRUPT on a torn or damaged tail. */
 int wal_read_next(wal_t *w, wal_rec_t *r, void *payload, uint32_t cap)
 {
-    ssize_t n = pread(w->fd, r, sizeof *r, w->read_off);
+    uint64_t off = (uint64_t)w->read_off;
+    int rc = wal_read_at(w, off, r, payload, cap);
+    if (rc == KV_OK) w->read_off = (off_t)(off + r->len);
+    return rc;
+}
+
+uint64_t wal_read_offset(wal_t *w) { return (uint64_t)w->read_off; }
+
+/* Read the record at a byte offset without disturbing the iteration
+ * cursor, so a pass can note where a record was and come back to it. */
+int wal_read_at(wal_t *w, uint64_t at, wal_rec_t *r, void *payload,
+                uint32_t cap)
+{
+    ssize_t n = pread(w->fd, r, sizeof *r, (off_t)at);
     if (n == 0) return KV_ERR_NOTFOUND;
     if (n != (ssize_t)sizeof *r) return KV_ERR_CORRUPT;
     if (r->magic != WAL_MAGIC) return KV_ERR_CORRUPT;
@@ -113,7 +126,7 @@ int wal_read_next(wal_t *w, wal_rec_t *r, void *payload, uint32_t cap)
         return KV_ERR_CORRUPT;
 
     uint8_t buf[sizeof(wal_rec_t) + WAL_MAX_PAYLOAD];
-    n = pread(w->fd, buf, r->len, w->read_off);
+    n = pread(w->fd, buf, r->len, (off_t)at);
     if (n != (ssize_t)r->len) return KV_ERR_CORRUPT;
     size_t off = offsetof(wal_rec_t, crc) + sizeof(uint32_t);
     if (ms_crc32(buf + off, r->len - off) != r->crc) return KV_ERR_CORRUPT;
@@ -122,7 +135,6 @@ int wal_read_next(wal_t *w, wal_rec_t *r, void *payload, uint32_t cap)
         if (r->vlen > cap) return KV_ERR_CORRUPT;
         memcpy(payload, buf + sizeof *r, r->vlen);
     }
-    w->read_off += r->len;
     return KV_OK;
 }
 
