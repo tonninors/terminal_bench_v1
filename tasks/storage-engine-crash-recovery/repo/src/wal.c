@@ -40,6 +40,7 @@ int wal_close(wal_t *w)
 }
 
 uint64_t wal_next_lsn(wal_t *w) { return w->next_lsn; }
+uint64_t wal_bytes(wal_t *w) { return (uint64_t)w->end; }
 
 /* Recovery learns from the log how far sequence numbers actually got, so
  * that the records written after it continue past the ones already

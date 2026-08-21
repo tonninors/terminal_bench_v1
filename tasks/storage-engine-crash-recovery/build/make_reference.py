@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Rebuild private/fixed (the reference repair) from the shipped tree, and
+"""Rebuild private/fixed (the reference repair) from the shipped tree and
 regenerate private/reference_fix.patch.
 
-The repair makes a page that a split creates recoverable on its own: the
-split record carries the new sibling as a formatted image, which needs the
-log payload limit raised (internal.h), the record produced with that
-payload (btree.c) and redo restoring it (recover.c).
+The shipped engine keeps the log inside its budget from inside the write
+path, before the transaction has committed.  That checkpoint flushes the
+pages the unfinished transaction has already touched and then recycles
+the log, so a crash in that window leaves work on disk that was never
+committed and no record that would let recovery tell.  The repair is to
+let the log budget be enforced only where no transaction is in flight.
 
     python3 build/make_reference.py
 """
@@ -18,37 +20,6 @@ REPO = os.path.join(TASK, "repo")
 FIXED = os.path.join(TASK, "private", "fixed")
 PATCH = os.path.join(TASK, "private", "reference_fix.patch")
 SKIP = {"build", "testwork", "__pycache__"}
-
-NEW_SPLIT_REDO = '''    case WR_LEAF_SPLIT:
-    case WR_INT_SPLIT: {
-        /* The new sibling is logged as a formatted image, so neither half
-         * depends on the other having survived: each is replayed only if
-         * its own LSN is behind this record. */
-        int apply_left = 0, apply_right = 0;
-        right = page_for(s, r->aux, r->lsn, &apply_right);
-        if (!right) return KV_ERR_IO;
-        if (apply_right) {
-            if (r->vlen != PAGE_SIZE) {
-                pager_unpin(s->pg, right);
-                return KV_ERR_CORRUPT;
-            }
-            memcpy(right->buf, payload, PAGE_SIZE);
-            stamp(s, right, r->lsn);
-        }
-        pager_unpin(s->pg, right);
-
-        pg = page_for(s, r->page, r->lsn, &apply_left);
-        if (!pg) return KV_ERR_IO;
-        if (apply_left) {
-            PHDR(pg)->nkeys = (uint16_t)r->arg;
-            if (r->type == WR_LEAF_SPLIT) PHDR(pg)->link = r->aux;
-            stamp(s, pg, r->lsn);
-        }
-        pager_unpin(s->pg, pg);
-        return KV_OK;
-    }
-
-'''
 
 
 def rd(p):
@@ -65,35 +36,47 @@ def build_fixed():
     shutil.copytree(REPO, FIXED,
                     ignore=lambda d, names: [n for n in names if n in SKIP])
 
-    p = os.path.join(FIXED, "src", "internal.h")
-    s = rd(p).replace(
-        "#define WAL_MAX_PAYLOAD KV_MAX_VALUE_LEN  /* largest payload a record carries */",
-        "#define WAL_MAX_PAYLOAD PAGE_SIZE    /* a split logs the new page in full */")
-    wr(p, s)
-
-    p = os.path.join(FIXED, "src", "btree.c")
+    p = os.path.join(FIXED, "src", "kvstore.c")
     s = rd(p)
-    s = s.replace("    rc = emit(s, &r, NULL, 0, parent, rightpg);",
-                  "    rc = emit(s, &r, rightpg->buf, PAGE_SIZE, parent, rightpg);")
-    s = s.replace("    rc = emit(s, &r, NULL, 0, leaf, right);",
-                  "    rc = emit(s, &r, right->buf, PAGE_SIZE, leaf, right);")
-    wr(p, s)
 
-    p = os.path.join(FIXED, "src", "recover.c")
-    s = rd(p)
-    start = s.index("    case WR_LEAF_SPLIT:")
-    end = s.index("    case WR_INT_INSERT:")
-    wr(p, s[:start] + NEW_SPLIT_REDO + s[end:])
+    # the budget may only be enforced once the transaction is durable
+    s = s.replace("""    rc = btree_put(s, key, val, len);
+    if (rc != KV_OK) return rc;
+    rc = keep_log_bounded(s);
+    if (rc != KV_OK) return rc;
+    return txn_commit(s);""",
+                  """    rc = btree_put(s, key, val, len);
+    if (rc != KV_OK) return rc;
+    rc = txn_commit(s);
+    if (rc != KV_OK) return rc;
+    return keep_log_bounded(s);""")
+    s = s.replace("""    rc = btree_del(s, key);
+    if (rc != KV_OK) return rc;            /* nothing logged but BEGIN */
+    rc = keep_log_bounded(s);
+    if (rc != KV_OK) return rc;
+    return txn_commit(s);""",
+                  """    rc = btree_del(s, key);
+    if (rc != KV_OK) return rc;            /* nothing logged but BEGIN */
+    rc = txn_commit(s);
+    if (rc != KV_OK) return rc;
+    return keep_log_bounded(s);""")
+    s = s.replace("""/* The log is not allowed to grow without bound: once it passes
+ * MS_LOG_LIMIT the engine takes a checkpoint, which flushes the pages and
+ * reclaims the records the data file no longer needs. */""",
+                  """/* The log is not allowed to grow without bound: once it passes
+ * MS_LOG_LIMIT the engine takes a checkpoint, which flushes the pages and
+ * reclaims the records the data file no longer needs.  A checkpoint
+ * publishes whatever the pages currently hold and then drops the records
+ * that describe it, so it may only be taken when no transaction is part
+ * way through: between operations, never inside one. */""")
+    wr(p, s)
 
 
 def make_patch():
-    parts = []
-    for f in ("src/internal.h", "src/btree.c", "src/recover.c"):
-        r = subprocess.run(["diff", "-u", os.path.join("repo", f),
-                            os.path.join("private", "fixed", f)],
-                           cwd=TASK, capture_output=True, text=True)
-        parts.append(r.stdout)
-    wr(PATCH, "".join(parts))
+    r = subprocess.run(["diff", "-u", "repo/src/kvstore.c",
+                        "private/fixed/src/kvstore.c"],
+                       cwd=TASK, capture_output=True, text=True)
+    wr(PATCH, r.stdout)
 
 
 if __name__ == "__main__":

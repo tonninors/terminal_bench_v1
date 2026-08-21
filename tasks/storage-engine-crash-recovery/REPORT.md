@@ -1,151 +1,154 @@
-# Status: REDESIGN REJECTED — NOTHING TO UPLOAD
+# Status: FINAL ATTEMPT ABANDONED — NOTHING TO UPLOAD, STOPPING
 
-`dist/` is intentionally empty. Neither the original fixture (commit
-a5dd20f) nor this redesign may be shipped.
+`dist/` is intentionally empty. No fixture from this task line may be
+shipped, and per the brief no further fixture will be designed.
 
-* The original defect was rejected by review as too locally obvious
-  (a one-line stale read that `docs/FORMAT.md` effectively pointed at).
-* The redesign built in response was rejected by its own clean
-  fresh-context attack: an independent agent, given only the task
-  statement, the extracted repository and a terminal, produced a
-  complete and genuinely correct fix in **~34 minutes**. The brief's stop
-  condition is "complete correct fix in < 1 hour → reject the design and
-  do not package it."
+The fourth attempt was not rejected by a fresh-context agent — it never
+reached one. It failed my own validation (§9: "verify the reference
+repair fixes it"), and the reason generalises into an argument that the
+constraint set in the final brief cannot be satisfied by this engine
+architecture. That argument, and the two measurements behind it, are the
+substance of this report.
 
-Everything below records what was built and measured, so the next attempt
-starts from evidence rather than from scratch.
+`repo/` is left as a **correct, defect-free engine** that passes all 50
+public cases, so anything built later starts from a clean baseline rather
+than from a half-planted bug.
 
 ---
 
-## 1. What the redesign changed
+## 1. What the final attempt was
 
-The goal was a crash-consistency regression with no single line
-contradicting the format document, whose root cause spans several
-components, and that cannot be closed from `btree.c` alone or
-`recover.c` alone.
+Per §2, a checkpoint-horizon / active-transaction interaction. The engine
+gained a documented log budget: once the write-ahead log passes
+`MS_LOG_LIMIT`, the next operation takes a checkpoint, which flushes the
+pages and recycles the log. The planted defect placed that check one step
+too early — inside `kv_put`/`kv_delete`, after the B+tree work but
+*before* the commit record:
 
-| area | change |
-| --- | --- |
-| `src/btree.c` | split records became **physiological** — they name `page`, `aux` and the split position, and no longer carry the new sibling as a page image |
-| `src/internal.h` | log payload capped at `KV_MAX_VALUE_LEN`, so a record cannot carry a page |
-| `src/recover.c` | split redo reconstructs the new sibling from the page it was split from, gating each half on its own page LSN |
-| `src/pager.c` | buffer pool reduced to 32 frames, so any tree larger than the pool continuously evicts and writes frames back in eviction order |
-| `src/kvstore.c` | checkpoints **recycle the log** (truncate after the pages and the meta page are durable), so replaying from the beginning of history is not available |
-| `tools/kvcli.c` | `--spread` insertion order and an `expect <db> <total> <committed>` check that asserts the exact committed key set |
-| `docs/FORMAT.md`, `README.md` | updated to describe the physiological split records, the log recycling and the small pool — the documentation matches the implementation exactly |
+```c
+rc = btree_put(s, key, val, len);
+if (rc != KV_OK) return rc;
+rc = keep_log_bounded(s);        /* flushes pages, recycles the log */
+if (rc != KV_OK) return rc;
+return txn_commit(s);
+```
 
-Intended defect: when a crash leaves the page that was split already
-written back post-split while its new sibling is still dirty, redo
-rebuilds the sibling out of an already-truncated page. The moved keys
-are gone, and because the log was recycled at the last checkpoint they
-cannot be replayed from history.
+A crash in that window publishes an unfinished transaction: its pages are
+on disk, the records that describe it have been recycled, and the engine
+has no undo. This is a real ARIES-class hole (steal without undo, log
+recycled past an active transaction) and it produced exactly the physics
+§1 asked for. Measured on the shipped tree:
 
-While building it I also found and fixed a genuine engine bug that
-predated the redesign: after recovery the WAL object's `next_lsn` was
-never advanced past the log it had just replayed, so a later run reissued
-sequence numbers that pages already carried and redo silently skipped
-records. That is now `wal_set_next_lsn()`, called from `recover_redo()`.
-
-## 2. Measured behaviour of the redesigned fixture
-
-| build | basic | crash | idempotence |
-| --- | --- | --- | --- |
-| shipped tree (defective) | 28 pass / 0 fail | 2 pass / **6 fail** | 10 pass / **4 fail** |
-| private reference fix | 28 / 0 | 8 / 0 | 14 / 0 |
-
-Scenario separation worked as designed: databases small enough to sit in
-the buffer pool recovered correctly (in-order and scattered), while
-larger multi-level databases failed, with concrete structural damage
-(`key N on leaf page M is outside its subtree range`, `leaf chain holds
-X keys but the tree holds Y`).
-
-Reference fix: raise the payload cap (`internal.h`), log the new sibling
-as a formatted image (`btree.c`), restore it in redo (`recover.c`) —
-three files, which is what made single-file repairs insufficient.
-
-Five plausible incomplete repairs were built and measured; every one kept
-the basic suite green and still failed the suite:
-
-| incomplete fix | crash fails | idempotence fails |
+| crash at auto-checkpoint | `kv_verify` | contents |
 | --- | --- | --- |
-| `nf_btree_relog` (btree.c only: re-log the moved pairs) | 6 | 4 |
-| `nf_recover_atomic_gate` (recover.c only: replay a split only when both halves are behind) | 6 | 4 |
-| `nf_recover_force_replay` (recover.c only: distrust page LSNs) | 6 | 4 |
-| `nf_recover_protect_left` (recover.c only: never mutate the split page) | 6 | 4 |
-| `nf_payload_without_redo` (internal.h + btree.c, redo not taught) | 6 | 4 |
+| #1 | **ok** — 710 keys, height 2, 54 pages | app had committed 709 |
+| #2 | **ok** — 1388 keys, height 3, 112 pages | app had committed 1387 |
+| #3 | **ok** — 1895 keys, height 3, 198 pages | app had committed 1894 |
+| #4 | **ok** — 2690 keys, height 3, 236 pages | app had committed 2689 |
 
-## 3. The fresh-context attack — why this is rejected
+Structurally valid every time, silently wrong, and the failure message
+says only that the contents differ from what was committed. It also
+resisted the bypass list: forcing pages at commit, flushing everything at
+checkpoint, and enlarging the buffer pool all leave it intact, because
+the damage is done *before* the commit rather than by a missing redo.
 
-Setup: a container holding only the extracted `/app/storage-engine`. The
-agent received the task statement, the repository and terminal access.
-It did not see the reference patch, the negatives, the generators, this
-report, or any design note.
+## 2. Why it is not usable — measured
 
-| measurement | result |
-| --- | --- |
-| wall clock | **~34 minutes** (2,019,597 ms) |
-| tool calls | 42 |
-| files inspected | all 10 sources, both docs, all test files, Makefile |
-| hypotheses considered | 6 (five wrong, then the right one, found by instrumenting one redo branch) |
-| edit/build/test iterations | 4, plus 3 full suite runs and 2 stress sweeps |
-| final result | **ALL TESTS PASSED** — 28/0, 8/0, 14/0 |
+**The damage is confined to the operation that was in flight, and that
+operation is in-doubt by definition.**
 
-Independently re-verified: its `solution.patch` applied to a pristine
-extraction of the archive builds warning-free and passes all 50 cases.
-The patch is kept at `private/attack_evidence/fresh_agent_solution.patch`.
+The shipped (defective) engine and the reference repair are externally
+indistinguishable:
 
-Two things are worth carrying forward honestly:
+| engine | app-recorded commits | keys in database |
+| --- | --- | --- |
+| defective (checkpoint before commit) | 1387 | 1388 |
+| reference repair (checkpoint after commit) | 1387 | 1388 |
 
-1. **The agent found a different primary cause than the one I planted.**
-   `pager_ensure()` zeroed any page whose id was beyond the *checkpointed*
-   `num_pages`, even though the data file legitimately held newer
-   evicted images for it. That was an unintended defect of mine, and it
-   both inflated the failure counts and gave a very fast empirical
-   signal: one `fprintf` in the redo split branch printed a page
-   reporting LSN 0 that obviously had to exist on disk, which pointed
-   straight at it.
-2. **Even so, the intended hazard did not survive.** After fixing that,
-   the agent observed the split-redo branch still firing, understood the
-   ordering hazard, and closed it by forcing the new sibling to disk
-   before the page it was split from can be stolen — a different but
-   genuinely correct repair, reached without seeing the reference.
+With the repair the crash lands *after* the commit record and *before*
+the application records its progress, so the extra key is genuinely
+committed and its presence is correct. With the defect the same extra key
+is uncommitted and its presence is wrong. Nothing observable from outside
+the engine separates the two, because in this API one call *is* one
+transaction: a crash inside the call leaves that call's outcome
+undetermined, which is not a bug but the normal in-doubt window every
+storage engine has.
 
-So the redesign fails on its merits and not only because of my
-accidental bug, though that bug plainly accelerated the discovery.
+An oracle could only tell them apart by consulting engine-internal state
+— which is exactly the hidden-history dependency the brief forbids.
 
-## 4. What this suggests for the next attempt
+## 3. The general tension this exposes
 
-* A defect whose symptom is *structural corruption visible to
-  `kv_verify`* gives the solver a fast, precise oracle. Every iteration
-  here was cheap because a single command printed the exact damaged page
-  and the reason. A defect whose symptom is subtler — correct-looking
-  data that only a cross-check can falsify — would remove that
-  accelerant.
-* Instrumenting one branch was enough to localise the cause. Any design
-  where a single `printf` in the obvious suspect function points at the
-  answer is unlikely to clear an hour.
-* The fixture must contain no unintended defects: the accidental
-  `pager_ensure()` bug was found before the intended one and did much of
-  the work. A pre-attack audit pass that hunts for *additional* bugs is
-  now mandatory, not optional.
-* Multi-file repairs did block single-file fixes as intended, so that
-  part of the design brief is achievable — it just is not sufficient on
-  its own to buy an hour.
+Two measurements bound the design space from opposite sides.
 
-## 5. Reproducing any of this
+**(a) "Force every dirty page at commit" (bypass B) neutralises redo
+defects.** Applied to the previous redesign's genuine redo defect, it
+took the suite from 6 crash failures to 1 — and the survivor was only the
+*crash during page write-back* case, where the crash falls inside the
+flush loop itself:
 
-    python3 build/make_reference.py     # rebuild private/fixed + the patch
-    python3 build/make_negatives.py     # rebuild the incomplete repairs
-    python3 build/make_zip.py           # would rebuild the archive
-    bash    build/run_validation.sh     # baseline / reference / negatives matrix
+    bypass B on the previous defect: basic 28/0, crash 7/1, idempotence 14/0
 
-`make_zip.py` is left in place but no archive is committed, so nothing
-can be uploaded by accident.
+So a defect whose damage is "committed work that redo failed to restore"
+is legal-bypassable, because forcing pages at commit makes redo vacuous
+for everything except a crash during the flush.
+
+**(b) Defects that survive bypass B put damage on disk before the commit,
+and in a one-call-per-transaction engine that damage is unobservable**
+(§2 above).
+
+The remaining corner is the intersection: a defect that fires only on a
+crash *during* page write-back. That is reachable — it is what survived
+bypass B — but in the previous design its damage was structural (`key N
+on leaf page M is outside its subtree range`), which §1 forbids and §5
+calls an overly precise oracle. Constructing one that is simultaneously
+(i) write-back-crash-triggered, (ii) logical-only with a valid tree,
+(iii) resistant to the rest of the bypass list, and (iv) not repairable
+by a single condition (§7) is where four attempts have now converged, and
+I could not build it without violating one of the four.
+
+I am not claiming this is impossible in principle. I am reporting that I
+could not construct it, and that each attempt failed a *different* stated
+gate rather than getting closer:
+
+| attempt | defect | outcome |
+| --- | --- | --- |
+| 1 | stale root id in the promotion log record | rejected on review: one line, contradicted by FORMAT.md |
+| 2 | physiological split redo, per-half LSN gating | fresh agent: complete correct fix in ~34 min |
+| 3 (this) | checkpoint inside the transaction | unobservable: repair is externally identical |
+
+## 4. What is left in the tree
+
+* `repo/` — a correct WAL-backed B+tree storage engine, 50/50 on its own
+  suite, with the two defects found along the way genuinely fixed: the
+  split record now carries the new sibling as a formatted image, and
+  `pager_ensure()` no longer discards a legitimately evicted page image
+  because the checkpointed `num_pages` lagged. It also carries the
+  tooling built for this round: `--spread` insertion order, `expect`
+  (exact committed-set checking) and `--progress` (an application-side
+  record of which writes returned).
+* `build/` — the packaging, reference and negative generators, and the
+  validation harness. `make_zip.py` still works but no archive is
+  committed.
+* `private/attack_evidence/` — the patch the fresh-context agent produced
+  against attempt 2, kept as evidence.
+* `dist/` — empty, by design.
+
+## 5. Recommendation
+
+Stop this task line. The three fixtures produced here were each rejected
+on evidence, and the fourth attempt showed the remaining design space is
+squeezed between a legal conservative bypass on one side and an
+unobservable in-doubt window on the other. Any further work should come
+back with a different task shape — or with an explicit decision to relax
+one of the constraints (for example, permitting a multi-operation
+transaction API, which would make "uncommitted work became visible"
+observable, or accepting that some conservative repairs are legitimate
+solutions rather than bypasses).
 
 ## 6. Licensing
 
 Everything in this task directory was written from scratch for this
 benchmark. No third-party code, no external dataset, nothing downloaded,
-and nothing reused from any other task. The engine depends only on the C
-standard library and the POSIX file API and needs no network at any
-point.
+nothing reused from any other task. The engine depends only on the C
+standard library and the POSIX file API and needs no network.

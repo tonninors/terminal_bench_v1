@@ -1,8 +1,10 @@
 /* kvcli.c - command line driver used by the tests and for debugging. */
+#include <fcntl.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include "internal.h"
 
 /* Deterministic value for a key, so any run can be checked again later. */
@@ -51,6 +53,26 @@ static uint64_t nth_key(long i, long start, long count, int spread)
     return (uint64_t)(start + ((i * 7919L) % count));
 }
 
+/* The application records how many writes it has been told succeeded.
+ * A crash cannot lose this: the count is written with a plain write(2)
+ * after kv_put returns, so it survives the process dying. */
+static int progress_open(int argc, char **argv)
+{
+    for (int i = 0; i < argc; i++)
+        if (!strcmp(argv[i], "--progress") && i + 1 < argc)
+            return open(argv[i + 1], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    return -1;
+}
+
+static void progress_note(int fd, long n)
+{
+    char buf[24];
+    int len;
+    if (fd < 0) return;
+    len = snprintf(buf, sizeof buf, "%012ld\n", n);
+    if (pwrite(fd, buf, (size_t)len, 0) != len) { /* nothing useful to do */ }
+}
+
 static int cmd_fill(int argc, char **argv)
 {
     long start = 0, ckpt = 0;
@@ -68,6 +90,7 @@ static int cmd_fill(int argc, char **argv)
         return 2;
     }
 
+    int pfd = progress_open(argc, argv);
     kvstore_t *s = kv_open(db);
     if (!s) { fprintf(stderr, "kvcli: cannot open %s\n", db); return 1; }
     char val[KV_MAX_VALUE_LEN];
@@ -79,8 +102,10 @@ static int cmd_fill(int argc, char **argv)
             fprintf(stderr, "kvcli: put %" PRIu64 ": %s\n", key, kv_strerror(rc));
             return 1;
         }
+        progress_note(pfd, i + 1);
         if (ckpt && ((i + 1) % ckpt) == 0) kv_checkpoint(s);
     }
+    if (pfd >= 0) close(pfd);
     int rc = kv_close(s);
     if (rc != KV_OK) { fprintf(stderr, "kvcli: close: %s\n", kv_strerror(rc)); return 1; }
     printf("filled %ld keys from %ld\n", count, start);

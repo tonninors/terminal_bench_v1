@@ -178,18 +178,15 @@ page_t *pager_alloc(pager_t *p, uint32_t *out_id)
 page_t *pager_ensure(pager_t *p, uint32_t id)
 {
     meta_t *m = pager_meta(p);
-    int fresh = 0;
     if (id >= m->num_pages) {
+        /* the page count in the meta page only becomes durable at a
+         * checkpoint, so it can lag behind the file; grow it, but let the
+         * file itself supply the image (a read past the end is zero
+         * filled, which is what a page that never reached disk holds) */
         m->num_pages = id + 1;
         p->meta.dirty = 1;
-        fresh = 1;
     }
-    page_t *pg = frame_for(p, id, 0);
-    if (pg && fresh) {
-        memset(pg->buf, 0, PAGE_SIZE);
-        pg->dirty = 1;
-    }
-    return pg;
+    return frame_for(p, id, 0);
 }
 
 int pager_flush_all(pager_t *p)

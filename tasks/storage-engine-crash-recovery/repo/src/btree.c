@@ -149,7 +149,7 @@ static int insert_into_parent(kvstore_t *s, uint32_t *path, int level,
     r.page = pid;
     r.aux  = new_id;
     r.arg  = (uint32_t)at;
-    rc = emit(s, &r, NULL, 0, parent, rightpg);
+    rc = emit(s, &r, rightpg->buf, PAGE_SIZE, parent, rightpg);
     if (rc != KV_OK) goto out;
 
     page_t *target = (sep < sep_up) ? parent : rightpg;
@@ -208,7 +208,7 @@ int btree_put(kvstore_t *s, uint64_t key, const void *val, uint32_t vlen)
     r.page = leaf_id;
     r.aux  = right_id;
     r.arg  = (uint32_t)at;
-    rc = emit(s, &r, NULL, 0, leaf, right);
+    rc = emit(s, &r, right->buf, PAGE_SIZE, leaf, right);
     if (rc != KV_OK) goto out;
 
     uint64_t sep = LEAF_SLOTS(right)[0].key;

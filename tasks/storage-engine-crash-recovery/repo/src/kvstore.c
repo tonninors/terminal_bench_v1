@@ -84,6 +84,17 @@ static int txn_commit(kvstore_t *s)
     return KV_OK;
 }
 
+/* The log is not allowed to grow without bound: once it passes
+ * MS_LOG_LIMIT the engine takes a checkpoint, which flushes the pages and
+ * reclaims the records the data file no longer needs.  A checkpoint
+ * publishes whatever the pages hold and then drops the records that
+ * describe it, so it is only ever taken between operations. */
+static int keep_log_bounded(kvstore_t *s)
+{
+    if (wal_bytes(s->wal) < MS_LOG_LIMIT) return KV_OK;
+    return kv_checkpoint(s);
+}
+
 int kv_put(kvstore_t *s, uint64_t key, const void *val, uint32_t len)
 {
     if (!s || !val) return KV_ERR_INVAL;
@@ -92,7 +103,9 @@ int kv_put(kvstore_t *s, uint64_t key, const void *val, uint32_t len)
     if (rc != KV_OK) return rc;
     rc = btree_put(s, key, val, len);
     if (rc != KV_OK) return rc;
-    return txn_commit(s);
+    rc = txn_commit(s);
+    if (rc != KV_OK) return rc;
+    return keep_log_bounded(s);
 }
 
 int kv_delete(kvstore_t *s, uint64_t key)
@@ -102,7 +115,9 @@ int kv_delete(kvstore_t *s, uint64_t key)
     if (rc != KV_OK) return rc;
     rc = btree_del(s, key);
     if (rc != KV_OK) return rc;            /* nothing logged but BEGIN */
-    return txn_commit(s);
+    rc = txn_commit(s);
+    if (rc != KV_OK) return rc;
+    return keep_log_bounded(s);
 }
 
 int kv_get(kvstore_t *s, uint64_t key, void *buf, uint32_t buflen,

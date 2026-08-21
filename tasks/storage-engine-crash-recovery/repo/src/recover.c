@@ -83,30 +83,29 @@ static int redo_one(kvstore_t *s, const wal_rec_t *r, const uint8_t *payload)
 
     case WR_LEAF_SPLIT:
     case WR_INT_SPLIT: {
-        /* Redo the split the same way btree.c performed it: the entries
-         * from `arg` onwards move to the new sibling, and the page that
-         * was split keeps the ones before it.  Each page carries its own
-         * LSN, so each half is replayed only if it is behind. */
+        /* The new sibling is logged as a formatted image, so neither half
+         * depends on the other having survived: each is replayed only if
+         * its own LSN is behind this record. */
         int apply_left = 0, apply_right = 0;
+        right = page_for(s, r->aux, r->lsn, &apply_right);
+        if (!right) return KV_ERR_IO;
+        if (apply_right) {
+            if (r->vlen != PAGE_SIZE) {
+                pager_unpin(s->pg, right);
+                return KV_ERR_CORRUPT;
+            }
+            memcpy(right->buf, payload, PAGE_SIZE);
+            stamp(s, right, r->lsn);
+        }
+        pager_unpin(s->pg, right);
+
         pg = page_for(s, r->page, r->lsn, &apply_left);
         if (!pg) return KV_ERR_IO;
-        right = page_for(s, r->aux, r->lsn, &apply_right);
-        if (!right) { pager_unpin(s->pg, pg); return KV_ERR_IO; }
-
-        if (apply_right) {
-            uint64_t sep = 0;
-            if (r->type == WR_LEAF_SPLIT)
-                leaf_split(pg, right, r->aux, (int)r->arg);
-            else
-                int_split(pg, right, (int)r->arg, &sep);
-            stamp(s, right, r->lsn);
-            stamp(s, pg, r->lsn);           /* the split truncated it too */
-        } else if (apply_left) {
+        if (apply_left) {
             PHDR(pg)->nkeys = (uint16_t)r->arg;
             if (r->type == WR_LEAF_SPLIT) PHDR(pg)->link = r->aux;
             stamp(s, pg, r->lsn);
         }
-        pager_unpin(s->pg, right);
         pager_unpin(s->pg, pg);
         return KV_OK;
     }

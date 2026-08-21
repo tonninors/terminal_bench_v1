@@ -13,6 +13,7 @@
 #define META_PAGE       0
 #define INVALID_PAGE    0xFFFFFFFFu
 #define MAX_TREE_DEPTH  24
+#define MS_LOG_LIMIT    (192 * 1024)  /* checkpoint once the log passes this */
 
 /* ---------------------------------------------------------------- pages */
 #define PT_META      1
@@ -78,7 +79,7 @@ typedef struct page {
 #define WR_CHECKPOINT  9
 
 #define WAL_MAGIC 0x57414C31u        /* "WAL1" */
-#define WAL_MAX_PAYLOAD KV_MAX_VALUE_LEN  /* largest payload a record carries */
+#define WAL_MAX_PAYLOAD PAGE_SIZE    /* a split logs the new page in full */
 
 typedef struct __attribute__((packed)) {
     uint32_t magic;
@@ -126,6 +127,7 @@ int      wal_read_first(wal_t *w);
 int      wal_read_next(wal_t *w, wal_rec_t *r, void *payload, uint32_t cap);
 int      wal_truncate(wal_t *w);
 uint64_t wal_durable_lsn(wal_t *w);
+uint64_t wal_bytes(wal_t *w);
 
 /* --------------------------------------------------------------- nodes  */
 void node_init(page_t *pg, uint16_t type);
