@@ -1,0 +1,29 @@
+--- repo/src/btree.c	2026-08-21 02:15:24.835215700 -0500
++++ private/fixed/src/btree.c	2026-08-21 02:23:59.996786000 -0500
+@@ -74,14 +74,15 @@
+ static int insert_into_parent(kvstore_t *s, uint32_t *path, int level,
+                               uint64_t sep, uint32_t right_child);
+ 
+-static int log_root_promotion(kvstore_t *s, uint32_t new_root, uint64_t sep,
++static int log_root_promotion(kvstore_t *s, uint32_t new_root,
++                              uint32_t left_child, uint64_t sep,
+                               uint32_t right_child, page_t *rootpg)
+ {
+     wal_rec_t r;
+     memset(&r, 0, sizeof r);
+     r.type = WR_NEW_ROOT;
+     r.page = new_root;
+-    r.aux  = pager_meta(s->pg)->root;      /* left child of the new root */
++    r.aux  = left_child;                   /* left child of the new root */
+     r.key  = sep;
+     r.arg  = right_child;
+     return emit(s, &r, NULL, 0, rootpg, NULL);
+@@ -104,7 +105,7 @@
+     m->height++;
+     pager_meta_dirty(s->pg);
+ 
+-    int rc = log_root_promotion(s, new_id, sep, right_child, nr);
++    int rc = log_root_promotion(s, new_id, old_root, sep, right_child, nr);
+     pager_unpin(s->pg, nr);
+     return rc;
+ }
