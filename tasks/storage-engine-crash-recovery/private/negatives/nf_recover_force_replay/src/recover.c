@@ -44,7 +44,8 @@ static page_t *page_for(kvstore_t *s, uint32_t id, uint64_t lsn, int *apply)
 {
     page_t *pg = pager_ensure(s->pg, id);
     if (!pg) return NULL;
-    *apply = (PHDR(pg)->lsn < lsn);
+    *apply = 1;                 /* always replay */
+    (void)lsn;
     return pg;
 }
 

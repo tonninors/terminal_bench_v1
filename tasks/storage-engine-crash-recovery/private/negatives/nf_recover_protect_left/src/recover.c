@@ -95,12 +95,13 @@ static int redo_one(kvstore_t *s, const wal_rec_t *r, const uint8_t *payload)
 
         if (apply_right) {
             uint64_t sep = 0;
+            page_t tmp = *pg;               /* keep the page as it stands */
             if (r->type == WR_LEAF_SPLIT)
-                leaf_split(pg, right, r->aux, (int)r->arg);
+                leaf_split(&tmp, right, r->aux, (int)r->arg);
             else
-                int_split(pg, right, (int)r->arg, &sep);
+                int_split(&tmp, right, (int)r->arg, &sep);
             stamp(s, right, r->lsn);
-            stamp(s, pg, r->lsn);           /* the split truncated it too */
+            if (apply_left) { *pg = tmp; stamp(s, pg, r->lsn); }
         } else if (apply_left) {
             PHDR(pg)->nkeys = (uint16_t)r->arg;
             if (r->type == WR_LEAF_SPLIT) PHDR(pg)->link = r->aux;

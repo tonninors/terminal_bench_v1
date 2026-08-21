@@ -82,27 +82,33 @@ static int redo_one(kvstore_t *s, const wal_rec_t *r, const uint8_t *payload)
         return KV_OK;
 
     case WR_LEAF_SPLIT:
-    case WR_INT_SPLIT:
-        /* the new sibling is logged as a full image, so either half can
-         * be replayed on its own */
-        right = page_for(s, r->aux, r->lsn, &apply);
+    case WR_INT_SPLIT: {
+        /* The new sibling is logged as a formatted image, so neither half
+         * depends on the other having survived: each is replayed only if
+         * its own LSN is behind this record. */
+        int apply_left = 0, apply_right = 0;
+        right = page_for(s, r->aux, r->lsn, &apply_right);
         if (!right) return KV_ERR_IO;
-        if (apply) {
-            if (r->vlen != PAGE_SIZE) { pager_unpin(s->pg, right); return KV_ERR_CORRUPT; }
+        if (apply_right) {
+            if (r->vlen != PAGE_SIZE) {
+                pager_unpin(s->pg, right);
+                return KV_ERR_CORRUPT;
+            }
             memcpy(right->buf, payload, PAGE_SIZE);
             stamp(s, right, r->lsn);
         }
         pager_unpin(s->pg, right);
 
-        pg = page_for(s, r->page, r->lsn, &apply);
+        pg = page_for(s, r->page, r->lsn, &apply_left);
         if (!pg) return KV_ERR_IO;
-        if (apply) {
+        if (apply_left) {
             PHDR(pg)->nkeys = (uint16_t)r->arg;
             if (r->type == WR_LEAF_SPLIT) PHDR(pg)->link = r->aux;
             stamp(s, pg, r->lsn);
         }
         pager_unpin(s->pg, pg);
         return KV_OK;
+    }
 
     case WR_INT_INSERT:
         pg = page_for(s, r->page, r->lsn, &apply);
@@ -192,6 +198,7 @@ int recover_redo(kvstore_t *s)
 
     recompute_height(s);
     m = pager_meta(s->pg);
+    wal_set_next_lsn(s->wal, max_lsn + 1);
     if (m->next_lsn <= max_lsn) {
         m->next_lsn = max_lsn + 1;
         pager_meta_dirty(s->pg);

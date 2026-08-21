@@ -1,207 +1,151 @@
-# Input-files package report — ministore storage engine
+# Status: REDESIGN REJECTED — NOTHING TO UPLOAD
 
-Deliverable: `dist/storage-engine-inputs.zip`, which unpacks to a single
-directory `storage-engine/`, so extracting it under `/app` yields
-`/app/storage-engine` as the final prompt assumes.
+`dist/` is intentionally empty. Neither the original fixture (commit
+a5dd20f) nor this redesign may be shipped.
 
-Nothing from the previous PostgreSQL MVCC task is reused: this repository,
-its on-disk format, its tests and its documentation were all written from
-scratch for this task.
+* The original defect was rejected by review as too locally obvious
+  (a one-line stale read that `docs/FORMAT.md` effectively pointed at).
+* The redesign built in response was rejected by its own clean
+  fresh-context attack: an independent agent, given only the task
+  statement, the extracted repository and a terminal, produced a
+  complete and genuinely correct fix in **~34 minutes**. The brief's stop
+  condition is "complete correct fix in < 1 hour → reject the design and
+  do not package it."
 
-## 1. ZIP contents
+Everything below records what was built and measured, so the next attempt
+starts from evidence rather than from scratch.
 
-    dist/storage-engine-inputs.zip
-      sha256 85d27f6e8a190bd43fca1c3c01202e7dbf6e72053e9798554feafba936c8be47
-      27577 bytes, 19 members:
+---
 
-            29  storage-engine/.gitignore
-           603  storage-engine/Makefile
-          3746  storage-engine/README.md
-          5486  storage-engine/docs/FORMAT.md
-          2375  storage-engine/include/kvstore.h
-          8054  storage-engine/src/btree.c
-          5930  storage-engine/src/internal.h
-         10048  storage-engine/src/kvstore.c
-          3918  storage-engine/src/node.c
-          6228  storage-engine/src/pager.c
-          6115  storage-engine/src/recover.c
-          1419  storage-engine/src/util.c
-          3619  storage-engine/src/wal.c
-          2058  storage-engine/tests/lib.sh
-           493  storage-engine/tests/run_all.sh
-          2268  storage-engine/tests/test_basic.sh
-          3425  storage-engine/tests/test_crash_recovery.sh
-          4076  storage-engine/tests/test_idempotence.sh
-          8835  storage-engine/tools/kvcli.c
+## 1. What the redesign changed
 
-The archive is byte reproducible: `build/make_zip.py` writes members in
-sorted order with fixed timestamps and fixed modes, and refuses to
-package CRLF files or any path whose name suggests private material.
+The goal was a crash-consistency regression with no single line
+contradicting the format document, whose root cause spans several
+components, and that cannot be closed from `btree.c` alone or
+`recover.c` alone.
 
-## 2. What the repository is
-
-`ministore` is a single-writer embedded key/value engine, roughly 1,600
-lines of C11 across eight translation units:
-
-* `src/pager.c` — 1 KiB pages, 256-frame LRU cache, lazy write-back, and
-  the write-ahead rule (a dirty page is never written before the log
-  record describing its newest change is durable);
-* `src/wal.c` — append-only log; self-describing, CRC-protected records
-  so a torn tail is detectable;
-* `src/node.c` — leaf and internal page primitives (search, insert,
-  delete, split);
-* `src/btree.c` — descent, leaf splits, internal splits, root promotion,
-  and the records each of those logs;
-* `src/recover.c` — two-pass redo: find committed transactions and the
-  end of the readable log, then replay against the data file, skipping
-  pages whose stored LSN shows the change already landed;
-* `src/kvstore.c` — transactions, checkpoints, scans, and `kv_verify`,
-  a structural self-check (page types, key ordering, subtree ranges,
-  child reachability with cycle detection, leaf chain versus tree key
-  counts);
-* `tools/kvcli.c` — `fill`, `update`, `get`, `del`, `verify`, `stats`,
-  `dump`, `recover`, `waldump`.
-
-Public API (`include/kvstore.h`) and on-disk format (`docs/FORMAT.md`)
-are established and documented in the shipped repository, as required.
-
-Fault injection is part of the engine, as it is in real storage engines:
-`MINISTORE_CRASH_POINT` (`commit`, `page_write`, `meta_write`,
-`checkpoint`) plus `MINISTORE_CRASH_COUNT` make the process `_exit(90)`
-at that point without flushing anything — a power cut, deterministically
-placed.
-
-### Language and build commands
-
-    language:  C11 (POSIX file API only, no third-party dependencies)
-    build:     make                 -> build/libministore.a, build/kvcli
-    test:      make test            -> tests/run_all.sh
-    clean:     make clean
-
-Verified warning-free with `gcc -std=c11 -D_POSIX_C_SOURCE=200809L -O2 -g
--Wall -Wextra` (Debian gcc 12.2.0).
-
-## 3. Buggy baseline results (the shipped tree)
-
-Extracted from the ZIP as `/app/storage-engine`, built clean (0 warnings,
-0 errors):
-
-    ---- test_basic.sh:           26 passed,  0 failed
-    ---- test_crash_recovery.sh:   5 passed,  5 failed
-    ---- test_idempotence.sh:     12 passed,  5 failed
-    2 test file(s) reported failures
-
-Normal inserts, updates, deletes, checkpoints, reopens and clean
-shutdowns all work — the whole basic suite is green, including a
-1,200-key three-batch reopen whose contents hash identically across a
-clean restart.
-
-The crash suite separates the scenarios required by the brief, and the
-separation is what localises the defect:
-
-| replayed window contains | shipped tree |
+| area | change |
 | --- | --- |
-| leaf splits only, on a checkpointed base | **passes** |
-| internal-node splits, no promotion (height-3 base) | **passes** |
-| a root promotion | **fails** |
-| two levels of growth | **fails** |
-| crash during page write-back | **fails** |
-| mixed workload with deletes | passes |
-| uncommitted work must not appear | fails |
+| `src/btree.c` | split records became **physiological** — they name `page`, `aux` and the split position, and no longer carry the new sibling as a page image |
+| `src/internal.h` | log payload capped at `KV_MAX_VALUE_LEN`, so a record cannot carry a page |
+| `src/recover.c` | split redo reconstructs the new sibling from the page it was split from, gating each half on its own page LSN |
+| `src/pager.c` | buffer pool reduced to 32 frames, so any tree larger than the pool continuously evicts and writes frames back in eviction order |
+| `src/kvstore.c` | checkpoints **recycle the log** (truncate after the pages and the meta page are durable), so replaying from the beginning of history is not available |
+| `tools/kvcli.c` | `--spread` insertion order and an `expect <db> <total> <committed>` check that asserts the exact committed key set |
+| `docs/FORMAT.md`, `README.md` | updated to describe the physiological split records, the log recycling and the small pool — the documentation matches the implementation exactly |
 
-Failures are reported as concrete structural damage, e.g.
-`tree is not well formed: page 3 reachable twice: the tree contains a
-cycle`, and `kvcli waldump` exposes the underlying record. The engine
-never hangs on a damaged tree: descent is depth-limited and `kv_verify`
-detects cycles.
+Intended defect: when a crash leaves the page that was split already
+written back post-split while its new sibling is still dirty, redo
+rebuilds the sibling out of an already-truncated page. The moved keys
+are gone, and because the log was recycled at the last checkpoint they
+cannot be replayed from history.
 
-## 4. Reference-fix results (private, not shipped)
+While building it I also found and fixed a genuine engine bug that
+predated the redesign: after recovery the WAL object's `next_lsn` was
+never advanced past the log it had just replayed, so a later run reissued
+sequence numbers that pages already carried and redo silently skipped
+records. That is now `wal_set_next_lsn()`, called from `recover_redo()`.
 
-`private/reference_fix.patch` — two hunks, both in `src/btree.c`.
-Applied to a tree extracted from the ZIP:
+## 2. Measured behaviour of the redesigned fixture
 
-    ---- test_basic.sh:           26 passed, 0 failed
-    ---- test_crash_recovery.sh:  10 passed, 0 failed
-    ---- test_idempotence.sh:     17 passed, 0 failed
-    ALL TESTS PASSED
+| build | basic | crash | idempotence |
+| --- | --- | --- | --- |
+| shipped tree (defective) | 28 pass / 0 fail | 2 pass / **6 fail** | 10 pass / **4 fail** |
+| private reference fix | 28 / 0 | 8 / 0 | 14 / 0 |
 
-53/53. Grading is behavioural, so other correct repairs also pass; two
-are noted in `private/NOTES.md`.
+Scenario separation worked as designed: databases small enough to sit in
+the buffer pool recovered correctly (in-order and scattered), while
+larger multi-level databases failed, with concrete structural damage
+(`key N on leaf page M is outside its subtree range`, `leaf chain holds
+X keys but the tree holds Y`).
 
-## 5. Negative-fix results (private, not shipped)
+Reference fix: raise the payload cap (`internal.h`), log the new sibling
+as a formatted image (`btree.c`), restore it in redo (`recover.c`) —
+three files, which is what made single-file repairs insufficient.
 
-Five plausible incomplete repairs, each built from the shipped tree and
-run against the full suite:
+Five plausible incomplete repairs were built and measured; every one kept
+the basic suite green and still failed the suite:
 
-| incomplete fix | idea a developer would plausibly try | crash fails | idem fails | basic |
-| --- | --- | --- | --- | --- |
-| `nf1_reorder_bookkeeping` | reorder the bookkeeping around the promotion | 5 | 5 | 26/26 |
-| `nf2_recovery_assumes_first_root` | patch recovery, assuming the tree grew out of page 1 | 2 | 5 | 26/26 |
-| `nf3_replay_everything` | fix the record, then drop the page-LSN gate "to be safe" | 0 | 2 | 26/26 |
-| `nf4_recovery_keeps_old_root` | fix the record but stop republishing the root in redo | 5 | 5 | 26/26 |
-| `nf5_only_first_promotion` | special-case the first promotion (patch the first failing test) | 2 | 5 | 26/26 |
+| incomplete fix | crash fails | idempotence fails |
+| --- | --- | --- |
+| `nf_btree_relog` (btree.c only: re-log the moved pairs) | 6 | 4 |
+| `nf_recover_atomic_gate` (recover.c only: replay a split only when both halves are behind) | 6 | 4 |
+| `nf_recover_force_replay` (recover.c only: distrust page LSNs) | 6 | 4 |
+| `nf_recover_protect_left` (recover.c only: never mutate the split page) | 6 | 4 |
+| `nf_payload_without_redo` (internal.h + btree.c, redo not taught) | 6 | 4 |
 
-Every one keeps normal operation working and still fails the suite, which
-is the profile a good trap needs. `nf3` is the reason the idempotence
-file contains an interrupted-replay case that starts from a checkpoint:
-an earlier, weaker version of that test let `nf3` through, so the test
-was strengthened until double application was actually observable.
+## 3. The fresh-context attack — why this is rejected
 
-## 6. Leak audit
+Setup: a container holding only the extracted `/app/storage-engine`. The
+agent received the task statement, the repository and terminal access.
+It did not see the reference patch, the negatives, the generators, this
+report, or any design note.
 
-* Searched every shipped file for `bug`, `fixme`, `xxx`, `hack`, `wrong`,
-  `broken`, `regression`, `root cause`, `todo`, `workaround`,
-  `known issue`, `should be`. The only hits are `old_root` (a local
-  variable in the correct in-memory promotion path — legitimate engine
-  code, and its presence is precisely what makes the defect subtle) and
-  a `"wrong value"` string in a test-failure message.
-* No comment, filename, fixture or test names the failing mechanism.
-  Crash tests are named after the workload shape
-  (`crash_after_ckpt_small`, `crash_from_empty_large`, …), never after a
-  cause.
-* `README.md` says only that crash recovery is under investigation and
-  that some crash/idempotence cases do not pass yet — the same thing the
-  test output shows.
-* The archive was checked programmatically for any member matching
-  `patch|fixed|reference|negative|private|solution|answer|oracle|golden`:
-  0 hits, and every member is rooted at `storage-engine/`.
-* The private reference fix, the fixed tree and all negatives live in
-  `private/`, which `make_zip.py` cannot package.
+| measurement | result |
+| --- | --- |
+| wall clock | **~34 minutes** (2,019,597 ms) |
+| tool calls | 42 |
+| files inspected | all 10 sources, both docs, all test files, Makefile |
+| hypotheses considered | 6 (five wrong, then the right one, found by instrumenting one redo branch) |
+| edit/build/test iterations | 4, plus 3 full suite runs and 2 stress sweeps |
+| final result | **ALL TESTS PASSED** — 28/0, 8/0, 14/0 |
 
-## 7. Network independence
+Independently re-verified: its `solution.patch` applied to a pristine
+extraction of the archive builds warning-free and passes all 50 cases.
+The patch is kept at `private/attack_evidence/fresh_agent_solution.patch`.
 
-* No source file references `http`, `curl`, `wget`, sockets or any
-  package manager; the sole grep hit is the README sentence stating that
-  nothing is downloaded.
-* Verified empirically: the archive was extracted, built and the full
-  suite run inside a container started with `--network none` (only the
-  `lo` interface present). Build succeeded and the suite produced exactly
-  the same verdict as the networked run.
+Two things are worth carrying forward honestly:
 
-## 8. Verification performed
+1. **The agent found a different primary cause than the one I planted.**
+   `pager_ensure()` zeroed any page whose id was beyond the *checkpointed*
+   `num_pages`, even though the data file legitimately held newer
+   evicted images for it. That was an unintended defect of mine, and it
+   both inflated the failure counts and gave a very fast empirical
+   signal: one `fprintf` in the redo split branch printed a page
+   reporting LSN 0 that obviously had to exist on disk, which pointed
+   straight at it.
+2. **Even so, the intended hazard did not survive.** After fixing that,
+   the agent observed the split-redo branch still firing, understood the
+   ordering hazard, and closed it by forcing the new sibling to disk
+   before the page it was split from can be stolen — a different but
+   genuinely correct repair, reached without seeing the reference.
 
-1. built the buggy repository from scratch — clean compile, no warnings;
-2. normal tests pass (26/26);
-3. deterministic crash tests fail for the intended recovery defect, with
-   scenario separation confirming it is confined to root promotion /
-   multi-level growth;
-4. created the private reference fix;
-5. reference fix passes all crash and repeated-recovery/idempotence tests
-   (53/53), including recovery interrupted part way and then resumed;
-6. five plausible incomplete fixes built and confirmed still failing;
-7. leak audit of the solver-facing tree (above);
-8. no hidden network dependency (`--network none` run);
-9. ZIP confirmed to contain no private solution, patch, or verifier
-   answers, and to unpack exactly as `storage-engine/`.
+So the redesign fails on its merits and not only because of my
+accidental bug, though that bug plainly accelerated the discovery.
 
-`build/run_validation.sh` performs steps 1–9 unattended in throwaway
-containers and asserts each expected verdict.
+## 4. What this suggests for the next attempt
 
-## 9. Licensing statement
+* A defect whose symptom is *structural corruption visible to
+  `kv_verify`* gives the solver a fast, precise oracle. Every iteration
+  here was cheap because a single command printed the exact damaged page
+  and the reason. A defect whose symptom is subtler — correct-looking
+  data that only a cross-check can falsify — would remove that
+  accelerant.
+* Instrumenting one branch was enough to localise the cause. Any design
+  where a single `printf` in the obvious suspect function points at the
+  answer is unlikely to clear an hour.
+* The fixture must contain no unintended defects: the accidental
+  `pager_ensure()` bug was found before the intended one and did much of
+  the work. A pre-attack audit pass that hunts for *additional* bugs is
+  now mandatory, not optional.
+* Multi-file repairs did block single-file fixes as intended, so that
+  part of the design brief is achievable — it just is not sufficient on
+  its own to buy an hour.
 
-All solver-facing source code, headers, tests, tooling, documentation and
-data in `dist/storage-engine-inputs.zip` were written from scratch for
-this benchmark. No third-party code, no external dataset, no downloaded
-material and no content from any other task is included. The engine
-depends only on the C standard library and the POSIX file API, and the
-task requires no network access at any point.
+## 5. Reproducing any of this
+
+    python3 build/make_reference.py     # rebuild private/fixed + the patch
+    python3 build/make_negatives.py     # rebuild the incomplete repairs
+    python3 build/make_zip.py           # would rebuild the archive
+    bash    build/run_validation.sh     # baseline / reference / negatives matrix
+
+`make_zip.py` is left in place but no archive is committed, so nothing
+can be uploaded by accident.
+
+## 6. Licensing
+
+Everything in this task directory was written from scratch for this
+benchmark. No third-party code, no external dataset, nothing downloaded,
+and nothing reused from any other task. The engine depends only on the C
+standard library and the POSIX file API and needs no network at any
+point.

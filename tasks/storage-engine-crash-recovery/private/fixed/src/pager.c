@@ -1,8 +1,11 @@
 /* pager.c - page cache and data-file I/O.
  *
- * Frames are written back lazily.  The write-ahead rule is enforced here:
- * a dirty page is never written to the data file before the log record
- * that describes its newest change is durable.
+ * The buffer pool is deliberately small, the way an embedded engine on a
+ * constrained device is configured: any working set larger than NFRAMES
+ * pages evicts, and eviction writes the frame back.  Frames are written
+ * back lazily and in no particular order.  The write-ahead rule is
+ * enforced here: a dirty page is never written to the data file before
+ * the log record that describes its newest change is durable.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -11,7 +14,7 @@
 #include <unistd.h>
 #include "internal.h"
 
-#define NFRAMES 256
+#define NFRAMES 32
 
 struct pager {
     int      fd;

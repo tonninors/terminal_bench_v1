@@ -1,94 +1,93 @@
 #!/usr/bin/env bash
-# Crash recovery: every committed write must come back after a power cut,
-# and the tree that comes back must be a well formed B+tree.
+# Crash recovery.
 #
-# Each case kills the writer the instant a scripted commit becomes durable,
-# then reopens the database (which runs recovery) and checks the result.
+# Every write whose commit returned must come back after a power cut, the
+# writes that never committed must not, and the tree that comes back must
+# be a well formed B+tree.  Each case kills the writer the instant a
+# scripted commit becomes durable, then reopens the database - which runs
+# recovery - and checks exactly which keys survived.
 set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 setup_suite
 
-# ---- the replayed window sits on top of a checkpointed tree ------------
-db="$(fresh_db crash_after_ckpt_small)"
-"$KVCLI" fill "$db" 100 >/dev/null
-if crash_fill "$db" 80 101 45; then
-    ok "crash after a checkpoint, small tree: recovers" \
-       "$KVCLI" verify "$db" 145
+# ---- databases small enough to sit entirely in the buffer pool --------
+db="$(fresh_db crash_small_seq)"
+if crash_fill_opts "$db" 300 150 ""; then
+    ok "small database, keys in order: recovers" \
+       "$KVCLI" expect "$db" 300 150
 else
-    echo "FAIL crash after a checkpoint, small tree: workload did not crash"
+    echo "FAIL small database, keys in order: workload did not crash"
     FAILED=$((FAILED + 1))
 fi
 
-db="$(fresh_db crash_after_ckpt_large)"
-"$KVCLI" fill "$db" 1500 >/dev/null
-if crash_fill "$db" 900 1501 600; then
-    ok "crash after a checkpoint, large tree: recovers" \
-       "$KVCLI" verify "$db" 2100
+db="$(fresh_db crash_small_spread)"
+if crash_fill_opts "$db" 350 180 "--spread"; then
+    ok "small database, keys scattered: recovers" \
+       "$KVCLI" expect "$db" 350 180 --spread
 else
-    echo "FAIL crash after a checkpoint, large tree: workload did not crash"
+    echo "FAIL small database, keys scattered: workload did not crash"
     FAILED=$((FAILED + 1))
 fi
 
-# ---- the replayed window covers the whole life of the tree -------------
-db="$(fresh_db crash_from_empty_small)"
-if crash_fill "$db" 100 1 40; then
-    ok "crash on a young database: recovers" \
-       "$KVCLI" verify "$db" 40
+# ---- databases larger than the buffer pool ----------------------------
+db="$(fresh_db crash_large_seq)"
+if crash_fill_opts "$db" 3000 1500 ""; then
+    ok "large database, keys in order: recovers" \
+       "$KVCLI" expect "$db" 3000 1500
 else
-    echo "FAIL crash on a young database: workload did not crash"
+    echo "FAIL large database, keys in order: workload did not crash"
     FAILED=$((FAILED + 1))
 fi
 
-db="$(fresh_db crash_from_empty_medium)"
-if crash_fill "$db" 600 1 300; then
-    ok "crash while the tree is growing: recovers" \
-       "$KVCLI" verify "$db" 300
+db="$(fresh_db crash_large_spread)"
+if crash_fill_opts "$db" 3000 1200 "--spread"; then
+    ok "large database, keys scattered: recovers" \
+       "$KVCLI" expect "$db" 3000 1200 --spread
 else
-    echo "FAIL crash while the tree is growing: workload did not crash"
+    echo "FAIL large database, keys scattered: workload did not crash"
     FAILED=$((FAILED + 1))
 fi
 
-db="$(fresh_db crash_from_empty_large)"
-if crash_fill "$db" 3000 1 2400; then
-    ok "crash on a large growing tree: recovers" \
-       "$KVCLI" verify "$db" 2400
+# ---- with checkpoints along the way -----------------------------------
+db="$(fresh_db crash_checkpointed)"
+MINISTORE_CRASH_POINT=commit MINISTORE_CRASH_COUNT=1800 \
+    "$KVCLI" fill "$db" 2500 --spread --checkpoint-every 400 >/dev/null 2>&1
+if [ "$?" -eq 90 ]; then
+    ok "checkpoints during the workload: recovers" \
+       "$KVCLI" expect "$db" 2500 1800 --spread
 else
-    echo "FAIL crash on a large growing tree: workload did not crash"
+    echo "FAIL checkpoints during the workload: workload did not crash"
     FAILED=$((FAILED + 1))
 fi
 
-# ---- crash with page write back already in progress -------------------
+# ---- crash while pages are being written back -------------------------
 db="$(fresh_db crash_mid_writeback)"
-MINISTORE_CRASH_POINT=page_write MINISTORE_CRASH_COUNT=25 \
-    "$KVCLI" fill "$db" 4000 --checkpoint-every 500 >/dev/null 2>&1
-rc=$?
-if [ "$rc" -eq 90 ]; then
+MINISTORE_CRASH_POINT=page_write MINISTORE_CRASH_COUNT=60 \
+    "$KVCLI" fill "$db" 2500 --spread >/dev/null 2>&1
+if [ "$?" -eq 90 ]; then
     ok "crash during page write back: tree is sound" "$KVCLI" verify "$db"
 else
-    echo "FAIL crash during page write back: workload did not crash (exit $rc)"
+    echo "FAIL crash during page write back: workload did not crash"
     FAILED=$((FAILED + 1))
 fi
 
-# ---- crash after updates and deletes ----------------------------------
-db="$(fresh_db crash_mixed)"
-"$KVCLI" fill "$db" 800 >/dev/null
-"$KVCLI" del "$db" 5 >/dev/null
-"$KVCLI" del "$db" 500 >/dev/null
-if crash_fill "$db" 900 801 700; then
-    ok "crash after a mixed workload: tree is sound" "$KVCLI" verify "$db"
-    n="$("$KVCLI" stats "$db" | sed -n "s/keys=\([0-9]*\).*/\1/p")"
-    same "crash after a mixed workload: committed keys survive" \
-         "yes" "$([ "${n:-0}" -eq 1498 ] && echo yes || echo no)"
+# ---- a second crash on top of a recovered database --------------------
+db="$(fresh_db crash_twice)"
+if crash_fill_opts "$db" 3000 900 "--spread"; then
+    "$KVCLI" recover "$db" >/dev/null 2>&1
+    MINISTORE_CRASH_POINT=commit MINISTORE_CRASH_COUNT=400 \
+        "$KVCLI" fill "$db" 1000 --start 4001 >/dev/null 2>&1
+    ok "crash, recover, crash again: tree is sound" "$KVCLI" verify "$db"
 else
-    echo "FAIL crash after a mixed workload: workload did not crash"
+    echo "FAIL crash, recover, crash again: workload did not crash"
     FAILED=$((FAILED + 1))
 fi
 
-# ---- writes that were never committed must not appear ------------------
+# ---- work that never committed must not appear ------------------------
 db="$(fresh_db crash_no_phantoms)"
-if crash_fill "$db" 500 1 200; then
-    ok "no phantom keys: tree is sound" "$KVCLI" verify "$db" 200
-    fails "no phantom keys: uncommitted key absent" "$KVCLI" get "$db" 400
+if crash_fill_opts "$db" 3000 700 "--spread"; then
+    ok "no phantom keys: exactly the committed set" \
+       "$KVCLI" expect "$db" 3000 700 --spread
 else
     echo "FAIL no phantom keys: workload did not crash"
     FAILED=$((FAILED + 1))

@@ -1,0 +1,162 @@
+diff --git a/src/btree.c b/src/btree.c
+index dfb739f..502db76 100644
+--- a/src/btree.c
++++ b/src/btree.c
+@@ -150,6 +150,10 @@ static int insert_into_parent(kvstore_t *s, uint32_t *path, int level,
+     r.aux  = new_id;
+     r.arg  = (uint32_t)at;
+     rc = emit(s, &r, NULL, 0, parent, rightpg);
++    /* The sibling has to reach the data file before the page it was
++     * split from can: redo reconstructs it from that page's pre-split
++     * image, which is lost as soon as the split half is written out. */
++    if (rc == KV_OK) rc = pager_write_now(s->pg, rightpg);
+     if (rc != KV_OK) goto out;
+ 
+     page_t *target = (sep < sep_up) ? parent : rightpg;
+@@ -209,6 +213,8 @@ int btree_put(kvstore_t *s, uint64_t key, const void *val, uint32_t vlen)
+     r.aux  = right_id;
+     r.arg  = (uint32_t)at;
+     rc = emit(s, &r, NULL, 0, leaf, right);
++    /* see insert_into_parent: the new sibling goes out first */
++    if (rc == KV_OK) rc = pager_write_now(s->pg, right);
+     if (rc != KV_OK) goto out;
+ 
+     uint64_t sep = LEAF_SLOTS(right)[0].key;
+diff --git a/src/internal.h b/src/internal.h
+index 8866e02..1d6b6d5 100644
+--- a/src/internal.h
++++ b/src/internal.h
+@@ -107,6 +107,7 @@ page_t  *pager_alloc(pager_t *p, uint32_t *out_id);
+ page_t  *pager_ensure(pager_t *p, uint32_t id);        /* grow to fit id  */
+ int      pager_flush_all(pager_t *p);
+ int      pager_sync(pager_t *p);
++int      pager_write_now(pager_t *p, page_t *pg);
+ uint32_t pager_num_pages(pager_t *p);
+ meta_t  *pager_meta(pager_t *p);
+ void     pager_meta_dirty(pager_t *p);
+diff --git a/src/pager.c b/src/pager.c
+index e4c81df..d755bf2 100644
+--- a/src/pager.c
++++ b/src/pager.c
+@@ -174,22 +174,27 @@ page_t *pager_alloc(pager_t *p, uint32_t *out_id)
+ }
+ 
+ /* Make `id` addressable, growing the file if redo refers to a page that
+- * the data file has never seen. */
++ * the data file has never seen.
++ *
++ * `num_pages` in the meta page is only as fresh as the last checkpoint:
++ * pages allocated after it were written back to the data file long
++ * before the meta page recorded them, so a page id beyond `num_pages`
++ * says nothing about whether that page already has an image on disk.
++ * The file is the authority here.  A read past the end of the file is
++ * zero filled, which is exactly the image a page that never reached the
++ * file should have, and its zero LSN makes redo replay everything the
++ * log still holds for it.  Discarding what the file does hold would
++ * throw away committed pages that a crash left beyond the last
++ * checkpointed `num_pages`.
++ */
+ page_t *pager_ensure(pager_t *p, uint32_t id)
+ {
+     meta_t *m = pager_meta(p);
+-    int fresh = 0;
+     if (id >= m->num_pages) {
+         m->num_pages = id + 1;
+         p->meta.dirty = 1;
+-        fresh = 1;
+-    }
+-    page_t *pg = frame_for(p, id, 0);
+-    if (pg && fresh) {
+-        memset(pg->buf, 0, PAGE_SIZE);
+-        pg->dirty = 1;
+     }
+-    return pg;
++    return frame_for(p, id, 0);
+ }
+ 
+ int pager_flush_all(pager_t *p)
+@@ -217,6 +222,23 @@ int pager_sync(pager_t *p)
+     return fsync(p->fd) == 0 ? KV_OK : KV_ERR_IO;
+ }
+ 
++/* Push one frame to the data file right now, still pinned.
++ *
++ * A split is described in the log rather than copied into it, so redo
++ * rebuilds the new sibling out of the pre-split image of the page it was
++ * split from.  The moment that page reaches the data file carrying the
++ * split, the material the sibling would be rebuilt from is gone, and a
++ * data file holding the split half without the sibling half could not be
++ * repaired from the log.  Writing the sibling out as soon as the split
++ * is logged keeps that ordering: the sibling is on disk before the page
++ * it came from ever can be.
++ */
++int pager_write_now(pager_t *p, page_t *pg)
++{
++    if (!pg) return KV_ERR_INVAL;
++    return frame_writeback(p, pg);
++}
++
+ /* Drop every cached frame without writing it back: used by the tests to
+  * observe the state that survived on disk. */
+ void pager_reset_cache(pager_t *p)
+diff --git a/src/recover.c b/src/recover.c
+index 3d357cd..39343bd 100644
+--- a/src/recover.c
++++ b/src/recover.c
+@@ -57,6 +57,7 @@ static void stamp(kvstore_t *s, page_t *pg, uint64_t lsn)
+ static int redo_one(kvstore_t *s, const wal_rec_t *r, const uint8_t *payload)
+ {
+     page_t *pg, *right;
++    int rc;
+     int apply = 0;
+ 
+     switch (r->type) {
+@@ -85,15 +86,22 @@ static int redo_one(kvstore_t *s, const wal_rec_t *r, const uint8_t *payload)
+     case WR_INT_SPLIT: {
+         /* Redo the split the same way btree.c performed it: the entries
+          * from `arg` onwards move to the new sibling, and the page that
+-         * was split keeps the ones before it.  Each page carries its own
+-         * LSN, so each half is replayed only if it is behind. */
++         * was split keeps the ones before it.
++         *
++         * The record describes the split rather than carrying the pages
++         * it produced, so the sibling can only be rebuilt while `page`
++         * still holds its pre-split image - that is, while `page` is the
++         * half that is behind.  btree.c and the code below keep that
++         * possible by writing the sibling to the data file before the
++         * page it came from is ever allowed out, so the sibling is never
++         * the only half left behind. */
+         int apply_left = 0, apply_right = 0;
+         pg = page_for(s, r->page, r->lsn, &apply_left);
+         if (!pg) return KV_ERR_IO;
+         right = page_for(s, r->aux, r->lsn, &apply_right);
+         if (!right) { pager_unpin(s->pg, pg); return KV_ERR_IO; }
+ 
+-        if (apply_right) {
++        if (apply_left && apply_right) {
+             uint64_t sep = 0;
+             if (r->type == WR_LEAF_SPLIT)
+                 leaf_split(pg, right, r->aux, (int)r->arg);
+@@ -101,11 +109,22 @@ static int redo_one(kvstore_t *s, const wal_rec_t *r, const uint8_t *payload)
+                 int_split(pg, right, (int)r->arg, &sep);
+             stamp(s, right, r->lsn);
+             stamp(s, pg, r->lsn);           /* the split truncated it too */
++            /* same ordering rule as btree.c, in case this recovery is
++             * itself interrupted part way through writing its pages */
++            rc = pager_write_now(s->pg, right);
++            if (rc != KV_OK) {
++                pager_unpin(s->pg, right);
++                pager_unpin(s->pg, pg);
++                return rc;
++            }
+         } else if (apply_left) {
++            /* the sibling already carries the split: only trim `page` */
+             PHDR(pg)->nkeys = (uint16_t)r->arg;
+             if (r->type == WR_LEAF_SPLIT) PHDR(pg)->link = r->aux;
+             stamp(s, pg, r->lsn);
+         }
++        /* apply_right without apply_left cannot happen; leaving both
++         * halves alone is the only safe thing to do if it ever does. */
+         pager_unpin(s->pg, right);
+         pager_unpin(s->pg, pg);
+         return KV_OK;

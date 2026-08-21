@@ -93,7 +93,7 @@ static int redo_one(kvstore_t *s, const wal_rec_t *r, const uint8_t *payload)
         right = page_for(s, r->aux, r->lsn, &apply_right);
         if (!right) { pager_unpin(s->pg, pg); return KV_ERR_IO; }
 
-        if (apply_right) {
+        if (apply_right && apply_left) {
             uint64_t sep = 0;
             if (r->type == WR_LEAF_SPLIT)
                 leaf_split(pg, right, r->aux, (int)r->arg);

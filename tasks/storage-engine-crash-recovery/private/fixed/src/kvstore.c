@@ -139,6 +139,12 @@ int kv_checkpoint(kvstore_t *s)
     rc = pager_flush_all(s->pg);
     if (rc != KV_OK) return rc;
     rc = pager_sync(s->pg);
+    if (rc != KV_OK) return rc;
+
+    /* Every page is on disk and the meta page records how far the log has
+     * been absorbed, so the log can be recycled: nothing before this
+     * point will ever be replayed again. */
+    rc = wal_truncate(s->wal);
     if (rc == KV_OK) ms_crash_hook("checkpoint");
     return rc;
 }

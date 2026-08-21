@@ -41,20 +41,38 @@ static int arg_num(int argc, char **argv, const char *name, long defval,
     return 0;
 }
 
+/* Insertion order.  --spread walks the same set of keys in a fixed
+ * scattered order (a stride permutation), the way a real workload keyed
+ * by an identifier does, so the pages in play do not stay in one corner
+ * of the tree. */
+static uint64_t nth_key(long i, long start, long count, int spread)
+{
+    if (!spread) return (uint64_t)(start + i);
+    return (uint64_t)(start + ((i * 7919L) % count));
+}
+
 static int cmd_fill(int argc, char **argv)
 {
     long start = 0, ckpt = 0;
+    int spread = 0;
     if (argc < 2) return usage();
     const char *db = argv[0];
     long count = strtol(argv[1], NULL, 10);
     arg_num(argc, argv, "--start", 1, &start);
     arg_num(argc, argv, "--checkpoint-every", 0, &ckpt);
+    for (int i = 0; i < argc; i++)
+        if (!strcmp(argv[i], "--spread")) spread = 1;
+    if (spread && (count % 7919L) == 0) {
+        fprintf(stderr, "kvcli: --spread needs a count that is not a "
+                        "multiple of 7919\n");
+        return 2;
+    }
 
     kvstore_t *s = kv_open(db);
     if (!s) { fprintf(stderr, "kvcli: cannot open %s\n", db); return 1; }
     char val[KV_MAX_VALUE_LEN];
     for (long i = 0; i < count; i++) {
-        uint64_t key = (uint64_t)(start + i);
+        uint64_t key = nth_key(i, start, count, spread);
         uint32_t len = value_for(key, val, sizeof val);
         int rc = kv_put(s, key, val, len);
         if (rc != KV_OK) {
@@ -170,6 +188,66 @@ static int cmd_verify(int argc, char **argv)
     return 0;
 }
 
+/* expect <db> <total> <committed> [--spread]
+ *
+ * The workload inserts `total` keys in a known order; a crash left the
+ * first `committed` of them durable.  Check that exactly those keys are
+ * present, with their proper values, and nothing else. */
+static int cmd_expect(int argc, char **argv)
+{
+    int spread = 0;
+    if (argc < 3) return usage();
+    const char *db = argv[0];
+    long total = strtol(argv[1], NULL, 10);
+    long committed = strtol(argv[2], NULL, 10);
+    for (int i = 0; i < argc; i++)
+        if (!strcmp(argv[i], "--spread")) spread = 1;
+    if (committed > total) return usage();
+
+    kvstore_t *s = kv_open(db);
+    if (!s) { fprintf(stderr, "kvcli: cannot open %s\n", db); return 1; }
+
+    char err[256];
+    int rc = kv_verify(s, err, sizeof err);
+    if (rc != KV_OK) {
+        fprintf(stderr, "kvcli: tree is not well formed: %s\n",
+                err[0] ? err : kv_strerror(rc));
+        kv_close(s);
+        return 1;
+    }
+
+    char want[KV_MAX_VALUE_LEN], got[KV_MAX_VALUE_LEN];
+    for (long i = 0; i < committed; i++) {
+        uint64_t key = nth_key(i, 1, total, spread);
+        uint32_t want_len = value_for(key, want, sizeof want);
+        uint32_t got_len = 0;
+        int grc = kv_get(s, key, got, sizeof got, &got_len);
+        if (grc != KV_OK) {
+            fprintf(stderr, "kvcli: committed key %" PRIu64 " is missing "
+                    "after recovery (%s)\n", key, kv_strerror(grc));
+            kv_close(s);
+            return 1;
+        }
+        if (got_len != want_len || memcmp(got, want, want_len)) {
+            fprintf(stderr, "kvcli: committed key %" PRIu64 " came back with "
+                    "the wrong value\n", key);
+            kv_close(s);
+            return 1;
+        }
+    }
+    int64_t n = kv_count(s);
+    if (n != committed) {
+        fprintf(stderr, "kvcli: %lld keys are present, but exactly %ld were "
+                "committed\n", (long long)n, committed);
+        kv_close(s);
+        return 1;
+    }
+    printf("ok: exactly %ld committed keys, height %u, %u pages\n",
+           committed, kv_height(s), kv_pages(s));
+    kv_close(s);
+    return 0;
+}
+
 static int dump_cb(uint64_t k, const void *v, uint32_t n, void *ctx)
 {
     (void)ctx;
@@ -257,6 +335,7 @@ int main(int argc, char **argv)
     if (!strcmp(cmd, "del"))     return cmd_simple(n, a, 1);
     if (!strcmp(cmd, "recover")) return cmd_recover(n, a);
     if (!strcmp(cmd, "verify"))  return cmd_verify(n, a);
+    if (!strcmp(cmd, "expect"))  return cmd_expect(n, a);
     if (!strcmp(cmd, "stats"))   return cmd_stats(n, a);
     if (!strcmp(cmd, "dump"))    return cmd_dump(n, a);
     if (!strcmp(cmd, "waldump")) return cmd_waldump(n, a);

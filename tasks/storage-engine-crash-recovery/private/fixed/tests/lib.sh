@@ -81,6 +81,20 @@ crash_fill() {
     return 0
 }
 
+# crash_fill_opts <db> <count> <crash_at_commit> <extra fill options>
+crash_fill_opts() {
+    local db="$1" count="$2" at="$3" opts="$4"
+    # shellcheck disable=SC2086
+    MINISTORE_CRASH_POINT=commit MINISTORE_CRASH_COUNT="$at" \
+        "$KVCLI" fill "$db" "$count" $opts >/dev/null 2>&1
+    local rc=$?
+    if [ "$rc" -ne 90 ]; then
+        echo "     (workload did not crash as scripted: exit $rc)" >&2
+        return 1
+    fi
+    return 0
+}
+
 finish_suite() {
     echo "---- $(basename "$0"): $PASSED passed, $FAILED failed"
     [ "$FAILED" -eq 0 ]

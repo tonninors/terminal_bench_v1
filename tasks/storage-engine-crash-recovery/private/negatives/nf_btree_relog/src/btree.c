@@ -211,6 +211,18 @@ int btree_put(kvstore_t *s, uint64_t key, const void *val, uint32_t vlen)
     rc = emit(s, &r, NULL, 0, leaf, right);
     if (rc != KV_OK) goto out;
 
+    /* re-log the pairs that moved, so redo can restore them */
+    for (int m = 0; m < PHDR(right)->nkeys; m++) {
+        leaf_slot_t *ms = &LEAF_SLOTS(right)[m];
+        wal_rec_t rr;
+        memset(&rr, 0, sizeof rr);
+        rr.type = WR_LEAF_PUT;
+        rr.page = right_id;
+        rr.key  = ms->key;
+        rc = emit(s, &rr, ms->val, ms->vlen, right, NULL);
+        if (rc != KV_OK) goto out;
+    }
+
     uint64_t sep = LEAF_SLOTS(right)[0].key;
     page_t *target = (key < sep) ? leaf : right;
     uint32_t target_id = (key < sep) ? leaf_id : right_id;

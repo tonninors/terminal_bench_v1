@@ -1,0 +1,5 @@
+build/
+*.o
+*.a
+*.db
+*.db.wal

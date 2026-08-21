@@ -33,6 +33,10 @@ ok  "deletes: tree still sound"        "$KVCLI" verify "$db"
 ok  "deletes: reinsert"                "$KVCLI" fill "$db" 1 --start 42
 ok  "deletes: verify"                  "$KVCLI" verify "$db" 120
 
+db="$(fresh_db basic_spread)"
+ok  "scattered inserts: fill"          "$KVCLI" fill "$db" 2500 --spread
+ok  "scattered inserts: verify"        "$KVCLI" verify "$db" 2500
+
 db="$(fresh_db basic_ckpt)"
 ok  "checkpoints: fill with checkpoints" \
     "$KVCLI" fill "$db" 500 --checkpoint-every 50

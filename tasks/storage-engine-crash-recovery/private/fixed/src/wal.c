@@ -40,6 +40,17 @@ int wal_close(wal_t *w)
 }
 
 uint64_t wal_next_lsn(wal_t *w) { return w->next_lsn; }
+
+/* Recovery learns from the log how far sequence numbers actually got, so
+ * that the records written after it continue past the ones already
+ * stamped on the pages. */
+void wal_set_next_lsn(wal_t *w, uint64_t lsn)
+{
+    if (lsn <= w->next_lsn) return;
+    w->next_lsn = lsn;
+    if (w->written_lsn < lsn - 1) w->written_lsn = lsn - 1;
+    if (w->durable_lsn < lsn - 1) w->durable_lsn = lsn - 1;
+}
 uint64_t wal_durable_lsn(wal_t *w) { return w->durable_lsn; }
 
 int wal_append(wal_t *w, wal_rec_t *r, const void *payload, uint32_t vlen,
